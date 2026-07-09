@@ -10,13 +10,13 @@ poetry run black .                    # format (line-length 120)
 poetry run python -m cc_adapter       # dev server (port 8080, or $CC_ADAPTER_PORT)
 poetry run cc-adapter                 # same, via pyproject.toml scripts
 bash run.sh                           # alternative: sources .env, runs uvicorn directly
-docker build -t dgqyushen/command-code-proxy:latest .
+docker build -t ${DOCKERHUB_NAMESPACE:-yourname}/command-code-proxy:latest .
 docker compose up -d                  # docker-compose.yml + optional docker-compose.override.yml
 ```
 
 **Version**: `pyproject.toml` `[tool.poetry].version` is the single source of truth. `core/constants.py` reads it at import via `_load_version()`. Both `main.py` and `admin/router.py` import `VERSION` from constants. Bump in pyproject.toml when releasing — do not edit constants.py.
 
-**After each feature/fix**: bump the version in `pyproject.toml` before committing. Push a `v*` tag (e.g. `v0.7.2`) to trigger the Docker CI workflow, which pushes `latest` + semver tags to Docker Hub.
+**After each feature/fix**: bump the version in `pyproject.toml` before committing. Push the `docker` branch to trigger `docker-publish.yml`, which builds a multi-arch (`linux/amd64` + `linux/arm64`) image and pushes `docker` + `latest` + `sha-*` tags to `<DOCKERHUB_NAMESPACE>/command-code-proxy` on Docker Hub.
 
 ## Routes
 
@@ -132,10 +132,12 @@ Both translate to CC /alpha/generate body, stream SSE back.
 ## Docker
 
 ```bash
-docker build -t dgqyushen/command-code-proxy:latest .
+docker build -t ${DOCKERHUB_NAMESPACE:-yourname}/command-code-proxy:latest .
 # Port conflict? Create docker-compose.override.yml mapping 8081:8080
 docker compose up -d
 ```
+
+**Publishing to Docker Hub**: `.github/workflows/docker-publish.yml` runs on every push to the `docker` branch (and via `workflow_dispatch`). It logs in with `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets and pushes the image to `<DOCKERHUB_NAMESPACE>/command-code-proxy`. Set the `DOCKERHUB_NAMESPACE` repository variable to override the namespace; otherwise the workflow falls back to `DOCKERHUB_USERNAME`.
 
 ## End-of-work checklist
 
