@@ -29,11 +29,6 @@ class AppConfig(BaseSettings):
 
     oss_primary_provider: str = ""
 
-    web_search_provider: str = ""
-    deepseek_api_key: str = ""
-    deepseek_anthropic_url: str = "https://api.deepseek.com/anthropic"
-    web_search_model: str = ""
-
     @field_validator("cc_api_key", mode="before")
     @classmethod
     def coerce_api_key(cls, v):
