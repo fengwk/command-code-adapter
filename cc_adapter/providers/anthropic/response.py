@@ -63,7 +63,9 @@ async def collect_and_translate_anthropic_nonstream(
             try:
                 from cc_adapter.core.token_recorder import record_daily_tokens
 
-                asyncio.ensure_future(record_daily_tokens(usage.input_tokens or 0, usage.output_tokens or 0))
+                asyncio.ensure_future(
+                    record_daily_tokens(usage.input_tokens or 0, usage.output_tokens or 0, model=model)
+                )
             except Exception:
                 pass
 
@@ -262,7 +264,7 @@ async def translate_anthropic_stream(
             try:
                 from cc_adapter.core.token_recorder import record_daily_tokens
 
-                asyncio.ensure_future(record_daily_tokens(input_t, output_t))
+                asyncio.ensure_future(record_daily_tokens(input_t, output_t, model=model))
             except Exception:
                 pass
             yield _anthropic_sse(
