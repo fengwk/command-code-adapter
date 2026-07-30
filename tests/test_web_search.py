@@ -21,8 +21,8 @@ class TestWebSearchToolDefinition:
         assert schema["type"] == "object"
         assert "query" in schema["required"]
         assert "numResults" in schema["properties"]
-        assert "allowedDomains" in schema["properties"]
-        assert "blockedDomains" in schema["properties"]
+        assert "allowed_domains" in schema["properties"]
+        assert "blocked_domains" in schema["properties"]
 
     def test_numResults_has_default(self):
         assert WEB_SEARCH_TOOL_DEFINITION["input_schema"]["properties"]["numResults"]["default"] == 5
@@ -56,7 +56,7 @@ class TestIsAnthropicWebTool:
         assert is_anthropic_web_tool(tool) is True
 
     def test_detects_web_fetch_server_tool_object(self):
-        tool = DummyTool(name="web_fetch", type="web_search_20250305")
+        tool = DummyTool(name="web_fetch", type="web_fetch_20250910")
         assert is_anthropic_web_tool(tool) is True
 
     def test_detects_dict_tool(self):
@@ -90,7 +90,7 @@ class TestAnthropicWebToolToFunction:
         assert "query" in result["input_schema"]["properties"]
 
     def test_converts_web_fetch_object(self):
-        tool = DummyTool(name="web_fetch", type="web_search_20250305")
+        tool = DummyTool(name="web_fetch", type="web_fetch_20250910")
         result = anthropic_web_tool_to_function(tool)
         assert result["name"] == "web_fetch"
         assert "url" in result["input_schema"]["required"]

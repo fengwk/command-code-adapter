@@ -60,6 +60,15 @@ class AnthropicTranslator:
             for t in req.tools:
                 if is_anthropic_web_tool(t):
                     converted = anthropic_web_tool_to_function(t)
+                    unsupported = sorted(
+                        name for name, value in (t.model_extra or {}).items() if value not in (None, False)
+                    )
+                    if unsupported:
+                        raise AdapterError(
+                            message=f"Anthropic server tool options are not supported: {', '.join(unsupported)}",
+                            status_code=400,
+                        )
+
                     cc_tools.append(
                         {
                             "name": converted["name"],

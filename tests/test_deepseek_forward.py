@@ -24,8 +24,8 @@ CC_SSE_RESPONSE = (
 
 @pytest.mark.asyncio
 async def test_web_search_tool_goes_to_cc_not_deepseek():
-    """Anthropic web_search server tool goes to CC even when DeepSeek is configured."""
-    cfg = AppConfig(cc_api_key="test-key", web_search_provider="deepseek", deepseek_api_key="sk-test")
+    """Anthropic web_search server tool goes to CC, never the removed DeepSeek route."""
+    cfg = AppConfig(cc_api_key="test-key")
     runtime._config = cfg
     runtime._cc_client = None
 

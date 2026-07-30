@@ -53,7 +53,7 @@ def _parse_sse(text: str) -> list[dict]:
 def _setup(
     cfg_overrides: dict | None = None, events: list[dict] | None = None, events_second: list[dict] | None = None
 ):
-    base = {"cc_api_key": "test_key_123", "web_search_provider": "", "deepseek_api_key": ""}
+    base = {"cc_api_key": "test_key_123"}
     if cfg_overrides:
         base.update(cfg_overrides)
     cfg = AppConfig(**base)
@@ -553,7 +553,6 @@ async def test_nonstream_access_key_auth(client):
 @pytest.mark.asyncio
 async def test_stream_empty_returns_error(client):
     _setup(
-        cfg_overrides={"web_search_provider": ""},
         events=[
             {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 0, "outputTokens": 0}},
         ],
@@ -598,7 +597,6 @@ async def test_stream_empty_both_attempts_returns_error(client):
 @pytest.mark.asyncio
 async def test_stream_empty_text_delta_returns_error(client):
     _setup(
-        cfg_overrides={"web_search_provider": ""},
         events=[
             {"type": "text-delta", "text": ""},
             {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 0, "outputTokens": 0}},

@@ -45,6 +45,8 @@ async def collect_and_translate_anthropic_nonstream(
             thinking_parts.append(event.get("text", ""))
 
         elif event_type == "tool-call":
+            if event.get("providerExecuted"):
+                continue
             tc = {
                 "type": "tool_use",
                 "id": event.get("toolCallId", generate_id("toolu_", 12)),
@@ -205,6 +207,8 @@ async def translate_anthropic_stream(
             )
 
         elif event_type == "tool-call":
+            if event.get("providerExecuted"):
+                continue
             if not has_started:
                 yield _message_start_event()
                 has_started = True

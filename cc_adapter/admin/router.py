@@ -234,13 +234,48 @@ async def admin_daily_usage(req: DailyUsageRequest, _=Depends(verify_auth)):
         return {"daily": [], "totals": {"total_cost": 0, "total_count": 0, "models": []}}
     start = date_type.fromisoformat(req.start_date)
     end = date_type.fromisoformat(req.end_date)
-    daily = await query_daily_usage(cfg.cc_base_url, primary_key[0], start, end)
 
-    total_cost = sum(d["total_cost"] for d in daily)
-    total_count = sum(d["total_count"] for d in daily)
+    # ponytail: CC billing API no longer returns per-model breakdown.
+    # Use local per-model token stats to proportionally split daily cost.
+    daily_cc = await query_daily_usage(cfg.cc_base_url, primary_key[0], start, end)
+    local = query_daily_tokens(days=365)
+
+    daily_result: list[dict[str, Any]] = []
+    for d in daily_cc:
+        date_key = d["date"]
+        day_cost = d["total_cost"]
+        local_entry = local.get(date_key, {})
+        local_models = local_entry.get("models", {})
+        local_total_tokens = local_entry.get("tokens", 0)
+
+        models: list[dict[str, Any]] = []
+        if local_models and local_total_tokens > 0:
+            for m_name, m_data in local_models.items():
+                share = m_data["tokens"] / local_total_tokens
+                models.append(
+                    {
+                        "model_id": m_name,
+                        "cost": round(day_cost * share, 4),
+                        "count": m_data["requests"],
+                    }
+                )
+            # sort by cost desc
+            models.sort(key=lambda x: x["cost"], reverse=True)
+
+        daily_result.append(
+            {
+                "date": date_key,
+                "total_cost": day_cost,
+                "total_count": d["total_count"],
+                "models": models,
+            }
+        )
+
+    total_cost = sum(d["total_cost"] for d in daily_result)
+    total_count = sum(d["total_count"] for d in daily_result)
 
     model_agg: dict[str, dict[str, object]] = {}
-    for d in daily:
+    for d in daily_result:
         for m in d.get("models", []):
             mid = m["model_id"]
             if mid not in model_agg:
@@ -253,7 +288,7 @@ async def admin_daily_usage(req: DailyUsageRequest, _=Depends(verify_auth)):
         m["pct"] = round((m["cost"] / total_cost * 100), 1) if total_cost > 0 else 0
 
     return {
-        "daily": daily,
+        "daily": daily_result,
         "totals": {
             "total_cost": round(total_cost, 4),
             "total_count": total_count,

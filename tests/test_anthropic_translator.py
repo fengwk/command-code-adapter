@@ -477,6 +477,32 @@ async def test_nonstream_with_tool_calls():
 
 
 @pytest.mark.asyncio
+async def test_nonstream_hides_provider_executed_web_tool_events():
+    async def fake_stream():
+        yield {
+            "type": "tool-call",
+            "toolCallId": "call_1",
+            "toolName": "web_search",
+            "input": {"query": "latest news"},
+            "providerExecuted": True,
+        }
+        yield {
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "web_search",
+            "output": {"type": "text", "value": "Search result"},
+            "providerExecuted": True,
+        }
+        yield {"type": "text-delta", "text": "Answer"}
+        yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 15}}
+
+    resp = await collect_and_translate_anthropic_nonstream(fake_stream(), "claude-sonnet-4-6")
+
+    assert resp.content == [{"type": "text", "text": "Answer"}]
+    assert resp.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
 async def test_nonstream_thinking_only_fallback_to_text():
     async def fake_stream():
         yield {"type": "reasoning-delta", "text": "thinking hard"}
@@ -605,6 +631,33 @@ async def test_stream_with_tool_call():
     assert events[5][0] == "message_stop"
 
 
+@pytest.mark.asyncio
+async def test_stream_hides_provider_executed_web_tool_events():
+    async def fake_stream():
+        yield {
+            "type": "tool-call",
+            "toolCallId": "call_1",
+            "toolName": "web_fetch",
+            "input": {"url": "https://example.com"},
+            "providerExecuted": True,
+        }
+        yield {
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "web_fetch",
+            "output": {"type": "error-text", "value": "url_not_accessible"},
+            "providerExecuted": True,
+        }
+        yield {"type": "text-delta", "text": "Could not fetch the page."}
+        yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 5}}
+
+    chunks = [c async for c in translate_anthropic_stream(fake_stream(), "claude-sonnet-4-6")]
+    events = _parse_sse_events("".join(chunks))
+
+    assert [data["content_block"]["type"] for event, data in events if event == "content_block_start"] == ["text"]
+    assert next(data for event, data in events if event == "message_delta")["delta"]["stop_reason"] == "end_turn"
+
+
 def test_converts_server_web_search_tool_to_function(translator):
     req = AnthropicRequest(
         model="claude-sonnet-4-6",
@@ -628,6 +681,21 @@ def test_unknown_server_tool_still_raises_error(translator):
         tools=[AnthropicToolParam(name="code_execution", type="code_execution_20250522")],
     )
     with pytest.raises(AdapterError, match="not supported"):
+        translator.translate(req)
+
+
+def test_server_web_tool_options_are_rejected(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="search the web")],
+        tools=[
+            AnthropicToolParam(
+                name="web_search", type="web_search_20250305", allowed_domains=["example.com"], max_uses=1
+            )
+        ],
+    )
+    with pytest.raises(AdapterError, match="allowed_domains, max_uses"):
         translator.translate(req)
 
 

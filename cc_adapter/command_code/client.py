@@ -32,7 +32,10 @@ def _parse_sse_line(raw: str) -> dict[str, Any] | None:
         preview = raw[:60]
         logger.debug("sse.parse_error", preview=preview, error="not_a_json_object")
         return None
-    logger.debug("sse.raw_event", event_type=parsed.get("type", "?"))
+    et = parsed.get("type", "?")
+    if et in ("start", "finish", "provider-metadata"):
+        logger.info("sse.event_detail", event_type=et, body=parsed)
+    logger.debug("sse.raw_event", event_type=et)
     return parsed
 
 
@@ -155,6 +158,8 @@ class CommandCodeClient:
             headers["x-project-slug"] = project_slug
 
             url = f"{self.base_url}/alpha/generate"
+            # ponytail: debug log — remove after confirming correct model forwarding
+            logger.info("cc.forward", url=url, model=body.get("params", {}).get("model", "MISSING"))
 
             client = self._client()
             try:

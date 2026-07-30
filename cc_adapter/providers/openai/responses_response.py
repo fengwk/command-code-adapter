@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import AsyncGenerator, Any
@@ -317,6 +318,15 @@ class _ResponsesStreamState:
                 yield from self.close_current_item()
 
             usage = parse_usage(event.get("totalUsage"))
+            if usage:
+                try:
+                    from cc_adapter.core.token_recorder import record_daily_tokens
+
+                    asyncio.ensure_future(
+                        record_daily_tokens(usage["input_tokens"], usage["output_tokens"], model=self.model)
+                    )
+                except Exception:
+                    pass
             full_text = "".join(self.text_buf)
             output_items: list[dict] = []
             if self.reasoning_buf:
@@ -457,6 +467,15 @@ async def collect_and_translate_responses_nonstream(
 
         elif event_type == "finish":
             usage = parse_usage(event.get("totalUsage"))
+            if usage:
+                try:
+                    from cc_adapter.core.token_recorder import record_daily_tokens
+
+                    asyncio.ensure_future(
+                        record_daily_tokens(usage["input_tokens"], usage["output_tokens"], model=model)
+                    )
+                except Exception:
+                    pass
 
         elif event_type == "error":
             err = event.get("error") or {}

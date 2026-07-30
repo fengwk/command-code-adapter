@@ -87,7 +87,7 @@ def _parse_usage(raw_usage: dict | None, model: str, start_time: float) -> Usage
     try:
         from cc_adapter.core.token_recorder import record_daily_tokens
 
-        asyncio.ensure_future(record_daily_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0))
+        asyncio.ensure_future(record_daily_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0, model=model))
     except Exception:
         pass
     return usage

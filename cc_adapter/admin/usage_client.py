@@ -91,13 +91,14 @@ async def query_token_usage(base_url: str, api_key: str, timeout: float = 15.0) 
                 }
 
             if not isinstance(usage_resp, Exception) and usage_resp is not None and usage_resp.status_code < 400:
+                window_limits = (credits_data or {}).get("windowLimits") or {}
                 usage_data = usage_resp.json()
-                five_hour = usage_data.get("fiveHour") or {}
-                weekly = usage_data.get("weekly") or {}
+                five_hour = window_limits.get("fiveHour") or {}
+                weekly = window_limits.get("weekly") or {}
                 result["usage"] = {
                     "total_cost": usage_data.get("totalCost", 0),
                     "total_count": usage_data.get("totalCount", 0),
-                    "limited": usage_data.get("limited", False),
+                    "limited": window_limits.get("limited", False),
                     "fiveHour": (
                         {
                             "used": five_hour.get("used", 0),
@@ -191,7 +192,7 @@ async def query_daily_usage(
     for i in range(len(boundaries) - 1):
         cur = snapshots[i]
         nxt = snapshots[i + 1]
-        if cur is None:
+        if cur is None or (nxt is None and boundaries[i] != date_type.today()):
             continue
 
         # ponytail: nxt can be None when boundary is a future date (e.g. end_date=today,

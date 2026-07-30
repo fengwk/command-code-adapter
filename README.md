@@ -57,10 +57,6 @@ docker compose up -d
 | `CC_ADAPTER_HTTP2` | `false` | 启用 HTTP/2 |
 | `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存） |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | 可选的 OSS 提供商名称，作为 `x-oss-primary-provider` 请求头发送 |
-| `CC_ADAPTER_WEB_SEARCH_PROVIDER` | — | 设为 `deepseek` 时，将 Anthropic `web_search` 请求转发到 DeepSeek |
-| `CC_ADAPTER_DEEPSEEK_API_KEY` | — | DeepSeek API Key，用于 `web_search` 转发 |
-| `CC_ADAPTER_DEEPSEEK_ANTHROPIC_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic 兼容端点 |
-| `CC_ADAPTER_WEB_SEARCH_MODEL` | — | `web_search` 转发使用的 DeepSeek 模型；留空则使用请求中的模型 |
 
 也可通过 `.env` 文件配置（参考 `.env.example`）。
 
@@ -261,10 +257,6 @@ docker compose up -d
 | `CC_ADAPTER_HTTP2` | `false` | Enable HTTP/2 |
 | `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
-| `CC_ADAPTER_WEB_SEARCH_PROVIDER` | — | Set to `deepseek` to forward Anthropic `web_search` requests to DeepSeek |
-| `CC_ADAPTER_DEEPSEEK_API_KEY` | — | DeepSeek API key used for `web_search` forwarding |
-| `CC_ADAPTER_DEEPSEEK_ANTHROPIC_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible endpoint |
-| `CC_ADAPTER_WEB_SEARCH_MODEL` | — | DeepSeek model used for `web_search` forwarding; empty means use the request model |
 
 You can also configure via a `.env` file (see `.env.example`).
 

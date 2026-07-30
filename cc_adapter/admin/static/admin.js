@@ -150,8 +150,8 @@ function fmtUptime(s) {
 
 function fmtResetTime(resetAt) {
   if (!resetAt) return "";
-  const now = Math.floor(Date.now() / 1000);
-  const diff = resetAt - now;
+  const now = Date.now();
+  const diff = Math.floor((resetAt - now) / 1000);
   if (diff <= 0) return "resetting...";
   const h = Math.floor(diff / 3600);
   const m = Math.floor((diff % 3600) / 60);
@@ -619,21 +619,25 @@ function renderTokenCard(item) {
           limitHtml += `<div class="token-limit-alert">&#9888; ${t("tokenLimitRestricted")}</div>`;
         }
         if (usage.fiveHour?.cap) {
-          const fiveHrPct = usage.fiveHour.cap > 0 ? Math.min(100, Math.round((usage.fiveHour.used / usage.fiveHour.cap) * 100)) : 0;
+          const fiveHrUsed = Number(usage.fiveHour.used) || 0;
+          const fiveHrCap = Number(usage.fiveHour.cap) || 0;
+          const fiveHrPct = fiveHrCap > 0 ? Math.min(100, Math.round((fiveHrUsed / fiveHrCap) * 100)) : 0;
           const fiveHrReset = fmtResetTime(usage.fiveHour.resetAt);
           limitHtml += `<div class="token-limit-row">
             <span class="token-limit-label">${t("tokenLimit5h")}</span>
-            <span class="token-limit-value">${usage.fiveHour.used}/${usage.fiveHour.cap}</span>
+            <span class="token-limit-value">${fiveHrUsed}/${fiveHrCap}</span>
             ${fiveHrReset ? `<span class="token-limit-reset">${t("tokenLimitReset")} ${fiveHrReset}</span>` : ""}
             <div class="token-limit-bar-track"><div class="token-limit-bar-fill" style="width:${fiveHrPct}%"></div></div>
           </div>`;
         }
         if (usage.weekly?.cap) {
-          const weeklyPct = usage.weekly.cap > 0 ? Math.min(100, Math.round((usage.weekly.used / usage.weekly.cap) * 100)) : 0;
+          const weeklyUsed = Number(usage.weekly.used) || 0;
+          const weeklyCap = Number(usage.weekly.cap) || 0;
+          const weeklyPct = weeklyCap > 0 ? Math.min(100, Math.round((weeklyUsed / weeklyCap) * 100)) : 0;
           const weeklyReset = fmtResetTime(usage.weekly.resetAt);
           limitHtml += `<div class="token-limit-row">
             <span class="token-limit-label">${t("tokenLimitWeekly")}</span>
-            <span class="token-limit-value">${usage.weekly.used}/${usage.weekly.cap}</span>
+            <span class="token-limit-value">${weeklyUsed}/${weeklyCap}</span>
             ${weeklyReset ? `<span class="token-limit-reset">${t("tokenLimitReset")} ${weeklyReset}</span>` : ""}
             <div class="token-limit-bar-track"><div class="token-limit-bar-fill" style="width:${weeklyPct}%"></div></div>
           </div>`;

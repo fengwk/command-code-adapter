@@ -21,18 +21,18 @@ WEB_SEARCH_TOOL_DEFINITION: dict[str, Any] = {
                 "description": "Number of results to return (1-10), default 5",
                 "default": 5,
             },
-            "allowedDomains": {
+            "allowed_domains": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
                     "Only return results from these domains (subdomains are auto-matched). "
-                    "Cannot be used together with blockedDomains."
+                    "Cannot be used together with blocked_domains."
                 ),
             },
-            "blockedDomains": {
+            "blocked_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": ("Exclude results from these domains. " "Cannot be used together with allowedDomains."),
+                "description": ("Exclude results from these domains. " "Cannot be used together with allowed_domains."),
             },
         },
         "required": ["query"],
@@ -84,10 +84,8 @@ def is_anthropic_web_tool(tool: Any) -> bool:
     if tool is None:
         return False
     tool_type = getattr(tool, "type", None) or (tool.get("type") if isinstance(tool, dict) else None)
-    if not isinstance(tool_type, str) or not tool_type.startswith("web_search"):
-        return False
     tool_name = getattr(tool, "name", None) or (tool.get("name") if isinstance(tool, dict) else None)
-    return tool_name in _WEB_TOOL_MAP
+    return isinstance(tool_type, str) and tool_name in _WEB_TOOL_MAP and tool_type.startswith(f"{tool_name}_")
 
 
 def anthropic_web_tool_to_function(tool: Any) -> dict[str, Any]:
