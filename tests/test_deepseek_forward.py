@@ -24,13 +24,17 @@ CC_SSE_RESPONSE = (
 
 @pytest.mark.asyncio
 async def test_web_search_tool_goes_to_cc_not_deepseek():
-    cfg = AppConfig(cc_api_key="test-key")
+    """Anthropic web_search server tool goes to CC even when DeepSeek is configured."""
+    cfg = AppConfig(cc_api_key="test-key", web_search_provider="deepseek", deepseek_api_key="sk-test")
     runtime._config = cfg
     runtime._cc_client = None
 
     async with respx.mock(assert_all_called=False) as respx_mock:
         cc_route = respx_mock.post("https://api.commandcode.ai/alpha/generate").mock(
             return_value=HttpxResponse(200, content=CC_SSE_RESPONSE)
+        )
+        deepseek_route = respx_mock.post("https://api.deepseek.com/anthropic/v1/messages").mock(
+            return_value=HttpxResponse(200, content=b"should not be called")
         )
         respx_mock.get("https://registry.npmjs.org/command-code/latest").mock(
             return_value=HttpxResponse(200, json={"version": "0.25.2"})
@@ -52,6 +56,7 @@ async def test_web_search_tool_goes_to_cc_not_deepseek():
     assert resp.status_code == 200
     assert "Hello from CC" in resp.text
     assert cc_route.called
+    assert not deepseek_route.called
 
 
 @pytest.mark.asyncio
