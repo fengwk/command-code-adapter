@@ -54,14 +54,28 @@ class AnthropicTranslator:
             params["system"] = system_text
 
         if req.tools:
-            params["tools"] = [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": normalize_schema(self._require_tool_schema(t)),
-                }
-                for t in req.tools
-            ]
+            from cc_adapter.providers.shared.web_search import is_anthropic_web_tool, anthropic_web_tool_to_function
+
+            cc_tools = []
+            for t in req.tools:
+                if is_anthropic_web_tool(t):
+                    converted = anthropic_web_tool_to_function(t)
+                    cc_tools.append(
+                        {
+                            "name": converted["name"],
+                            "description": converted["description"],
+                            "input_schema": normalize_schema(converted["input_schema"]),
+                        }
+                    )
+                else:
+                    cc_tools.append(
+                        {
+                            "name": t.name,
+                            "description": t.description or "",
+                            "input_schema": normalize_schema(self._require_tool_schema(t)),
+                        }
+                    )
+            params["tools"] = cc_tools
         if req.tool_choice:
             tc = req.tool_choice
             choice: dict[str, Any] = {"type": tc.type}
@@ -87,8 +101,8 @@ class AnthropicTranslator:
         if tool.type:
             raise AdapterError(
                 message=(
-                    f"Anthropic server tool '{tool.name}' cannot be translated to Command Code; "
-                    "enable DeepSeek web_search forwarding for server-side tools"
+                    f"Anthropic server tool '{tool.name}' is not supported. "
+                    f"Only web_search and web_fetch server tools can be translated."
                 ),
                 status_code=400,
             )

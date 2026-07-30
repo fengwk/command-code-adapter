@@ -3,8 +3,14 @@ import logging
 
 import pytest
 
-from cc_adapter.providers.anthropic.models import AnthropicMessage, AnthropicRequest, normalize_system_messages
+from cc_adapter.providers.anthropic.models import (
+    AnthropicMessage,
+    AnthropicRequest,
+    AnthropicToolParam,
+    normalize_system_messages,
+)
 from cc_adapter.providers.anthropic.request import AnthropicTranslator
+from cc_adapter.core.errors import AdapterError
 from cc_adapter.providers.anthropic.response import (
     collect_and_translate_anthropic_nonstream,
     translate_anthropic_stream,
@@ -597,3 +603,48 @@ async def test_stream_with_tool_call():
     assert events[4][0] == "message_delta"
     assert events[4][1]["delta"]["stop_reason"] == "tool_use"
     assert events[5][0] == "message_stop"
+
+
+def test_converts_server_web_search_tool_to_function(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="search the web")],
+        tools=[AnthropicToolParam(name="web_search", type="web_search_20250305")],
+    )
+    cc_body, _ = translator.translate(req)
+    tools = cc_body["params"]["tools"]
+    assert len(tools) == 1
+    assert tools[0]["name"] == "web_search"
+    assert "query" in tools[0]["input_schema"]["properties"]
+    assert "numResults" in tools[0]["input_schema"]["properties"]
+
+
+def test_unknown_server_tool_still_raises_error(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="test")],
+        tools=[AnthropicToolParam(name="code_execution", type="code_execution_20250522")],
+    )
+    with pytest.raises(AdapterError, match="not supported"):
+        translator.translate(req)
+
+
+def test_mixed_web_and_function_tools(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="test")],
+        tools=[
+            AnthropicToolParam(name="web_search", type="web_search_20250305"),
+            AnthropicToolParam(
+                name="get_weather", input_schema={"type": "object", "properties": {"city": {"type": "string"}}}
+            ),
+        ],
+    )
+    cc_body, _ = translator.translate(req)
+    tools = cc_body["params"]["tools"]
+    assert len(tools) == 2
+    assert tools[0]["name"] == "web_search"
+    assert tools[1]["name"] == "get_weather"
