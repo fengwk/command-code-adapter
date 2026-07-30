@@ -283,3 +283,33 @@ class TestQueryDailyUsage:
         assert len(results) == 1
         assert results[0]["total_cost"] == 0
         assert results[0]["total_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_query_usage_extracts_limits():
+    with respx.mock(base_url="https://api.commandcode.ai") as mock:
+        mock.get("/alpha/whoami").mock(return_value=httpx.Response(200, json={"name": "U", "email": "u@e.com"}))
+        mock.get("/alpha/usage/summary", params={"since": "1970-01-01T00:00:00Z"}).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "totalCost": 5.0,
+                    "totalCount": 10,
+                    "limited": True,
+                    "fiveHour": {"used": 42, "cap": 100, "resetAt": 1720000000},
+                    "weekly": {"used": 150, "cap": 500, "resetAt": 1720600000},
+                    "models": [],
+                },
+            )
+        )
+        mock.get("/alpha/billing/credits").mock(return_value=httpx.Response(200, json={}))
+        mock.get("/alpha/billing/subscriptions").mock(return_value=httpx.Response(200, json={}))
+
+        result = await query_token_usage("https://api.commandcode.ai", "test-key")
+
+    assert result["ok"] is True
+    assert result["usage"]["limited"] is True
+    assert result["usage"]["fiveHour"]["used"] == 42
+    assert result["usage"]["fiveHour"]["cap"] == 100
+    assert result["usage"]["weekly"]["used"] == 150
+    assert result["usage"]["weekly"]["cap"] == 500
