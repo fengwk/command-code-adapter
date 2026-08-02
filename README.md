@@ -80,9 +80,11 @@ docker compose up -d
 {"event": "http.done", "level": "info", "logger": "cc_adapter.main", "method": "POST", "path": "/v1/chat/completions", "status_code": 200, "elapsed": "2.480s", "request_id": "8f3a91c2", "timestamp": "2026-05-13T07:42:34Z"}
 ```
 
-**事件列表：** `app.start`、`http.done`、`openai.request`、`anthropic.request`、`upstream.error`、`upstream.retry`、`upstream.usage`、`tool.call`、`auth.failed`、`admin.login.failed`、`admin.config.updated`、`admin.verify_key`
+**事件列表：** `app.start`、`http.done`、`openai.request`、`anthropic.request`、`responses.request`、`upstream.error`、`upstream.retry`、`upstream.usage`、`tool.call`、`auth.failed`、`admin.login.failed`、`admin.config.updated`、`admin.verify_key`
 
-**脱敏：** 敏感字段（authorization、API key、messages、tool 编辑参数等）自动替换为 `***`。
+每个请求日志会输出 `reasoning_effort`（客户端请求值）和 `cc_reasoning_effort`（clamp 后实际发送值），以及 `thinking_budget`（Anthropic 模式）。
+
+**脱敏：** 敏感字段（authorization、API key、messages、tool 编辑参数、路径信息等）自动替换为 `***`。
 
 ### 使用
 
@@ -139,13 +141,11 @@ client = OpenAI(
 支持的取值因模型而异。适配器内置了 `MODEL_REASONING_EFFORTS_MAP`（来源：CC v0.26.7 客户端数据），当传入的强度值超出模型支持范围时，自动向上最近值（nearest-higher）映射。模型不在映射表中时不设该参数。
 
 | 模型 | 支持的值 |
-|---|---|
+|---|---|---|
 | deepseek/deepseek-v4-* | high, max |
-| claude-sonnet-4-6, claude-opus-4-6/7 | low, medium, high, xhigh, max |
+| claude-sonnet-4-6, claude-opus-4-6/7, claude-opus-5 | low, medium, high, xhigh, max |
 | gpt-5.5, gpt-5.4, gpt-5.3-codex | low, medium, high, xhigh |
-| gpt-5.4-mini, claude-haiku-4-5 | low, medium, high |
-| Qwen/Qwen3.6-Max-Preview, Qwen/Qwen3.6-Plus | low, medium, high |
-| stepfun/Step-3.5-Flash | low, medium, high |
+| gpt-5.4-mini, claude-haiku-4-5, qwen-3-7-*, mimo-v2.5, inkling-small | low, medium, high |
 
 实现：对 `reasoning_effort` 按模型支持范围进行 clamp（nearest-higher）后透传给 CC API，不注入任何 system prompt。响应端保留 `reasoning-delta` 的过滤逻辑（`"off"` 模式下剥离 `reasoning_content`）。
 
@@ -280,9 +280,11 @@ The log format is controlled by `CC_ADAPTER_LOG_FORMAT` (default: `console`).
 {"event": "http.done", "level": "info", "logger": "cc_adapter.main", "method": "POST", "path": "/v1/chat/completions", "status_code": 200, "elapsed": "2.480s", "request_id": "8f3a91c2", "timestamp": "2026-05-13T07:42:34Z"}
 ```
 
-**Event names:** `app.start`, `http.done`, `openai.request`, `anthropic.request`, `upstream.error`, `upstream.retry`, `upstream.usage`, `tool.call`, `auth.failed`, `admin.login.failed`, `admin.config.updated`, `admin.verify_key`
+**Event names:** `app.start`, `http.done`, `openai.request`, `anthropic.request`, `responses.request`, `upstream.error`, `upstream.retry`, `upstream.usage`, `tool.call`, `auth.failed`, `admin.login.failed`, `admin.config.updated`, `admin.verify_key`
 
-**Redaction:** Sensitive fields (authorization, API keys, messages, tool edit parameters) are automatically replaced with `***`.
+Each request log includes `reasoning_effort` (client-requested) and `cc_reasoning_effort` (clamped value sent to CC), plus `thinking_budget` for Anthropic mode.
+
+**Redaction:** Sensitive fields (authorization, API keys, messages, tool edit parameters, paths) are automatically replaced with `***`.
 
 ### Usage
 
@@ -339,13 +341,11 @@ The adapter supports the `reasoning_effort` parameter to control the model's rea
 Supported values vary per model. The adapter uses `MODEL_REASONING_EFFORTS_MAP` (sourced from CC v0.26.7 client data). When a value exceeds a model's supported range, it is clamped to the nearest higher supported value. Models not in the map get no `reasoning_effort` param.
 
 | Model | Supported Values |
-|---|---|
+|---|---|---|
 | deepseek/deepseek-v4-* | high, max |
-| claude-sonnet-4-6, claude-opus-4-6/7 | low, medium, high, xhigh, max |
+| claude-sonnet-4-6, claude-opus-4-6/7, claude-opus-5 | low, medium, high, xhigh, max |
 | gpt-5.5, gpt-5.4, gpt-5.3-codex | low, medium, high, xhigh |
-| gpt-5.4-mini, claude-haiku-4-5 | low, medium, high |
-| Qwen/Qwen3.6-Max-Preview, Qwen/Qwen3.6-Plus | low, medium, high |
-| stepfun/Step-3.5-Flash | low, medium, high |
+| gpt-5.4-mini, claude-haiku-4-5, qwen-3-7-*, mimo-v2.5, inkling-small | low, medium, high |
 
 Implementation: clamps `reasoning_effort` to the model's supported range (nearest-higher), then forwards to CC API. **No system prompt injection**. Response-side filtering strips `reasoning-delta` events when set to `"off"`.
 
