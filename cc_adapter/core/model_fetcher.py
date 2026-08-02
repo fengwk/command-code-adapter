@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import posixpath
 import re
 import tarfile
 import tempfile
@@ -54,6 +55,7 @@ class ModelFetcher:
         self._provider_map = dict(MODEL_PROVIDER_MAP)
         self._reasoning_efforts = dict(MODEL_REASONING_EFFORTS_MAP)
         self._static_provider_map = dict(MODEL_PROVIDER_MAP)
+        self._static_reasoning_efforts = dict(MODEL_REASONING_EFFORTS_MAP)
 
         self._load_cache()
 
@@ -92,7 +94,7 @@ class ModelFetcher:
         if self._fetched_at is None:
             return True
         ttl = NPM_ERROR_BACKOFF if self._last_error else NPM_CACHE_TTL
-        return time.monotonic() - self._fetched_at > ttl
+        return time.time() - self._fetched_at > ttl
 
     def _load_cache(self) -> bool:
         if not self._cache_path.exists():
@@ -100,7 +102,13 @@ class ModelFetcher:
         try:
             data = json.loads(self._cache_path.read_text())
             self._cached_version = data.get("version")
-            self._fetched_at = data.get("fetched_at")
+            fetched_at = data.get("fetched_at")
+            try:
+                fetched_at = float(fetched_at)
+            except (TypeError, ValueError):
+                fetched_at = None
+            # Old monotonic timestamps are not valid after restart.
+            self._fetched_at = fetched_at if fetched_at is not None and fetched_at >= 1_000_000_000 else None
             entries = data.get("models", [])
             if entries:
                 self._build_maps(entries)
@@ -113,7 +121,7 @@ class ModelFetcher:
         models: list[dict] = []
         provider_map: dict[str, str] = {}
         reasoning_efforts: dict[str, list[str]] = {}
-        now = int(time.monotonic())
+        now = int(time.time())
 
         for e in entries:
             model_id = e["id"]
@@ -133,13 +141,17 @@ class ModelFetcher:
             )
 
             short = parts[1] if len(parts) > 1 else model_id
-            provider_map[short] = model_id
+            canonical_id = self._static_provider_map.get(short, model_id) if len(parts) > 1 else model_id
+            provider_map[short] = canonical_id
 
             if efforts:
-                reasoning_efforts[model_id] = list(efforts)
+                reasoning_efforts[canonical_id] = list(efforts)
 
         for k, v in self._static_provider_map.items():
             provider_map.setdefault(k, v)
+
+        for k, v in self._static_reasoning_efforts.items():
+            reasoning_efforts.setdefault(k, v)
 
         self._models_data = models
         self._provider_map = provider_map
@@ -158,7 +170,7 @@ class ModelFetcher:
                 raise ValueError("could not determine latest version")
 
             if not force and self._cached_version == latest_version and self._fetched_at is not None:
-                self._fetched_at = time.monotonic()
+                self._fetched_at = time.time()
                 self._sync_maps()
                 logger.info("model_fetcher.version_unchanged", version=latest_version)
                 return
@@ -178,20 +190,20 @@ class ModelFetcher:
 
             cache = {
                 "version": latest_version,
-                "fetched_at": time.monotonic(),
+                "fetched_at": time.time(),
                 "models": entries,
             }
             self._atomic_write_cache(cache)
 
             self._build_maps(entries)
             self._cached_version = latest_version
-            self._fetched_at = time.monotonic()
+            self._fetched_at = time.time()
             self._sync_maps()
             logger.info("model_fetcher.updated", version=latest_version, count=len(entries), forced=force)
 
         except Exception as e:
             self._last_error = str(e)
-            self._fetched_at = time.monotonic()
+            self._fetched_at = time.time()
             logger.warning("model_fetcher.fetch_failed", error=str(e))
 
     async def force_refresh(self) -> None:
@@ -205,18 +217,45 @@ class ModelFetcher:
 
     def _extract_models(self, tarball_data: bytes) -> list[dict]:
         with tarfile.open(fileobj=io.BytesIO(tarball_data), mode="r:gz") as tar:
+            members = {member.name.lstrip("./"): member for member in tar.getmembers() if member.isfile()}
+            package_json_name = next(
+                (name for name in members if name == "package.json" or name.endswith("/package.json")), None
+            )
+            package_root = package_json_name.rsplit("/", 1)[0] if package_json_name and "/" in package_json_name else ""
+            main = None
+            if package_json_name:
+                package_file = tar.extractfile(members[package_json_name])
+                if package_file:
+                    try:
+                        main = json.loads(package_file.read().decode("utf-8")).get("main")
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                        pass
+
             mjs = None
-            for member in tar.getmembers():
-                if member.name.endswith("dist/index.mjs"):
-                    f = tar.extractfile(member)
-                    if f:
-                        mjs = f.read().decode("utf-8")
+            for candidate in (main, "dist/cli.mjs", "dist/index.mjs"):
+                if not isinstance(candidate, str) or not candidate:
+                    continue
+                candidate = posixpath.normpath(candidate.lstrip("./"))
+                names = [candidate]
+                if package_root and not candidate.startswith(f"{package_root}/"):
+                    names.insert(0, f"{package_root}/{candidate}")
+                for name in names:
+                    member = members.get(name)
+                    if member is None:
+                        member = next((item for key, item in members.items() if key.endswith(f"/{candidate}")), None)
+                    if member is None:
+                        continue
+                    file_obj = tar.extractfile(member)
+                    if file_obj:
+                        mjs = file_obj.read().decode("utf-8")
+                        break
+                if mjs:
                     break
 
             if not mjs:
-                raise ValueError("index.mjs not found in tarball")
+                raise ValueError("model catalog entrypoint not found in tarball")
 
-            entries: list[dict] = []
+            entries_by_id: dict[str, dict] = {}
             for m in re.finditer(r'(\w+)\s*:\s*\{\s*id\s*:\s*["\x60]([^"\x60]+)["\x60]', mjs):
                 model_id = m.group(2)
                 if not (model_id.startswith(MODEL_PREFIXES) or "/" in model_id):
@@ -232,14 +271,16 @@ class ModelFetcher:
                 re_match = re.search(r"reasoningEfforts\s*:\s*(\[[^\]]+\])", obj_text)
                 efforts = json.loads(re_match.group(1)) if re_match else None
 
-                entries.append(
-                    {
-                        "id": model_id,
-                        "context_window": context_window,
-                        "reasoning_efforts": efforts,
-                    }
-                )
+                entry = {
+                    "id": model_id,
+                    "context_window": context_window,
+                    "reasoning_efforts": efforts,
+                }
+                previous = entries_by_id.get(model_id)
+                if previous is None or (not previous.get("reasoning_efforts") and efforts):
+                    entries_by_id[model_id] = entry
 
+            entries = list(entries_by_id.values())
             entries.sort(key=lambda x: -(x.get("context_window") or 0))
             return entries
 

@@ -20,7 +20,7 @@ class TestVersionChecker:
     async def test_get_version_returns_default_on_first_call(self):
         checker = VersionChecker()
         version = checker.get_version()
-        assert version == "0.25.2"
+        assert version == "1.6.0"
 
     @pytest.mark.asyncio
     async def test_get_version_returns_cached_value_without_fetch(self):
@@ -46,9 +46,9 @@ class TestVersionChecker:
             side_effect=httpx.RequestError("connection failed")
         )
         checker = VersionChecker()
-        checker._cached_version = "0.25.2"
+        checker._cached_version = "1.6.0"
         await checker.refresh()
-        assert checker.get_version() == "0.25.2"
+        assert checker.get_version() == "1.6.0"
         assert checker.last_error is not None
         assert checker.last_fetch_time is not None  # backoff enforced
 
@@ -59,7 +59,7 @@ class TestVersionChecker:
         )
         checker = VersionChecker()
         await checker.refresh()
-        assert checker.get_version() == "0.25.2"
+        assert checker.get_version() == "1.6.0"
 
     @pytest.mark.asyncio
     async def test_refresh_sets_fetch_time_even_when_version_missing(self, respx_mock):
@@ -69,7 +69,7 @@ class TestVersionChecker:
         checker = VersionChecker()
         await checker.refresh()
         assert checker.last_fetch_time is not None
-        assert checker.get_version() == "0.25.2"
+        assert checker.get_version() == "1.6.0"
 
     @pytest.mark.asyncio
     async def test_failure_clears_old_error_before_attempt(self, respx_mock):
@@ -101,7 +101,7 @@ class TestVersionChecker:
         checker = VersionChecker()
         checker._last_fetch_time = None
         checker.get_version()
-        assert checker.get_version() == "0.25.2"
+        assert checker.get_version() == "1.6.0"
         if checker._fetch_task is not None:
             await checker._fetch_task
         assert checker.get_version() == "0.28.0"

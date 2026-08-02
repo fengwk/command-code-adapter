@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-import datetime
 import structlog
 from typing import Any
 
@@ -18,18 +16,15 @@ from cc_adapter.providers.shared.model_mapping import (
     NOT_SUPPORTED_PARAMS,
 )
 from cc_adapter.command_code.body import make_cc_body, make_config
-from cc_adapter.command_code.headers import make_cc_headers
 
 logger = structlog.get_logger(__name__)
 
 
 class RequestTranslator:
-    def translate(self, req: ChatCompletionRequest) -> tuple[dict[str, Any], dict[str, Any]]:
+    def translate(self, req: ChatCompletionRequest) -> dict[str, Any]:
         self._warn_unsupported(req)
         system_prompt, messages = self._split_messages(req.messages)
-        cc_body = self._build_body(req, system_prompt, messages)
-        cc_headers = self._build_headers()
-        return cc_body, cc_headers
+        return self._build_body(req, system_prompt, messages)
 
     def _warn_unsupported(self, req: ChatCompletionRequest) -> None:
         for attr, name in NOT_SUPPORTED_PARAMS.items():
@@ -143,6 +138,3 @@ class RequestTranslator:
             if tool_choice is not None:
                 params["tool_choice"] = tool_choice
         return make_cc_body(config=make_config(), params=params)
-
-    def _build_headers(self) -> dict[str, str]:
-        return make_cc_headers()

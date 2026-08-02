@@ -14,7 +14,7 @@ from cc_adapter.providers.anthropic.response import (
     collect_and_translate_anthropic_nonstream,
 )
 from cc_adapter.command_code.client import CommandCodeClient
-from cc_adapter.core.retry import retry_on_empty, stream_with_retry
+from cc_adapter.core.retry import stream_with_retry
 from cc_adapter.core.runtime import get_anthropic_translator
 from cc_adapter.core.constants import STREAMING_HEADERS
 from cc_adapter.core.errors import AdapterError
@@ -50,7 +50,7 @@ async def anthropic_chat(req: AnthropicRequest, request: Request):
 
     try:
         translator = get_anthropic_translator()
-        cc_body, _ = translator.translate(req)
+        cc_body = translator.translate(req)
         cc_body["params"]["stream"] = True
 
         current_client = _get_client()
@@ -69,11 +69,8 @@ async def anthropic_chat(req: AnthropicRequest, request: Request):
                 media_type="text/event-stream",
                 headers=STREAMING_HEADERS,
             )
-        return await retry_on_empty(
-            lambda: current_client.generate(cc_body, client_headers),
-            lambda stream: collect_and_translate_anthropic_nonstream(stream, req.model),
-            logger,
-            "anthropic.nonstream",
+        return await collect_and_translate_anthropic_nonstream(
+            current_client.generate(cc_body, client_headers), req.model
         )
     except AdapterError as e:
         return JSONResponse(

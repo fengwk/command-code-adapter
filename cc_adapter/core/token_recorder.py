@@ -100,6 +100,26 @@ def _reset_recorder() -> None:
     _recorder = None
 
 
+def schedule_token_record(input_tokens: int, output_tokens: int, model: str | None = None) -> asyncio.Task | None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("token_recorder.schedule_failed", error="no running event loop")
+        return None
+    task = loop.create_task(record_daily_tokens(input_tokens, output_tokens, model=model))
+
+    def _consume_result(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("token_recorder.record_failed", error=str(exc))
+
+    task.add_done_callback(_consume_result)
+    return task
+
+
 async def record_daily_tokens(input_tokens: int, output_tokens: int, model: str | None = None) -> None:
     await get_token_recorder().record(input_tokens, output_tokens, model=model)
 

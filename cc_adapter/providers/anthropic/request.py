@@ -4,7 +4,6 @@ import structlog
 from typing import Any
 
 from cc_adapter.providers.anthropic.models import AnthropicRequest, extract_system_text, normalize_system_messages
-from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.providers.shared.model_mapping import resolve_model_id, clamp_reasoning_effort
 from cc_adapter.providers.shared.tool_mapping import make_tool_call_block, make_tool_result_block, normalize_schema
 from cc_adapter.command_code.body import make_config, make_cc_body
@@ -28,12 +27,10 @@ def _budget_to_effort(budget: int | None) -> str | None:
 
 
 class AnthropicTranslator:
-    def translate(self, req: AnthropicRequest) -> tuple[dict[str, Any], dict[str, Any]]:
+    def translate(self, req: AnthropicRequest) -> dict[str, Any]:
         req = normalize_system_messages(req)
         self._warn_unsupported(req)
-        cc_body = self._build_body(req)
-        cc_headers = make_cc_headers()
-        return cc_body, cc_headers
+        return self._build_body(req)
 
     def _warn_unsupported(self, req: AnthropicRequest) -> None:
         for param in _NOT_SUPPORTED:

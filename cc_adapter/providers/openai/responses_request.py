@@ -7,7 +7,6 @@ import structlog
 
 from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
 from cc_adapter.command_code.body import make_config, make_cc_body
-from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.core.errors import AdapterError
 from cc_adapter.providers.shared.model_mapping import (
     resolve_model_id,
@@ -52,13 +51,11 @@ SUPPORTED_MESSAGE_ROLES = {"user", "assistant", "system", "developer"}
 
 
 class ResponsesRequestTranslator:
-    def translate(self, req: ResponseCreateRequest) -> tuple[dict[str, Any], dict[str, Any]]:
+    def translate(self, req: ResponseCreateRequest) -> dict[str, Any]:
         self._validate_session_params(req)
         self._warn_unsupported(req)
         self._validate_tools(req)
-        cc_body = self._build_body(req)
-        cc_headers = make_cc_headers()
-        return cc_body, cc_headers
+        return self._build_body(req)
 
     def _warn_unsupported(self, req: ResponseCreateRequest) -> None:
         for attr in RESPONSES_NOT_SUPPORTED:

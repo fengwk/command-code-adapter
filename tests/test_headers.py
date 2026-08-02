@@ -7,7 +7,7 @@ class TestMakeCcHeaders:
     def test_base_headers(self):
         headers = make_cc_headers()
         assert headers["Content-Type"] == "application/json"
-        assert headers["x-command-code-version"] == "0.25.2"
+        assert headers["x-command-code-version"] == "1.6.0"
         assert headers["x-cli-environment"] == "production"
         assert headers["x-co-flag"] == "false"
         assert headers["x-taste-learning"] == "false"
@@ -55,7 +55,7 @@ class TestVersionHeader:
         reset_version_checker()
         headers = make_cc_headers()
         assert "x-command-code-version" in headers
-        assert headers["x-command-code-version"] == "0.25.2"  # default before fetch
+        assert headers["x-command-code-version"] == "1.6.0"  # default before fetch
 
     def test_x_command_code_version_reflects_checker(self, monkeypatch):
         checker = get_version_checker()

@@ -37,6 +37,16 @@ async def test_nonstream_tool_calls():
 
 
 @pytest.mark.asyncio
+async def test_nonstream_tool_call_input_is_coerced_to_object():
+    async def fake_stream():
+        yield {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": '[{"path":"/tmp/x"}]'}
+        yield {"type": "finish", "finishReason": "tool_calls", "totalUsage": {"inputTokens": 1, "outputTokens": 1}}
+
+    result = await collect_and_translate_nonstream(fake_stream(), "gpt-5.4", time.time())
+    assert result.choices[0].message.tool_calls[0].function.arguments == '{"filePath": "/tmp/x"}'
+
+
+@pytest.mark.asyncio
 async def test_stream_output():
     async def fake_stream():
         yield {"type": "text-delta", "text": "Hi"}
@@ -63,6 +73,16 @@ async def test_stream_tool_call_delta_includes_index():
         chunks.append(chunk)
 
     assert '"tool_calls":[{"index":0,"id":"call_1"' in chunks[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_tool_call_input_is_coerced_to_object():
+    async def fake_stream():
+        yield {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": "malformed"}
+        yield {"type": "finish", "finishReason": "tool_calls", "totalUsage": {"inputTokens": 1, "outputTokens": 1}}
+
+    chunks = [chunk async for chunk in translate_stream(fake_stream(), "gpt-5.4", time.time())]
+    assert '"arguments":"{}"' in chunks[0]
 
 
 @pytest.mark.asyncio

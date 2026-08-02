@@ -50,6 +50,10 @@ class TestZdrErrorDetection:
         text = '{"error":{"message":"Disable CMD_ZDR for this model"}}'
         assert _is_zdr_error(400, text) is True
 
+    @pytest.mark.parametrize("marker", ["CMD_ZDR_NO_PROVIDERS", "cmd_zdr_no_providers"])
+    def test_detects_no_provider_marker(self, marker):
+        assert _is_zdr_error(400, f'{{"error":{{"code":"{marker}"}}}}') is True
+
     def test_ignores_other_400_errors(self):
         text = '{"error":{"message":"Bad request: invalid model"}}'
         assert _is_zdr_error(400, text) is False

@@ -52,8 +52,7 @@ def normalize_schema(schema: dict) -> dict:
 
 
 def normalize_args(tool_name: str, args: dict, map_path: bool = True) -> dict:
-    if not isinstance(args, dict):
-        return args
+    args = coerce_tool_input(args)
     result = {}
     for k, v in args.items():
         if map_path and tool_name.lower() in FILE_TOOLS:
@@ -82,9 +81,21 @@ def make_tool_result_block(tool_call_id: str, tool_name: str, value: str) -> dic
 
 
 def normalize_input_args(args: dict) -> dict:
-    if not isinstance(args, dict):
-        return args
+    args = coerce_tool_input(args)
     return {SCHEMA_PARAM_MAP.get(k, k): v for k, v in args.items()}
+
+
+def coerce_tool_input(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return coerce_tool_input(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    if isinstance(raw, list) and len(raw) == 1:
+        return coerce_tool_input(raw[0])
+    return {}
 
 
 def translate_tool_choice(tool_choice: Any) -> dict[str, Any] | None:

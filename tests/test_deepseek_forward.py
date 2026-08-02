@@ -37,7 +37,7 @@ async def test_web_search_tool_goes_to_cc_not_deepseek():
             return_value=HttpxResponse(200, content=b"should not be called")
         )
         respx_mock.get("https://registry.npmjs.org/command-code/latest").mock(
-            return_value=HttpxResponse(200, json={"version": "0.25.2"})
+            return_value=HttpxResponse(200, json={"version": "1.6.0"})
         )
 
         transport = ASGITransport(app=app)
@@ -70,7 +70,7 @@ async def test_regular_request_still_works():
             return_value=HttpxResponse(200, content=CC_SSE_RESPONSE)
         )
         respx_mock.get("https://registry.npmjs.org/command-code/latest").mock(
-            return_value=HttpxResponse(200, json={"version": "0.25.2"})
+            return_value=HttpxResponse(200, json={"version": "1.6.0"})
         )
 
         transport = ASGITransport(app=app)

@@ -95,10 +95,14 @@ async def query_token_usage(base_url: str, api_key: str, timeout: float = 15.0) 
                 usage_data = usage_resp.json()
                 five_hour = window_limits.get("fiveHour") or {}
                 weekly = window_limits.get("weekly") or {}
+                # ponytail: compute limited locally from individual windows;
+                # upstream may report limited=true even when no window is at cap.
+                five_hour_limited = (five_hour.get("cap") or 0) > 0 and (five_hour.get("used") or 0) >= (five_hour.get("cap") or 0)
+                weekly_limited = (weekly.get("cap") or 0) > 0 and (weekly.get("used") or 0) >= (weekly.get("cap") or 0)
                 result["usage"] = {
                     "total_cost": usage_data.get("totalCost", 0),
                     "total_count": usage_data.get("totalCount", 0),
-                    "limited": window_limits.get("limited", False),
+                    "limited": five_hour_limited or weekly_limited,
                     "fiveHour": (
                         {
                             "used": five_hour.get("used", 0),

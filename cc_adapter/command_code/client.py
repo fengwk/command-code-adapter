@@ -47,6 +47,9 @@ _INSUFFICIENT_CREDITS_PHRASES = (
 _ZDR_ERROR_PHRASES = (
     "zero-data-retention",
     "disable cmd_zdr",
+    "cmd_zdr_no_providers",
+    "cmd_zdr_no-providers",
+    "cmd zdr no providers",
 )
 
 

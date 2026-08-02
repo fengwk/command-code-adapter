@@ -14,7 +14,7 @@ def translator():
 @pytest.mark.asyncio
 async def test_simple_string_input(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hello")
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     params = body["params"]
     assert params["model"] == "deepseek/deepseek-v4-flash"
     assert len(params["messages"]) == 1
@@ -27,35 +27,35 @@ async def test_simple_string_input(translator):
 @pytest.mark.asyncio
 async def test_instructions_mapped_to_system(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", instructions="Be concise")
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["system"] == "Be concise"
 
 
 @pytest.mark.asyncio
 async def test_temperature_passthrough(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", temperature=0.7)
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["temperature"] == 0.7
 
 
 @pytest.mark.asyncio
 async def test_max_output_tokens_mapped(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", max_output_tokens=100)
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["max_tokens"] == 100
 
 
 @pytest.mark.asyncio
 async def test_reasoning_effort_mapped(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", reasoning={"effort": "high"})
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
 async def test_reasoning_effort_xhigh_clamps_for_deepseek(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", reasoning={"effort": "xhigh"})
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "max"
 
 
@@ -72,7 +72,7 @@ async def test_tools(translator):
             }
         ],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["tools"]) == 1
     assert body["params"]["tools"][0]["name"] == "Read"
 
@@ -82,14 +82,14 @@ async def test_tool_choice_auto(translator):
     req = ResponseCreateRequest(
         model="deepseek-v4-flash", input="Hi", tools=[{"name": "Read", "input_schema": {}}], tool_choice="auto"
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "auto"}
 
 
 @pytest.mark.asyncio
 async def test_tool_choice_none(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", tool_choice="none")
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "none"}
 
 
@@ -103,7 +103,7 @@ async def test_multi_turn_input_list(translator):
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "How are you?"}]},
         ],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["messages"]) == 3
     assert body["params"]["messages"][0]["role"] == "user"
     assert body["params"]["messages"][1]["role"] == "assistant"
@@ -119,7 +119,7 @@ async def test_function_call_output_in_input(translator):
             {"type": "function_call_output", "call_id": "call_1", "output": "file content"},
         ],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["messages"]) == 2
     assert body["params"]["messages"][0]["role"] == "assistant"
     assert body["params"]["messages"][0]["content"][0]["type"] == "tool-call"
@@ -130,7 +130,7 @@ async def test_function_call_output_in_input(translator):
 @pytest.mark.asyncio
 async def test_unknown_model_passthrough(translator):
     req = ResponseCreateRequest(model="unknown-model-42", input="Hi")
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "unknown-model-42"
 
 
@@ -147,7 +147,7 @@ async def test_output_text_content_block_not_stringified(translator):
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Tell me more"}]},
         ],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     msgs = body["params"]["messages"]
     assert len(msgs) == 2
     assert msgs[0]["content"][0]["type"] == "text"
@@ -189,7 +189,7 @@ async def test_function_tool_passes_validation(translator):
         input="do it",
         tools=[{"name": "my_func", "input_schema": {"type": "object", "properties": {}}}],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["tools"]) == 1
     assert body["params"]["tools"][0]["name"] == "my_func"
 
@@ -235,7 +235,7 @@ async def test_unsupported_input_item_type_raises_400(translator):
 @pytest.mark.asyncio
 async def test_tool_choice_standard_dict_passthrough(translator):
     req = ResponseCreateRequest(model="deepseek-v4-flash", input="Hi", tool_choice={"type": "none"})
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "none"}
 
 
@@ -247,7 +247,7 @@ async def test_tool_choice_function_dict_translates(translator):
         tools=[{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
         tool_choice={"type": "function", "name": "Read"},
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "tool", "name": "Read"}
 
 
@@ -444,7 +444,7 @@ async def test_assistant_tool_calls_without_text_content_translates(translator):
             {"type": "function_call_output", "call_id": "call_1", "output": "file content"},
         ],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     messages = body["params"]["messages"]
     assert messages[0]["role"] == "assistant"
     assert messages[0]["content"] == [

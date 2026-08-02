@@ -26,6 +26,7 @@ MODEL_PROVIDER_MAP: dict[str, str] = {
     "claude-opus-4-8": "anthropic:claude-opus-4-8",
     "claude-opus-4-7": "anthropic:claude-opus-4-7",
     "claude-opus-4-6": "anthropic:claude-opus-4-6",
+    "claude-opus-5": "anthropic:claude-opus-5",
     "claude-fable-5": "anthropic:claude-fable-5",
     "claude-haiku-4-5": "anthropic:claude-haiku-4-5-20251001",
     "gpt-5.5": "openai:gpt-5.5",
@@ -33,6 +34,13 @@ MODEL_PROVIDER_MAP: dict[str, str] = {
     "gpt-5.3-codex": "openai:gpt-5.3-codex",
     "gpt-5.4-mini": "openai:gpt-5.4-mini",
     "kimi-k2-7-code": "moonshotai/Kimi-K2.7-Code",
+    "mimo-v2.5-pro": "xiaomi/mimo-v2.5-pro",
+    "mimo-v2.5": "xiaomi/mimo-v2.5",
+    "inkling-small": "thinkingmachines/inkling-small",
+    "qwen-3-7-max": "Qwen/Qwen3.7-Max",
+    "qwen-3-7-plus": "Qwen/Qwen3.7-Plus",
+    "qwen-3-7-flash": "Qwen/Qwen3.7-Flash",
+    "ling-3-0-flash-free": "inclusionai/ling-3.0-flash-free",
 }
 
 MODEL_REASONING_EFFORTS_MAP: dict[str, list[str]] = {
@@ -48,6 +56,7 @@ MODEL_REASONING_EFFORTS_MAP: dict[str, list[str]] = {
     "anthropic:claude-opus-4-8": ["low", "medium", "high", "xhigh", "max"],
     "anthropic:claude-opus-4-7": ["low", "medium", "high", "xhigh", "max"],
     "anthropic:claude-opus-4-6": ["low", "medium", "high", "xhigh", "max"],
+    "anthropic:claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
     "anthropic:claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
     "anthropic:claude-haiku-4-5-20251001": ["low", "medium", "high"],
     "openai:gpt-5.5": ["low", "medium", "high", "xhigh"],
@@ -58,6 +67,12 @@ MODEL_REASONING_EFFORTS_MAP: dict[str, list[str]] = {
     "Qwen/Qwen3.6-Plus": ["low", "medium", "high"],
     "stepfun/Step-3.5-Flash": ["low", "medium", "high"],
     "zai-org/GLM-5.2": ["high", "max"],
+    "xiaomi/mimo-v2.5": ["low", "medium", "high"],
+    "Qwen/Qwen3.7-Max": ["low", "medium", "high"],
+    "Qwen/Qwen3.7-Plus": ["low", "medium", "high"],
+    "Qwen/Qwen3.7-Flash": ["low", "medium", "high"],
+    "thinkingmachines/inkling-small": ["low", "medium", "high"],
+    "inclusionai/ling-3.0-flash-free": ["low", "medium", "high"],
 }  # ponytail: duplicated entries with old and new prefix formats, merge when old format is fully deprecated
 
 NOT_SUPPORTED_PARAMS = {

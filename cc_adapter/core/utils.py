@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
+
+
+_PII_PATTERNS = (
+    (re.compile(r"(?<![A-Za-z0-9])(?:/home|/Users|/root)/[^\s\"'`<>]+"), "<path>"),
+    (re.compile(r"(?<![A-Za-z0-9])~[\\/][^\s\"'`<>]+"), "<path>"),
+    (re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s\"'`<>]+", re.I), "<path>"),
+    (re.compile(r"\b(?:sk-|key-|ghp_)[A-Za-z0-9_-]+\b"), "<secret>"),
+    (re.compile(r"(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])"), "<secret>"),
+    (re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9])"), "<secret>"),
+    (re.compile(r"(?i)(\b(?:bearer|token|secret|api[_ -]?key)\s*[:=]\s*)[^\s,;]+"), r"\1<secret>"),
+)
+
+
+def scrub_pii(value: str) -> str:
+    for pattern, replacement in _PII_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
 
 
 def generate_id(prefix: str = "", length: int = 12) -> str:

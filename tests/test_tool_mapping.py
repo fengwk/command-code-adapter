@@ -3,6 +3,7 @@ from cc_adapter.providers.shared.tool_mapping import (
     make_tool_result_block,
     normalize_schema,
     normalize_args,
+    coerce_tool_input,
     translate_tool_choice,
 )
 from cc_adapter.providers.shared.tool_mapping import SCHEMA_PARAM_MAP
@@ -73,7 +74,23 @@ class TestNormalizeArgs:
         assert normalize_args("read", {}) == {}
 
     def test_handles_none(self):
-        assert normalize_args("read", None) is None
+        assert normalize_args("read", None) == {}
+
+
+class TestCoerceToolInput:
+    def test_dict_is_preserved(self):
+        value = {"path": "/tmp/test"}
+        assert coerce_tool_input(value) is value
+
+    def test_single_item_array_is_unwrapped(self):
+        assert coerce_tool_input([{"path": "/tmp/test"}]) == {"path": "/tmp/test"}
+
+    def test_json_object_string_is_parsed(self):
+        assert coerce_tool_input('{"path":"/tmp/test"}') == {"path": "/tmp/test"}
+
+    def test_non_object_values_become_empty_object(self):
+        for value in ("not-json", "hello", [1, 2], "[1, 2]", "null", None, 1):
+            assert coerce_tool_input(value) == {}
 
 
 class TestMakeToolCallBlock:

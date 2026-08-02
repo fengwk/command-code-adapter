@@ -11,7 +11,7 @@ logger = structlog.get_logger(__name__)
 
 from cc_adapter.core.constants import NPM_URL, NPM_CACHE_TTL, NPM_ERROR_BACKOFF
 
-DEFAULT_VERSION = os.environ.get("CC_ADAPTER_DEFAULT_VERSION", "0.25.2")
+DEFAULT_VERSION = os.environ.get("CC_ADAPTER_DEFAULT_VERSION", "1.6.0")
 
 
 class VersionChecker:

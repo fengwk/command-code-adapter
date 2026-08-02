@@ -357,7 +357,7 @@ async def test_query_usage_extracts_limits():
         result = await query_token_usage("https://api.commandcode.ai", "test-key")
 
     assert result["ok"] is True
-    assert result["usage"]["limited"] is True
+    assert result["usage"]["limited"] is False  # neither window at cap
     assert result["usage"]["fiveHour"]["used"] == 42
     assert result["usage"]["fiveHour"]["cap"] == 100
     assert result["usage"]["weekly"]["used"] == 150

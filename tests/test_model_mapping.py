@@ -44,6 +44,10 @@ class TestClampReasoningEffort:
     def test_glm_5_2_supports_max_reasoning_effort(self):
         assert clamp_reasoning_effort("glm-5-2", "max") == "max"
 
+    def test_claude_opus_5_static_fallback_supports_full_range(self):
+        assert resolve_model_id("claude-opus-5") == "anthropic:claude-opus-5"
+        assert clamp_reasoning_effort("claude-opus-5", "max") == "max"
+
     def test_unknown_effort_falls_back_to_max(self):
         assert clamp_reasoning_effort("deepseek/deepseek-v4-flash", "extreme") == "max"
 

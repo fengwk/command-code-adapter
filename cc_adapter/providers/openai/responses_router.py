@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from cc_adapter.core.errors import AdapterError
-from cc_adapter.core.retry import retry_on_empty, stream_with_retry
+from cc_adapter.core.retry import stream_with_retry
 from cc_adapter.core.runtime import get_config, get_or_create_client, get_responses_translator
 from cc_adapter.core.constants import STREAMING_HEADERS
 from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
@@ -34,7 +34,7 @@ async def create_response(req: ResponseCreateRequest, request: Request):
 
     try:
         translator = get_responses_translator()
-        cc_body, _ = translator.translate(req)
+        cc_body = translator.translate(req)
         cc_body["params"]["stream"] = True
 
         current_client = get_or_create_client()
@@ -54,11 +54,8 @@ async def create_response(req: ResponseCreateRequest, request: Request):
                 headers=STREAMING_HEADERS,
             )
         else:
-            result = await retry_on_empty(
-                lambda: current_client.generate(cc_body, client_headers),
-                lambda stream: collect_and_translate_responses_nonstream(stream, req.model),
-                logger,
-                "responses.nonstream",
+            result = await collect_and_translate_responses_nonstream(
+                current_client.generate(cc_body, client_headers), req.model
             )
             return result
     except AdapterError as e:
