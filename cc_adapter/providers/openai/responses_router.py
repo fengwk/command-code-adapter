@@ -37,6 +37,13 @@ async def create_response(req: ResponseCreateRequest, request: Request):
         cc_body = translator.translate(req)
         cc_body["params"]["stream"] = True
 
+        logger.info(
+            "responses.request.cc",
+            model=req.model,
+            reasoning_effort=req.reasoning.get("effort") if req.reasoning else None,
+            cc_reasoning_effort=cc_body.get("params", {}).get("reasoning_effort"),
+        )
+
         current_client = get_or_create_client()
 
         client_headers = {k.lower(): v for k, v in request.headers.items()}

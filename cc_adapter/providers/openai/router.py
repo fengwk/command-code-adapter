@@ -21,6 +21,11 @@ router = APIRouter()
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     structlog.contextvars.bind_contextvars(protocol="openai")
 
+    translator = get_request_translator()
+    cc_body = translator.translate(req)
+    cc_body["params"]["stream"] = True
+    tools_available = bool(req.tools) and req.tool_choice != "none"
+
     logger.info(
         "openai.request",
         model=req.model,
@@ -28,12 +33,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         message_count=len(req.messages),
         tools="yes" if req.tools else "no",
         tool_choice=req.tool_choice,
+        reasoning_effort=req.reasoning_effort,
+        cc_reasoning_effort=cc_body.get("params", {}).get("reasoning_effort"),
     )
-
-    translator = get_request_translator()
-    cc_body = translator.translate(req)
-    cc_body["params"]["stream"] = True
-    tools_available = bool(req.tools) and req.tool_choice != "none"
 
     start_time = time.time()
 

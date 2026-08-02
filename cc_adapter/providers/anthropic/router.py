@@ -53,6 +53,13 @@ async def anthropic_chat(req: AnthropicRequest, request: Request):
         cc_body = translator.translate(req)
         cc_body["params"]["stream"] = True
 
+        logger.info(
+            "anthropic.request.cc",
+            model=req.model,
+            cc_reasoning_effort=cc_body.get("params", {}).get("reasoning_effort"),
+            thinking_budget=req.thinking.budget_tokens if req.thinking else None,
+        )
+
         current_client = _get_client()
 
         client_headers = {k.lower(): v for k, v in request.headers.items()}
