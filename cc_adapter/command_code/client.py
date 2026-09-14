@@ -8,7 +8,7 @@ import httpx
 
 from cc_adapter.core.errors import map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
 from cc_adapter.command_code.headers import make_cc_headers
-from cc_adapter.providers.shared.session_extractor import get_session_extractor
+from cc_adapter.providers.shared.session_extractor import SessionSignal, get_session_extractor
 
 logger = structlog.get_logger(__name__)
 
@@ -126,15 +126,20 @@ class CommandCodeClient:
             await self._http_client.aclose()
 
     async def generate(
-        self, body: dict[str, Any], extra_headers: dict[str, str] | None = None
+        self,
+        body: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+        session: SessionSignal | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         tried_keys: set[str] = set()
         last_error: Exception | None = None
         zdr_downgraded: bool = False
         extractor = get_session_extractor()
         # extra_headers may contain client-authored values (X-Session-ID etc.)
-        # for stable-flag extraction but must not leak to the CC upstream.
-        stable_flag = extractor.extract_stable_flag(body, extra_headers)
+        # for session extraction but must not leak to the CC upstream. Routers
+        # pass an already-resolved signal; when they do not, fall back to
+        # extracting from the headers and the CC body alone.
+        signal = session or extractor.extract(extra_headers, None, body)
 
         while True:
             if self.key_pool is not None:
@@ -152,7 +157,7 @@ class CommandCodeClient:
 
             tried_keys.add(key)
 
-            session_id, project_slug = extractor.derive(stable_flag, key)
+            session_id, project_slug = extractor.derive(signal.flag, key)
 
             headers = make_cc_headers(key)
             if zdr_downgraded:

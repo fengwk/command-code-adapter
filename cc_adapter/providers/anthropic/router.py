@@ -19,6 +19,7 @@ from cc_adapter.core.runtime import get_anthropic_translator
 from cc_adapter.core.constants import STREAMING_HEADERS
 from cc_adapter.core.errors import AdapterError
 from cc_adapter.core.utils import format_sse
+from cc_adapter.providers.shared.session_extractor import get_session_extractor
 
 logger = structlog.get_logger(__name__)
 
@@ -63,11 +64,14 @@ async def anthropic_chat(req: AnthropicRequest, request: Request):
         current_client = _get_client()
 
         client_headers = {k.lower(): v for k, v in request.headers.items()}
+        # Resolve the session identity once per request; the upstream session
+        # id is derived per key from it (and retries keep the same identity).
+        session = get_session_extractor().extract(client_headers, req, cc_body)
 
         if req.stream:
             return StreamingResponse(
                 stream_with_retry(
-                    lambda: current_client.generate(cc_body, client_headers),
+                    lambda: current_client.generate(cc_body, client_headers, session=session),
                     lambda stream: translate_anthropic_stream(stream, req.model),
                     logger,
                     "anthropic.stream",
@@ -77,7 +81,7 @@ async def anthropic_chat(req: AnthropicRequest, request: Request):
                 headers=STREAMING_HEADERS,
             )
         return await collect_and_translate_anthropic_nonstream(
-            current_client.generate(cc_body, client_headers), req.model
+            current_client.generate(cc_body, client_headers, session=session), req.model
         )
     except AdapterError as e:
         return JSONResponse(

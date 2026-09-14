@@ -16,7 +16,7 @@ from cc_adapter.main import app
 def _make_mock_generate(mock_client, events: list[dict], events_second: list[dict] | None = None):
     call_count = 0
 
-    async def _generate(body, extra_headers=None):
+    async def _generate(body, extra_headers=None, session=None):
         nonlocal call_count
         call_count += 1
         chosen = events_second if call_count == 2 and events_second else events
@@ -71,7 +71,7 @@ async def test_claude_code_message_level_system_role_is_normalized(client):
     captured_body: dict[str, Any] = {}
     _, mock_client = _setup()
 
-    async def _generate(body, extra_headers=None):
+    async def _generate(body, extra_headers=None, session=None):
         captured_body.update(body)
         yield {"type": "text-delta", "text": "OK"}
         yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 1}}

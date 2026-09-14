@@ -14,6 +14,7 @@ from cc_adapter.providers.openai.responses_response import (
     collect_and_translate_responses_nonstream,
     _sse,
 )
+from cc_adapter.providers.shared.session_extractor import get_session_extractor
 
 logger = structlog.get_logger(__name__)
 
@@ -47,11 +48,14 @@ async def create_response(req: ResponseCreateRequest, request: Request):
         current_client = get_or_create_client()
 
         client_headers = {k.lower(): v for k, v in request.headers.items()}
+        # Resolve the session identity once per request; the upstream session
+        # id is derived per key from it (and retries keep the same identity).
+        session = get_session_extractor().extract(client_headers, req, cc_body)
 
         if req.stream:
             return StreamingResponse(
                 stream_with_retry(
-                    lambda: current_client.generate(cc_body, client_headers),
+                    lambda: current_client.generate(cc_body, client_headers, session=session),
                     lambda stream: translate_responses_stream(stream, req.model),
                     logger,
                     "responses.stream",
@@ -62,7 +66,7 @@ async def create_response(req: ResponseCreateRequest, request: Request):
             )
         else:
             result = await collect_and_translate_responses_nonstream(
-                current_client.generate(cc_body, client_headers), req.model
+                current_client.generate(cc_body, client_headers, session=session), req.model
             )
             return result
     except AdapterError as e:

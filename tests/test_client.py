@@ -141,12 +141,66 @@ async def test_generate_injects_derived_session_id_in_headers():
         async for _ in client.generate(body):
             pass
         _, kwargs = mock_stream.call_args
-        expected_sid, expected_slug = get_session_extractor().derive(
-            get_session_extractor().extract_stable_flag(body, {}),
-            "test",
-        )
+        extractor = get_session_extractor()
+        flag = extractor.extract({}, None, body).flag
+        expected_sid, expected_slug = extractor.derive(flag, "test")
         assert kwargs["headers"]["x-session-id"] == expected_sid
         assert kwargs["headers"]["x-project-slug"] == expected_slug
+
+
+@pytest.mark.asyncio
+async def test_generate_uses_provided_session_signal():
+    """An explicit SessionSignal from the router wins over local extraction."""
+    from unittest.mock import patch, AsyncMock
+
+    from cc_adapter.command_code.body import make_cc_body, make_config
+    from cc_adapter.providers.shared.session_extractor import SessionSignal, get_session_extractor
+
+    async def fake_lines():
+        yield '{"type":"finish","finishReason":"end_turn"}'
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_ctx
+    mock_ctx.is_error = False
+    mock_ctx.status_code = 200
+    mock_ctx.aiter_lines = fake_lines
+
+    body = make_cc_body(config=make_config(), params={"model": "test", "messages": []})
+    signal = SessionSignal("claude:abc-123", True)
+    with patch.object(httpx.AsyncClient, "stream", return_value=mock_ctx) as mock_stream:
+        client = CommandCodeClient(base_url="https://api.commandcode.ai", api_key="test")
+        async for _ in client.generate(body, {}, session=signal):
+            pass
+        _, kwargs = mock_stream.call_args
+        expected_sid, _ = get_session_extractor().derive(signal.flag, "test")
+        assert kwargs["headers"]["x-session-id"] == expected_sid
+
+
+@pytest.mark.asyncio
+async def test_generate_falls_back_to_header_extraction():
+    """Without a signal, generate() extracts the session flag from headers."""
+    from unittest.mock import patch, AsyncMock
+
+    from cc_adapter.command_code.body import make_cc_body, make_config
+    from cc_adapter.providers.shared.session_extractor import get_session_extractor
+
+    async def fake_lines():
+        yield '{"type":"finish","finishReason":"end_turn"}'
+
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_ctx
+    mock_ctx.is_error = False
+    mock_ctx.status_code = 200
+    mock_ctx.aiter_lines = fake_lines
+
+    body = make_cc_body(config=make_config(), params={"model": "test", "messages": []})
+    with patch.object(httpx.AsyncClient, "stream", return_value=mock_ctx) as mock_stream:
+        client = CommandCodeClient(base_url="https://api.commandcode.ai", api_key="test")
+        async for _ in client.generate(body, {"X-Session-ID": "abc-123"}):
+            pass
+        _, kwargs = mock_stream.call_args
+        expected_sid, _ = get_session_extractor().derive("header:abc-123", "test")
+        assert kwargs["headers"]["x-session-id"] == expected_sid
 
 
 class TestClientEdgeCases:
