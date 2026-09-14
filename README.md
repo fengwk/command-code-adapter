@@ -55,6 +55,9 @@ docker compose up -d
 | `CC_ADAPTER_HTTP_MAX_CONNECTIONS` | `200` | HTTP 连接池最大连接数 |
 | `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` | `50` | HTTP 连接池最大 Keepalive 连接数 |
 | `CC_ADAPTER_HTTP2` | `false` | 启用 HTTP/2 |
+| `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | 限流（429）冷却起始秒数，每次失败翻倍 |
+| `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | 限流冷却上限（秒） |
+| `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | 额度用尽的 Key 冷却时长（秒，固定值） |
 | `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存） |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | 可选的 OSS 提供商名称，作为 `x-oss-primary-provider` 请求头发送 |
 | `CC_ADAPTER_ENV_FILE` | `.env` | 配置文件路径（管理面板读写此文件，见下） |
@@ -78,8 +81,9 @@ volumes:
 
 - 客户端带会话标识时（Claude Code 的 `x-claude-code-session-id` / `metadata.user_id`、Codex 的 `session-id`、`x-session-id`、`prompt_cache_key` 等），同一会话固定使用同一个 Key；新会话按配置顺序轮询分配 —— 目的是最大化上游 prompt cache 命中率。
 - 识别不到会话标识的请求固定使用第一个可用 Key（fill-first），保证行为可预期。
-- Key 失效或额度用尽会自动切换：401/403 禁用该 Key，402/429 进入冷却退避（60s → 最大 1800s），并解除受影响会话的绑定，重试时自动重新绑定到健康 Key。
-- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/reset` 解除冷却或禁用。
+- Key 故障自动切换：401/403 直接禁用该 Key；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
+- 所有 Key 都不可用时**不再消耗上游调用**，直接返回最后一个 Key 的失败信息（附各 Key 状态摘要）。
+- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/reset` 解除冷却/禁用并清除余额缓存（充值后用）。
 
 ### 日志
 
@@ -276,6 +280,9 @@ docker compose up -d
 | `CC_ADAPTER_HTTP_MAX_CONNECTIONS` | `200` | HTTP connection pool max connections |
 | `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` | `50` | HTTP connection pool max keepalive connections |
 | `CC_ADAPTER_HTTP2` | `false` | Enable HTTP/2 |
+| `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | Rate-limit (429) cooldown start in seconds, doubles per failure |
+| `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap in seconds |
+| `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat cooldown for an out-of-credits key, in seconds |
 | `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Config file path (the admin panel reads and rewrites this file) |
@@ -299,8 +306,9 @@ With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adap
 
 - Requests carrying a session identity (Claude Code `x-claude-code-session-id` / `metadata.user_id`, Codex `session-id`, `x-session-id`, `prompt_cache_key`, …) stick to one key per conversation; new sessions are bound round-robin in configured order — this maximizes upstream prompt-cache hits.
 - Requests without a session identity always use the first usable key (fill-first).
-- Failures fail over automatically: 401/403 disables a key, 402/429 puts it in cooling backoff (60s → 1800s max) and unbinds the affected sessions, which rebind to a healthy key on retry.
-- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/reset` (clear cooling/disabled).
+- Failures fail over automatically: 401/403 disables a key, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
+- When every key is unusable the adapter makes **no further upstream call** and returns the last key's failure together with a per-key state summary.
+- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/reset` (clear cooling/disabled and the cached balance after a top-up).
 
 ### Logging
 

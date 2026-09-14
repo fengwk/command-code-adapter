@@ -41,3 +41,6 @@ token_usage.json
 
 # Local agent workspaces
 .workspace/
+
+# cmd CLI local artifacts (created when running `cmd` inside the repo)
+.commandcode/

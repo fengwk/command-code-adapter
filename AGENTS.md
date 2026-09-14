@@ -58,6 +58,9 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_HTTP_MAX_CONNECTIONS` | `200` | |
 | `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` | `50` | |
 | `CC_ADAPTER_HTTP2` | `false` | |
+| `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | Rate-limit (429) cooldown start, seconds — doubles per failure |
+| `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap, seconds |
+| `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat park window for an out-of-credits key, seconds |
 | `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). |
@@ -77,7 +80,7 @@ Both translate to CC /alpha/generate body, stream SSE back.
 - **Retry**: `core/retry.py` — `retry_on_empty()` for non-streaming (retries once on empty upstream response), `stream_with_retry()` for streaming (same retry logic + optional error event emission). Inside `client.py:generate()` a retryable upstream error (402/429/400-insufficient-credits) or a key error (401/403) feeds `KeyScheduler.report()` and moves to the next key.
 - **Admin auth**: HMAC-signed token in `core/auth.py` (not JWT); embeds `exp` (24h) + password hash prefix. API access validation at `core/auth.py:check_api_access()`. When `CC_ADAPTER_ADMIN_PASSWORD` is empty the admin API is **unauthenticated** (`verify_auth` short-circuits it; `main.py` logs a startup warning) — intranet-only deployments rely on this, do not reintroduce a 503 gate.
 - **ID generation**: `generate_id(prefix, length)` in `core/utils.py`.
-- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `VERSION`.
+- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `KEY_CREDIT_COOLDOWN`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `VERSION`. The three key cooldowns are also config fields (`CC_ADAPTER_KEY_COOLDOWN_BASE|MAX`, `CC_ADAPTER_KEY_CREDIT_COOLDOWN`) so deployments can tune them from the environment.
 - **Version checker**: Background npm polling, cached 30min, fallback `0.25.2` (env `CC_ADAPTER_DEFAULT_VERSION`). See `core/version_checker.py`. Tests must set `_last_fetch_time = None` (not `0.0`) to guarantee cache invalidation.
 - **Model fetcher**: `core/model_fetcher.py` — downloads the cmd CLI npm tarball (`registry.npmjs.org`, 30min TTL), extracts model ids/context windows/reasoning efforts and rebuilds the model list plus `MODEL_PROVIDER_MAP` / `MODEL_REASONING_EFFORTS_MAP` via `refresh_maps()`. Unknown model ids pass through unchanged, so new upstream models need no code change; the static tables in `catalog/models_data.py` / `providers/shared/model_mapping.py` are only the pre-fetch fallback.
 - **Key scheduler**: `core/key_scheduler.py` — `KeyScheduler` replaces the old `KeyPool` (deleted). Owns per-key health (ok/cooling/disabled), credits, round-robin + sticky session bindings and the fill-first fallback.
@@ -115,7 +118,8 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 - An established binding outranks key order — a recovered key does not steal a session back.
 - **Fill-first**: requests without an explicit identity (content-hash fallback, `explicit=False`) always go to the first usable key and are never bound.
 - Bindings slide: 1h TTL, 4096 entries, LRU eviction (`constants.py`).
-- Health: 401/403 disables a key and unbinds its sessions; 402/429 cools it down with escalating backoff (60s → 1800s); 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
+- Health: 401/403 disables a key and unbinds its sessions; 429 cools it down with escalating backoff (`KEY_COOLDOWN_BASE` → `KEY_COOLDOWN_MAX`); an out-of-credits failure (400 + "insufficient credits", or 402) parks the key for a flat `KEY_CREDIT_COOLDOWN` (30 min), zeroes its cached balance (the 30-min credits refresh, or `POST /admin/api/keys/{suffix}/reset`, clears it) and unbinds the affected session; 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
+- **Fail-fast**: when no key is usable, `select()` returns `None` and `client.py:_no_key_error()` raises the remembered `last_failure()` (status + upstream text) plus a per-key state summary — no extra upstream call is made. Tune the windows with `CC_ADAPTER_KEY_COOLDOWN_BASE` / `CC_ADAPTER_KEY_COOLDOWN_MAX` / `CC_ADAPTER_KEY_CREDIT_COOLDOWN`.
 - Ops endpoints: `GET /admin/api/keys`, `DELETE /admin/api/sessions`, `POST /admin/api/keys/{suffix}/reset`.
 
 ## Translation quirks
