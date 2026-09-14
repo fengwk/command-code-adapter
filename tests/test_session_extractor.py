@@ -1,13 +1,23 @@
 """Tests for cc_adapter.providers.shared.session_extractor."""
 
+import hashlib
+
 import pytest
 
 from cc_adapter.command_code.body import make_cc_body, make_config
+from cc_adapter.providers.anthropic.models import AnthropicRequest
+from cc_adapter.providers.openai.models import ChatCompletionRequest
+from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
 from cc_adapter.providers.shared.session_extractor import (
     SessionExtractor,
+    SessionSignal,
     get_session_extractor,
     is_valid_cmd_session_id,
 )
+
+# Claude Code sends `user_<hash>_account_<uuid>_session_<uuid>` in metadata.
+CLAUDE_USER_ID = "user_3f221fe6b5c1_account_2f8f0b68_session_ac980658-63bd-4fb3-97ba-8da64cb1e344"
+CLAUDE_SESSION_ID = "ac980658-63bd-4fb3-97ba-8da64cb1e344"
 
 
 def _cc_body(**params):
@@ -16,54 +26,222 @@ def _cc_body(**params):
     return make_cc_body(config=make_config(), params=params)
 
 
-class TestSessionExtractorStableFlag:
+def _chat_request(**overrides) -> ChatCompletionRequest:
+    payload = {"model": "deepseek/deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}]}
+    payload.update(overrides)
+    return ChatCompletionRequest(**payload)
+
+
+def _anthropic_request(**overrides) -> AnthropicRequest:
+    payload = {
+        "model": "deepseek/deepseek-v4-pro",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    payload.update(overrides)
+    return AnthropicRequest(**payload)
+
+
+def _responses_request(**overrides) -> ResponseCreateRequest:
+    payload = {"model": "deepseek/deepseek-v4-pro", "input": "hi"}
+    payload.update(overrides)
+    return ResponseCreateRequest(**payload)
+
+
+class TestPriorityChainLevels:
+    """One test per level of the documented CLIProxyAPI-style chain."""
+
     def setup_method(self):
         self.ex = SessionExtractor()
 
-    def test_header_x_session_id_takes_priority(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[]),
-            {"x-session-id": "abc-123"},
-        )
-        assert flag == "header:abc-123"
+    # level 1 ----------------------------------------------------------
+    def test_level1_claude_code_header(self):
+        signal = self.ex.extract({"x-claude-code-session-id": "cli-abc"})
+        assert signal == SessionSignal("claude:cli-abc", True)
 
-    def test_header_session_id_variant(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[]),
-            {"session_id": "sid-1"},
-        )
-        assert flag == "header:sid-1"
+    def test_level1_header_lookup_is_case_insensitive(self):
+        # Routers lowercase inbound headers, but the extractor must not rely on it.
+        signal = self.ex.extract({"X-Claude-Code-Session-Id": "cli-abc"})
+        assert signal == SessionSignal("claude:cli-abc", True)
 
-    def test_header_x_client_request_id(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[]),
-            {"x-client-request-id": "req-42"},
-        )
-        assert flag == "clientreq:req-42"
+    # level 2 ----------------------------------------------------------
+    def test_level2_anthropic_metadata_user_id_carrying_session(self):
+        req = _anthropic_request(metadata={"user_id": CLAUDE_USER_ID})
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal(f"claude:session_{CLAUDE_SESSION_ID}", True)
 
-    def test_fallback_to_content_hash(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(
-                model="m",
-                system="You are a helpful assistant.",
-                messages=[{"role": "user", "content": "hello"}],
-            ),
-            {},
-        )
-        assert flag.startswith("msg:")
-        assert len(flag) == len("msg:") + 16
+    def test_level2_responses_metadata_user_id_carrying_session(self):
+        req = _responses_request(metadata={"user_id": CLAUDE_USER_ID})
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal(f"claude:session_{CLAUDE_SESSION_ID}", True)
 
-    def test_fallback_when_body_is_not_dict(self):
-        flag = self.ex.extract_stable_flag(None, {})
-        assert flag == "msg:empty"
+    def test_level2_metadata_user_id_without_session_is_hashed(self):
+        user_id = "user_abc123"
+        expected = "user:" + hashlib.sha256(user_id.encode()).hexdigest()[:16]
+        req = _anthropic_request(metadata={"user_id": user_id})
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal(expected, True)
 
-    def test_content_hash_stable_across_turns(self):
-        """More turns must not change the hash — system + first user anchor."""
-        base = _cc_body(
-            model="m",
-            system="sys",
-            messages=[{"role": "user", "content": "first ask"}],
-        )
+    def test_level2_metadata_without_user_id_falls_through(self):
+        req = _anthropic_request(metadata={"other": "value"})
+        body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+        signal = self.ex.extract({}, req, body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    # level 3 ----------------------------------------------------------
+    def test_level3_codex_session_headers(self):
+        assert self.ex.extract({"session-id": "cx-1"}) == SessionSignal("codex:cx-1", True)
+        assert self.ex.extract({"session_id": "cx-2"}) == SessionSignal("codex:cx-2", True)
+
+    # level 4 ----------------------------------------------------------
+    def test_level4_http_session_header(self):
+        assert self.ex.extract({"x-http-session-id": "http-1"}) == SessionSignal("http:http-1", True)
+
+    # level 5 ----------------------------------------------------------
+    def test_level5_affinity_headers(self):
+        assert self.ex.extract({"x-session-id": "s"}) == SessionSignal("header:s", True)
+        assert self.ex.extract({"x-session-affinity": "a"}) == SessionSignal("affinity:a", True)
+        assert self.ex.extract({"x-slot-session-id": "sl"}) == SessionSignal("slot:sl", True)
+
+    def test_level5_header_order_within_level(self):
+        signal = self.ex.extract({"x-slot-session-id": "sl", "x-session-affinity": "a", "x-session-id": "s"})
+        assert signal == SessionSignal("header:s", True)
+
+    # level 6 ----------------------------------------------------------
+    def test_level6_conversation_and_thread_headers(self):
+        assert self.ex.extract({"x-conversation-id": "c"}) == SessionSignal("conv:c", True)
+        assert self.ex.extract({"x-thread-id": "t"}) == SessionSignal("thread:t", True)
+
+    def test_level6_conversation_header_beats_thread_header(self):
+        signal = self.ex.extract({"x-thread-id": "t", "x-conversation-id": "c"})
+        assert signal == SessionSignal("conv:c", True)
+
+    # level 7 ----------------------------------------------------------
+    def test_level7_prompt_cache_key_on_chat_request(self):
+        req = _chat_request(prompt_cache_key="pck-1")
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal("pck:pck-1", True)
+
+    def test_level7_prompt_cache_key_on_responses_request(self):
+        req = _responses_request(prompt_cache_key="pck-1")
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal("pck:pck-1", True)
+
+    def test_level7_prompt_cache_key_on_body(self):
+        # CommandCodeClient.generate() only has the CC body to work with.
+        signal = self.ex.extract({}, None, {"params": {"model": "m"}, "prompt_cache_key": "pck-2"})
+        assert signal == SessionSignal("pck:pck-2", True)
+
+    # level 8 ----------------------------------------------------------
+    def test_level8_conversation_string(self):
+        req = _responses_request(conversation="conv-1")
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal("conv:conv-1", True)
+
+    def test_level8_conversation_object_id(self):
+        req = _responses_request(conversation={"id": "conv-2"})
+        signal = self.ex.extract({}, req, _cc_body(model="m", system="sys", messages=[]))
+        assert signal == SessionSignal("conv:conv-2", True)
+
+    def test_level8_conversation_without_id_falls_through(self):
+        req = _responses_request(conversation={"unrelated": "value"})
+        body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+        signal = self.ex.extract({}, req, body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    # level 9 ----------------------------------------------------------
+    def test_level9_body_session_ids(self):
+        assert self.ex.extract({}, {"session_id": "s1"}) == SessionSignal("session:s1", True)
+        assert self.ex.extract({}, {"sessionId": "s2"}) == SessionSignal("session:s2", True)
+
+    def test_level9_body_conversation_ids(self):
+        assert self.ex.extract({}, {"conversation_id": "c1"}) == SessionSignal("conv:c1", True)
+        assert self.ex.extract({}, {"chat_id": "c2"}) == SessionSignal("conv:c2", True)
+
+    # level 10 ---------------------------------------------------------
+    def test_level10_content_hash_fallback(self):
+        body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+        signal = self.ex.extract({}, None, body)
+        assert signal.flag.startswith("msg:")
+        assert len(signal.flag) == len("msg:") + 16
+        assert signal.explicit is False
+
+
+class TestPriorityPrecedence:
+    """A higher level always wins, regardless of which other source is set."""
+
+    def setup_method(self):
+        self.ex = SessionExtractor()
+        self.body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+
+    def test_claude_header_beats_metadata_user_id(self):
+        req = _anthropic_request(metadata={"user_id": CLAUDE_USER_ID})
+        headers = {"x-claude-code-session-id": "cli-abc"}
+        assert self.ex.extract(headers, req, self.body) == SessionSignal("claude:cli-abc", True)
+
+    def test_metadata_user_id_beats_codex_session_header(self):
+        req = _anthropic_request(metadata={"user_id": CLAUDE_USER_ID})
+        headers = {"session-id": "cx-1"}
+        signal = self.ex.extract(headers, req, self.body)
+        assert signal == SessionSignal(f"claude:session_{CLAUDE_SESSION_ID}", True)
+
+    def test_codex_header_beats_http_session_header(self):
+        signal = self.ex.extract({"x-http-session-id": "http-1", "session-id": "cx-1"})
+        assert signal == SessionSignal("codex:cx-1", True)
+
+    def test_http_header_beats_session_headers(self):
+        signal = self.ex.extract({"x-session-id": "s", "x-http-session-id": "http-1"})
+        assert signal == SessionSignal("http:http-1", True)
+
+    def test_headers_beat_body_fields(self):
+        req = _chat_request(prompt_cache_key="pck-1")
+        signal = self.ex.extract({"x-session-id": "hdr"}, req, self.body)
+        assert signal == SessionSignal("header:hdr", True)
+
+    def test_prompt_cache_key_precedes_body_session_ids(self):
+        # Documented order: prompt_cache_key (7) is checked before session_id (9).
+        signal = self.ex.extract({}, {"session_id": "s1", "prompt_cache_key": "pck-1"})
+        assert signal == SessionSignal("pck:pck-1", True)
+
+
+class TestExplicitSemantics:
+    """explicit is True for levels 1-9 and False for the content-hash fallback."""
+
+    @pytest.mark.parametrize(
+        ("headers", "original", "body", "expected_flag"),
+        [
+            ({"x-claude-code-session-id": "v"}, None, None, "claude:v"),
+            ({}, {"metadata": {"user_id": CLAUDE_USER_ID}}, None, f"claude:session_{CLAUDE_SESSION_ID}"),
+            ({"session-id": "v"}, None, None, "codex:v"),
+            ({"x-http-session-id": "v"}, None, None, "http:v"),
+            ({"x-session-id": "v"}, None, None, "header:v"),
+            ({"x-conversation-id": "v"}, None, None, "conv:v"),
+            ({}, {"prompt_cache_key": "v"}, None, "pck:v"),
+            ({}, {"conversation": "v"}, None, "conv:v"),
+            ({}, {"session_id": "v"}, None, "session:v"),
+        ],
+    )
+    def test_client_identities_are_explicit(self, headers, original, body, expected_flag):
+        signal = SessionExtractor().extract(headers, original, body)
+        assert signal.explicit is True
+        assert not signal.flag.startswith("msg:")
+        assert signal.flag == expected_flag
+
+    def test_content_hash_fallback_is_not_explicit(self):
+        body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+        assert SessionExtractor().extract({}, None, body).explicit is False
+
+
+class TestFallbackStability:
+    """The fallback flag groups every turn of one conversation on one key."""
+
+    def setup_method(self):
+        self.ex = SessionExtractor()
+
+    def test_appending_turns_keeps_the_same_flag(self):
+        base = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "first ask"}])
         extended = _cc_body(
             model="m",
             system="sys",
@@ -73,101 +251,124 @@ class TestSessionExtractorStableFlag:
                 {"role": "user", "content": "follow up question"},
             ],
         )
-        assert self.ex.extract_stable_flag(base, {}) == self.ex.extract_stable_flag(extended, {})
+        assert self.ex.extract({}, None, base).flag == self.ex.extract({}, None, extended).flag
 
-    def test_content_diff_changes_hash(self):
-        a = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="A", messages=[{"role": "user", "content": "x"}]),
-            {},
-        )
-        b = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="B", messages=[{"role": "user", "content": "x"}]),
-            {},
-        )
-        assert a != b
+    def test_different_first_user_message_changes_the_flag(self):
+        a = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "ask A"}])
+        b = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "ask B"}])
+        assert self.ex.extract({}, None, a).flag != self.ex.extract({}, None, b).flag
 
-    def test_content_hash_different_users_diverge(self):
-        a = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "ask A"}]),
-            {},
-        )
-        b = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "ask B"}]),
-            {},
-        )
-        assert a != b
+    def test_different_system_changes_the_flag(self):
+        a = _cc_body(model="m", system="A", messages=[{"role": "user", "content": "x"}])
+        b = _cc_body(model="m", system="B", messages=[{"role": "user", "content": "x"}])
+        assert self.ex.extract({}, None, a).flag != self.ex.extract({}, None, b).flag
 
-    def test_content_hash_handles_string_system(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(
-                model="m",
-                system="system prompt",
-                messages=[{"role": "user", "content": "hi"}],
-            ),
-            {},
+    def test_model_name_does_not_change_the_flag(self):
+        # Only system + first user message anchor the hash, so a model bump on a
+        # later turn (or a different route) keeps one conversation together.
+        a = _cc_body(model="m1", system="sys", messages=[{"role": "user", "content": "x"}])
+        b = _cc_body(model="m2", system="sys", messages=[{"role": "user", "content": "x"}])
+        assert self.ex.extract({}, None, a).flag == self.ex.extract({}, None, b).flag
+
+
+class TestContentHashFallbackShape:
+    """Body-shape edge cases of the content hash (defensive, must not raise)."""
+
+    def setup_method(self):
+        self.ex = SessionExtractor()
+
+    def _flag(self, body):
+        return self.ex.extract({}, None, body).flag
+
+    def test_non_dict_body_is_stable(self):
+        assert self._flag(None) == "msg:empty"
+        assert self._flag("not-a-body") == "msg:empty"
+
+    def test_body_without_params_is_stable(self):
+        assert self._flag({"config": {}}) == "msg:empty"
+
+    def test_string_system(self):
+        flag = self._flag(_cc_body(model="m", system="system prompt", messages=[{"role": "user", "content": "hi"}]))
+        assert flag.startswith("msg:")
+        assert flag != "msg:empty"
+
+    def test_list_system(self):
+        flag = self._flag(_cc_body(model="m", system=[{"type": "text", "text": "p"}], messages=[]))
+        assert flag.startswith("msg:")
+
+    def test_string_content(self):
+        flag = self._flag(_cc_body(model="m", system="s", messages=[{"role": "user", "content": "plain text"}]))
+        assert flag.startswith("msg:")
+
+    def test_list_content(self):
+        flag = self._flag(
+            _cc_body(model="m", system="s", messages=[{"role": "user", "content": [{"type": "text", "text": "part"}]}])
         )
         assert flag.startswith("msg:")
 
-    def test_content_hash_handles_list_system(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(
-                model="m",
-                system=[{"type": "text", "text": "system prompt"}],
-                messages=[{"role": "user", "content": "hi"}],
-            ),
-            {},
-        )
+    def test_non_string_system_coerces(self):
+        flag = self._flag(_cc_body(model="m", system=42, messages=[]))
         assert flag.startswith("msg:")
 
-    def test_content_hash_handles_string_content(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(
-                model="m",
-                system="s",
-                messages=[{"role": "user", "content": "plain text"}],
-            ),
-            {},
-        )
+    def test_non_list_messages(self):
+        flag = self._flag({"params": {"system": "s", "messages": "not-a-list"}})
         assert flag.startswith("msg:")
 
-    def test_content_hash_handles_list_content(self):
-        flag = self.ex.extract_stable_flag(
-            _cc_body(
-                model="m",
-                system="s",
-                messages=[{"role": "user", "content": [{"type": "text", "text": "part"}]}],
-            ),
-            {},
-        )
-        assert flag.startswith("msg:")
+    def test_non_user_roles_do_not_contribute(self):
+        a = self._flag(_cc_body(model="m", system="sys", messages=[{"role": "system", "content": "sys"}]))
+        b = self._flag(_cc_body(model="m", system="sys", messages=[{"role": "tool", "content": "tool"}]))
+        assert a == b
 
-    def test_content_hash_handles_non_string_system(self):
-        # Non-str / non-list values coerce via str().
-        flag = self.ex.extract_stable_flag(
-            _cc_body(model="m", system=42, messages=[]),
-            {},
-        )
-        assert flag.startswith("msg:")
 
-    def test_content_hash_handles_non_list_messages(self):
-        # Defensive: body["params"]["messages"] might not be a list.
-        flag = self.ex.extract_stable_flag(
-            {"params": {"system": "s", "messages": "not-a-list"}},
-            {},
-        )
-        assert flag.startswith("msg:")
+class TestValueHygiene:
+    """Blank / over-long / control-character values are skipped."""
 
-    def test_content_hash_skips_non_user_roles(self):
-        # Messages with no "user" role still hash deterministically.
-        flag_a = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[{"role": "system", "content": "sys"}]),
-            {},
-        )
-        flag_b = self.ex.extract_stable_flag(
-            _cc_body(model="m", system="sys", messages=[{"role": "tool", "content": "tool"}]),
-            {},
-        )
-        assert flag_a == flag_b  # same sys, different non-user roles
+    def setup_method(self):
+        self.ex = SessionExtractor()
+        self.body = _cc_body(model="m", system="sys", messages=[{"role": "user", "content": "hi"}])
+
+    def test_blank_value_falls_through(self):
+        signal = self.ex.extract({"x-session-id": "   "}, None, self.body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    def test_value_is_trimmed(self):
+        assert self.ex.extract({"x-session-id": "  abc  "}) == SessionSignal("header:abc", True)
+
+    def test_value_at_max_length_is_kept(self):
+        value = "a" * 200
+        assert self.ex.extract({"x-session-id": value}) == SessionSignal(f"header:{value}", True)
+
+    def test_over_long_value_falls_through(self):
+        signal = self.ex.extract({"x-session-id": "a" * 201}, None, self.body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    @pytest.mark.parametrize("value", ["bad\nvalue", "bad\x00value", "bad\tvalue", "bad\x7fvalue"])
+    def test_control_characters_fall_through(self, value):
+        signal = self.ex.extract({"x-session-id": value}, None, self.body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    def test_invalid_value_continues_down_the_chain(self):
+        # Same level: x-session-id is unusable, so x-session-affinity is next.
+        signal = self.ex.extract({"x-session-id": "a" * 201, "x-session-affinity": "aff"}, None, self.body)
+        assert signal == SessionSignal("affinity:aff", True)
+
+    def test_hygiene_applies_to_metadata_user_id(self):
+        req = _anthropic_request(metadata={"user_id": "user_abc\ndef"})
+        signal = self.ex.extract({}, req, self.body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    def test_hygiene_applies_to_body_fields(self):
+        signal = self.ex.extract({}, {"prompt_cache_key": "a" * 201}, self.body)
+        assert signal.flag.startswith("msg:")
+        assert signal.explicit is False
+
+    def test_non_string_values_are_ignored(self):
+        signal = self.ex.extract({"x-session-id": 12345}, None, self.body)
+        assert signal.flag.startswith("msg:")
 
 
 class TestSessionExtractorDerive:

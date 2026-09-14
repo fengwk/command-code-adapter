@@ -65,6 +65,7 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = None
     user: str | None = None
     response_format: dict[str, Any] | None = None
+    prompt_cache_key: str | None = None
     reasoning_effort: Literal["off", "low", "medium", "high", "xhigh", "max"] | None = None
 
 
