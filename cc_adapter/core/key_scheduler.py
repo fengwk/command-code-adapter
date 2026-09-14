@@ -1,0 +1,330 @@
+"""Credits-aware key scheduler with sticky session affinity.
+
+Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
+
+* per-key health (``ok`` / ``cooling`` with escalating backoff / ``disabled``);
+* credits-aware usability (a key with known zero credits is not usable);
+* round-robin bindings for explicit session identities, sticky for as long as
+  the session keeps talking (sliding TTL), so every turn of one conversation
+  stays on the same upstream account;
+* fill-first selection (first usable key) for requests without an explicit
+  session identity.
+
+``select()`` blocks only on the very first credits fetch; later calls use the
+currently known state and refresh the credits cache in the background.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+
+import httpx
+import structlog
+
+from cc_adapter.command_code.headers import make_cc_headers
+from cc_adapter.core.constants import (
+    KEY_COOLDOWN_BASE,
+    KEY_COOLDOWN_MAX,
+    KEY_CREDITS_CACHE_TTL,
+    KEY_CREDITS_ERROR_BACKOFF,
+    SESSION_AFFINITY_MAX_ENTRIES,
+    SESSION_AFFINITY_TTL,
+)
+
+logger = structlog.get_logger(__name__)
+
+STATE_OK = "ok"
+STATE_COOLING = "cooling"
+STATE_DISABLED = "disabled"
+
+
+def _reason_text(reason: str | None, status: int | None) -> str | None:
+    if reason:
+        return reason
+    return f"http_{status}" if status is not None else None
+
+
+class SessionAffinityCache:
+    """``session_flag -> key`` bindings with sliding TTL and LRU eviction."""
+
+    def __init__(self, ttl: float, max_entries: int):
+        self._ttl = float(ttl)
+        self._max_entries = int(max_entries)
+        self._entries: dict[str, tuple[str, float]] = {}
+
+    def get_and_refresh(self, sid: str) -> str | None:
+        """Return the bound key, renewing the sliding TTL, or None if unbound/expired."""
+        entry = self._entries.get(sid)
+        if entry is None:
+            return None
+        key, last_seen = entry
+        now = time.monotonic()
+        if now - last_seen > self._ttl:
+            self._entries.pop(sid, None)
+            return None
+        # Re-insert last so a hit also counts as the most recently used entry.
+        self._entries.pop(sid, None)
+        self._entries[sid] = (key, now)
+        return key
+
+    def set(self, sid: str, key: str) -> None:
+        self._entries.pop(sid, None)
+        self._entries[sid] = (key, time.monotonic())
+        while len(self._entries) > self._max_entries:
+            self._entries.pop(next(iter(self._entries)), None)
+
+    def compare_and_delete(self, sid: str | None, expected_key: str) -> bool:
+        """Unbind sid only while it still points at expected_key."""
+        if sid is None:
+            return False
+        entry = self._entries.get(sid)
+        if entry is None or entry[0] != expected_key:
+            return False
+        self._entries.pop(sid, None)
+        return True
+
+    def delete_by_key(self, key: str) -> int:
+        """Unbind every session pointing at key; returns the number of sessions."""
+        sids = [sid for sid, (bound, _) in self._entries.items() if bound == key]
+        for sid in sids:
+            self._entries.pop(sid, None)
+        return len(sids)
+
+    def clear(self) -> int:
+        count = len(self._entries)
+        self._entries.clear()
+        return count
+
+    def stats(self) -> dict:
+        bound_by_key: dict[str, int] = {}
+        for bound_key, _ in self._entries.values():
+            bound_by_key[bound_key] = bound_by_key.get(bound_key, 0) + 1
+        return {"entries": len(self._entries), "bound_by_key": bound_by_key}
+
+
+class KeyScheduler:
+    def __init__(self, keys: list[str], base_url: str):
+        self._keys = list(keys)
+        self._base_url = base_url.rstrip("/")
+        self._credits: dict[str, int] = {}
+        self._last_fetch: float | None = None
+        self._last_error: str | None = None
+        self._fetch_task: asyncio.Task[None] | None = None
+        self._fetch_lock = asyncio.Lock()
+
+        self._state: dict[str, str] = {}
+        self._until: dict[str, float] = {}
+        self._reason: dict[str, str | None] = {}
+        self._failures: dict[str, int] = {}
+        self._cursor_key: str | None = None
+        self._affinity = SessionAffinityCache(SESSION_AFFINITY_TTL, SESSION_AFFINITY_MAX_ENTRIES)
+
+    # ------------------------------------------------------------------ select
+
+    async def select(self, session_flag: str | None, *, explicit: bool, exclude: set[str] | None = None) -> str | None:
+        await self._ensure_credits()
+        skip = exclude or set()
+
+        usable = [key for key in self._keys if key not in skip and self._usable(key)]
+        if not usable:
+            # Everything is cooling or out of credits: relax health and credits,
+            # but never hand out a disabled key.
+            usable = [key for key in self._keys if key not in skip and self._health(key) != STATE_DISABLED]
+        if not usable:
+            return None
+
+        if explicit and session_flag:
+            bound = self._affinity.get_and_refresh(session_flag)
+            if bound is not None and bound in usable:
+                logger.info("key.select", session=session_flag[:8], key=bound[-4:], reason="sticky")
+                return bound
+            chosen = self._next_round_robin(usable)
+            self._affinity.set(session_flag, chosen)
+            logger.info("key.bind", session=session_flag[:8], key=chosen[-4:])
+            return chosen
+
+        chosen = usable[0]
+        logger.info("key.select", key=chosen[-4:], reason="no-session")
+        return chosen
+
+    def _next_round_robin(self, candidates: list[str]) -> str:
+        """First candidate after the cursor in configured order (ring semantics).
+
+        Walking the configured ring instead of the filtered candidate list keeps
+        the rotation stable no matter how the candidate set is filtered, so
+        filtering never skews selection towards the head of the list.
+        """
+        allowed = set(candidates)
+        start = 0
+        if self._cursor_key in self._keys:
+            start = self._keys.index(self._cursor_key) + 1
+        for offset in range(len(self._keys)):
+            key = self._keys[(start + offset) % len(self._keys)]
+            if key in allowed:
+                self._cursor_key = key
+                return key
+        self._cursor_key = candidates[0]
+        return candidates[0]
+
+    # ------------------------------------------------------------------ report
+
+    def report(
+        self,
+        key: str,
+        *,
+        ok: bool,
+        status: int | None = None,
+        reason: str | None = None,
+        session_flag: str | None = None,
+    ) -> None:
+        if ok:
+            self._clear_health(key)
+            return
+
+        if status in (401, 403) or reason == "invalid_key":
+            self._state[key] = STATE_DISABLED
+            self._until.pop(key, None)
+            self._reason[key] = _reason_text(reason, status)
+            unbound = self._affinity.delete_by_key(key)
+            logger.info("key.disabled", key=key[-4:], status=status, reason=self._reason[key], sessions=unbound)
+            return
+
+        if status in (402, 429) or reason == "insufficient_credits":
+            failures = self._failures.get(key, 0) + 1
+            self._failures[key] = failures
+            cooldown = min(KEY_COOLDOWN_BASE * 2 ** (failures - 1), KEY_COOLDOWN_MAX)
+            self._state[key] = STATE_COOLING
+            self._until[key] = time.monotonic() + cooldown
+            self._reason[key] = _reason_text(reason, status)
+            unbound = self._affinity.compare_and_delete(session_flag, key)
+            logger.info(
+                "key.cooldown",
+                key=key[-4:],
+                status=status,
+                failures=failures,
+                cooldown=cooldown,
+                unbound=unbound,
+            )
+            return
+
+        # Transient failure (5xx, timeout, cancellation): keep the key in rotation.
+
+    # ------------------------------------------------------------- health state
+
+    def _health(self, key: str) -> str:
+        """Effective state; an expired cooling window puts the key back to ok."""
+        if self._state.get(key) == STATE_COOLING:
+            until = self._until.get(key)
+            if until is not None and until <= time.monotonic():
+                self._state[key] = STATE_OK
+                self._until.pop(key, None)
+                self._reason.pop(key, None)
+        return self._state.get(key, STATE_OK)
+
+    def _usable(self, key: str) -> bool:
+        if self._health(key) != STATE_OK:
+            return False
+        credits = self._credits.get(key)
+        return credits is None or credits > 0
+
+    def _clear_health(self, key: str) -> None:
+        self._state[key] = STATE_OK
+        self._until.pop(key, None)
+        self._reason.pop(key, None)
+        self._failures.pop(key, None)
+
+    def key_state(self, key: str) -> dict:
+        state = self._health(key)
+        return {
+            "state": state,
+            "until": self._until.get(key),
+            "reason": self._reason.get(key),
+            "credits": self._credits.get(key),
+            "failures": self._failures.get(key, 0),
+            "sessions": self._affinity.stats()["bound_by_key"].get(key, 0),
+        }
+
+    def states(self) -> list[dict]:
+        return [self.key_state(key) for key in self._keys]
+
+    def clear_sessions(self) -> int:
+        return self._affinity.clear()
+
+    def reset_key(self, key: str) -> None:
+        """Clear cooling/disabled health so the key is selectable again."""
+        self._clear_health(key)
+
+    # ----------------------------------------------------------------- credits
+
+    def get_credits(self, key: str) -> int | None:
+        return self._credits.get(key)
+
+    async def _ensure_credits(self) -> None:
+        """Block on the first fetch only; afterwards refresh in the background."""
+        if not self._keys or not self._is_stale():
+            return
+        if self._last_fetch is None:
+            try:
+                await self.refresh()
+            except Exception:
+                logger.warning("initial_credits_fetch_failed", exc_info=True)
+        else:
+            self._trigger_refresh()
+
+    def _is_stale(self) -> bool:
+        if self._last_fetch is None:
+            return True
+        ttl = KEY_CREDITS_ERROR_BACKOFF if self._last_error else KEY_CREDITS_CACHE_TTL
+        return time.monotonic() - self._last_fetch > ttl
+
+    def _trigger_refresh(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            if not self._fetch_task or self._fetch_task.done():
+                self._fetch_task = loop.create_task(self.refresh())
+        except RuntimeError:
+            pass
+
+    async def refresh(self) -> None:
+        async with self._fetch_lock:
+            await self._refresh()
+
+    async def _refresh(self) -> None:
+        self._last_error = None
+        try:
+            tasks = [self._fetch_credits(key) for key in self._keys]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count = 0
+            for key, result in zip(self._keys, results):
+                if isinstance(result, Exception):
+                    logger.warning("credits_fetch_failed", key=key[-4:], error=str(result))
+                elif isinstance(result, int):
+                    self._credits[key] = result
+                    success_count += 1
+            if success_count == 0 and self._keys:
+                self._last_error = "All credit fetches failed"
+            self._last_fetch = time.monotonic()
+        except Exception as e:
+            self._last_error = str(e)
+            self._last_fetch = time.monotonic()
+            logger.warning("credits_refresh_failed", error=str(e))
+
+    async def _fetch_credits(self, api_key: str) -> int | None:
+        headers = make_cc_headers(api_key)
+        async with httpx.AsyncClient(timeout=10.0, base_url=self._base_url) as client:
+            r = await client.get("/alpha/billing/credits", headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            if "credits" in data:
+                c = data["credits"]
+                return c.get("monthlyCredits", 0) + c.get("purchasedCredits", 0) + c.get("freeCredits", 0)
+            return 0
+
+    @property
+    def last_fetch_time(self) -> float | None:
+        return self._last_fetch
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
