@@ -19,7 +19,7 @@ class TokenRecorder:
     def __init__(self, data_path: str | Path | None = None) -> None:
         self._path = Path(data_path) if data_path else Path(DEFAULT_DATA_FILE)
         self._lock = asyncio.Lock()
-        self._data: dict[str, dict[str, int]] = {}
+        self._data: dict[str, dict[str, Any]] = {}
         self._loaded = False
 
     def _ensure_loaded(self) -> None:
@@ -39,7 +39,7 @@ class TokenRecorder:
     def _date_key(self) -> str:
         return datetime.date.today().isoformat()
 
-    async def record(self, input_tokens: int, output_tokens: int) -> None:
+    async def record(self, input_tokens: int, output_tokens: int, model: str | None = None) -> None:
         self._ensure_loaded()
         total = input_tokens + output_tokens
         if total <= 0:
@@ -48,10 +48,22 @@ class TokenRecorder:
             day = self._date_key()
             entry = self._data.get(day)
             if entry is None:
-                self._data[day] = {"tokens": total, "requests": 1}
-            else:
-                entry["tokens"] = entry.get("tokens", 0) + total
-                entry["requests"] = entry.get("requests", 0) + 1
+                entry = {"tokens": 0, "requests": 0, "models": {}}
+                self._data[day] = entry
+            entry["tokens"] = entry.get("tokens", 0) + total
+            entry["requests"] = entry.get("requests", 0) + 1
+
+            # per-model stats
+            if model:
+                m = model.split("/")[-1]  # "deepseek/deepseek-v4-flash" → "deepseek-v4-flash"
+                if "models" not in entry:
+                    entry["models"] = {}
+                models = entry["models"]
+                if m not in models:
+                    models[m] = {"tokens": 0, "requests": 0}
+                models[m]["tokens"] += total
+                models[m]["requests"] += 1
+
             self._atomic_write()
 
     def _atomic_write(self) -> None:
@@ -67,7 +79,7 @@ class TokenRecorder:
                 pass
             raise
 
-    def query(self, days: int = 365) -> dict[str, dict[str, int]]:
+    def query(self, days: int = 365) -> dict[str, dict[str, Any]]:
         self._ensure_loaded()
         cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
         return {k: v for k, v in self._data.items() if k >= cutoff}
@@ -88,9 +100,29 @@ def _reset_recorder() -> None:
     _recorder = None
 
 
-async def record_daily_tokens(input_tokens: int, output_tokens: int) -> None:
-    await get_token_recorder().record(input_tokens, output_tokens)
+def schedule_token_record(input_tokens: int, output_tokens: int, model: str | None = None) -> asyncio.Task | None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("token_recorder.schedule_failed", error="no running event loop")
+        return None
+    task = loop.create_task(record_daily_tokens(input_tokens, output_tokens, model=model))
+
+    def _consume_result(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("token_recorder.record_failed", error=str(exc))
+
+    task.add_done_callback(_consume_result)
+    return task
 
 
-def query_daily_tokens(days: int = 365) -> dict[str, dict[str, int]]:
+async def record_daily_tokens(input_tokens: int, output_tokens: int, model: str | None = None) -> None:
+    await get_token_recorder().record(input_tokens, output_tokens, model=model)
+
+
+def query_daily_tokens(days: int = 365) -> dict[str, dict[str, Any]]:
     return get_token_recorder().query(days)

@@ -6,7 +6,7 @@ import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from cc_adapter.core.retry import retry_on_empty, stream_with_retry, _BufferDetector
+from cc_adapter.core.retry import stream_with_retry, _BufferDetector
 from cc_adapter.core.runtime import get_request_translator, get_or_create_client
 from cc_adapter.core.constants import STREAMING_HEADERS
 from cc_adapter.providers.openai.models import ChatCompletionRequest
@@ -21,6 +21,11 @@ router = APIRouter()
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     structlog.contextvars.bind_contextvars(protocol="openai")
 
+    translator = get_request_translator()
+    cc_body = translator.translate(req)
+    cc_body["params"]["stream"] = True
+    tools_available = bool(req.tools) and req.tool_choice != "none"
+
     logger.info(
         "openai.request",
         model=req.model,
@@ -28,12 +33,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         message_count=len(req.messages),
         tools="yes" if req.tools else "no",
         tool_choice=req.tool_choice,
+        reasoning_effort=req.reasoning_effort,
+        cc_reasoning_effort=cc_body.get("params", {}).get("reasoning_effort"),
     )
-
-    translator = get_request_translator()
-    cc_body, _ = translator.translate(req)
-    cc_body["params"]["stream"] = True
-    tools_available = bool(req.tools) and req.tool_choice != "none"
 
     start_time = time.time()
 
@@ -56,11 +58,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             headers=STREAMING_HEADERS,
         )
     else:
-        return await retry_on_empty(
-            lambda: current_client.generate(cc_body, client_headers),
-            lambda stream: collect_and_translate_nonstream(
-                stream, req.model, start_time, req.reasoning_effort, tools_available
-            ),
-            logger,
-            "openai.nonstream",
+        return await collect_and_translate_nonstream(
+            current_client.generate(cc_body, client_headers),
+            req.model,
+            start_time,
+            req.reasoning_effort,
+            tools_available,
         )

@@ -32,13 +32,24 @@ def _parse_sse_line(raw: str) -> dict[str, Any] | None:
         preview = raw[:60]
         logger.debug("sse.parse_error", preview=preview, error="not_a_json_object")
         return None
-    logger.debug("sse.raw_event", event_type=parsed.get("type", "?"))
+    et = parsed.get("type", "?")
+    if et in ("start", "finish", "provider-metadata"):
+        logger.info("sse.event_detail", event_type=et, body=parsed)
+    logger.debug("sse.raw_event", event_type=et)
     return parsed
 
 
 _INSUFFICIENT_CREDITS_PHRASES = (
     "insufficient credits",
     "insufficient_credits",
+)
+
+_ZDR_ERROR_PHRASES = (
+    "zero-data-retention",
+    "disable cmd_zdr",
+    "cmd_zdr_no_providers",
+    "cmd_zdr_no-providers",
+    "cmd zdr no providers",
 )
 
 
@@ -49,6 +60,13 @@ def _is_retryable_error(status_code: int, body_text: str) -> bool:
         lowered = body_text.lower()
         return any(phrase in lowered for phrase in _INSUFFICIENT_CREDITS_PHRASES)
     return False
+
+
+def _is_zdr_error(status_code: int, body_text: str) -> bool:
+    if status_code != 400:
+        return False
+    lowered = body_text.lower()
+    return any(phrase in lowered for phrase in _ZDR_ERROR_PHRASES)
 
 
 def _make_http2_safe(http2: bool) -> bool:
@@ -112,6 +130,7 @@ class CommandCodeClient:
     ) -> AsyncGenerator[dict[str, Any], None]:
         tried_keys: set[str] = set()
         last_error: Exception | None = None
+        zdr_downgraded: bool = False
         extractor = get_session_extractor()
         # extra_headers may contain client-authored values (X-Session-ID etc.)
         # for stable-flag extraction but must not leak to the CC upstream.
@@ -136,10 +155,14 @@ class CommandCodeClient:
             session_id, project_slug = extractor.derive(stable_flag, key)
 
             headers = make_cc_headers(key)
+            if zdr_downgraded:
+                headers.pop("x-cmd-zdr", None)
             headers["x-session-id"] = session_id
             headers["x-project-slug"] = project_slug
 
             url = f"{self.base_url}/alpha/generate"
+            # ponytail: debug log — remove after confirming correct model forwarding
+            logger.info("cc.forward", url=url, model=body.get("params", {}).get("model", "MISSING"))
 
             client = self._client()
             try:
@@ -152,6 +175,12 @@ class CommandCodeClient:
 
                         if _is_retryable_error(response.status_code, text):
                             last_error = mapped
+                            continue
+
+                        if _is_zdr_error(response.status_code, text) and not zdr_downgraded:
+                            zdr_downgraded = True
+                            tried_keys.discard(key)
+                            logger.info("zdr.downgrade", key_last4=key[-4:])
                             continue
 
                         raise mapped

@@ -58,6 +58,10 @@ const i18n = {
     usageLoading: "加载中...",
     usageNoData: "暂无使用数据",
     pastYear: "过去一年",
+    tokenLimit5h: "5h窗口",
+    tokenLimitWeekly: "每周",
+    tokenLimitReset: "重置",
+    tokenLimitRestricted: "已限流",
   },
   en: {
     title: "CC Adapter Admin",
@@ -117,6 +121,10 @@ const i18n = {
     usageLoading: "Loading...",
     usageNoData: "No usage data",
     pastYear: "Past Year",
+    tokenLimit5h: "5h Window",
+    tokenLimitWeekly: "Weekly",
+    tokenLimitReset: "Resets in",
+    tokenLimitRestricted: "Rate Limited",
   },
 };
 
@@ -138,6 +146,21 @@ function fmtUptime(s) {
   if (d > 0) return `${d}天${h % 24}小时`;
   if (h > 0) return h > 0 && m % 60 > 0 ? `${h}小时${m % 60}分钟` : `${h}小时`;
   return `${m}分钟`;
+}
+
+function fmtResetTime(resetAt) {
+  if (!resetAt) return "";
+  const now = Date.now();
+  const diff = Math.floor((resetAt - now) / 1000);
+  if (diff <= 0) return "resetting...";
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  if (h > 24) {
+    const d = Math.floor(h / 24);
+    return d + "d " + (h % 24) + "h";
+  }
+  if (h > 0) return h + "h " + m + "m";
+  return m + "m";
 }
 
 function applyLang() {
@@ -375,7 +398,6 @@ function buildHeatmap(data) {
     const label = document.createElement("span");
     label.className = "heatmap-month-label";
     const start = m.index * 17;
-    const next = i + 1 < months.length ? months[i + 1].index * 17 : totalWidth;
     label.style.position = "absolute";
     label.style.left = (start + 24) + "px";
     label.textContent = m.label;
@@ -403,6 +425,10 @@ function buildHeatmap(data) {
   // Grid
   const grid = document.createElement("div");
   grid.className = "heatmap-grid";
+
+  // ponytail: sync month labels scroll with grid
+  grid.onscroll = () => { monthRow.scrollLeft = grid.scrollLeft; };
+  monthRow.onscroll = () => { grid.scrollLeft = monthRow.scrollLeft; };
 
   let tid = "heatmap-tooltip";
   let tooltipEl = document.getElementById(tid);
@@ -473,6 +499,8 @@ async function loadDashboard() {
   try {
     const resp = await api("GET", "/admin/api/health");
     const data = await resp.json();
+    // ponytail: show version in topbar
+    document.querySelector(".logo").textContent = "CC Adapter v" + data.version;
     document.getElementById("health-dot").className = "status-dot ok";
     document.getElementById("health-text").textContent =
       `${t("running")} | ${fmtUptime(data.uptime)}`;
@@ -483,6 +511,7 @@ async function loadDashboard() {
   } catch {
     document.getElementById("health-dot").className = "status-dot err";
     document.getElementById("health-text").textContent = t("stopped");
+    document.querySelector(".logo").textContent = "CC Adapter";
   }
 }
 
@@ -584,6 +613,41 @@ function renderTokenCard(item) {
         </div>
       </div>
       `;
+      if (usage.fiveHour || usage.weekly) {
+        let limitHtml = '<div class="token-limits">';
+        if (usage.limited) {
+          limitHtml += `<div class="token-limit-alert">&#9888; ${t("tokenLimitRestricted")}</div>`;
+        }
+        if (usage.fiveHour?.cap) {
+          const fiveHrUsed = Number(usage.fiveHour.used) || 0;
+          const fiveHrCap = Number(usage.fiveHour.cap) || 0;
+          const fiveHrPct = fiveHrCap > 0 ? Math.min(100, Math.round((fiveHrUsed / fiveHrCap) * 100)) : 0;
+          const fiveHrReset = fmtResetTime(usage.fiveHour.resetAt);
+          limitHtml += `<div class="token-limit-row">
+            <span class="token-limit-label">${t("tokenLimit5h")}</span>
+            <span class="token-limit-value">${fiveHrUsed}/${fiveHrCap}</span>
+            ${fiveHrReset ? `<span class="token-limit-reset">${t("tokenLimitReset")} ${fiveHrReset}</span>` : ""}
+            <div class="token-limit-bar-track"><div class="token-limit-bar-fill" style="width:${fiveHrPct}%"></div></div>
+          </div>`;
+        }
+        if (usage.weekly?.cap) {
+          const weeklyUsed = Number(usage.weekly.used) || 0;
+          const weeklyCap = Number(usage.weekly.cap) || 0;
+          const weeklyPct = weeklyCap > 0 ? Math.min(100, Math.round((weeklyUsed / weeklyCap) * 100)) : 0;
+          const weeklyReset = fmtResetTime(usage.weekly.resetAt);
+          limitHtml += `<div class="token-limit-row">
+            <span class="token-limit-label">${t("tokenLimitWeekly")}</span>
+            <span class="token-limit-value">${weeklyUsed}/${weeklyCap}</span>
+            ${weeklyReset ? `<span class="token-limit-reset">${t("tokenLimitReset")} ${weeklyReset}</span>` : ""}
+            <div class="token-limit-bar-track"><div class="token-limit-bar-fill" style="width:${weeklyPct}%"></div></div>
+          </div>`;
+        }
+        limitHtml += '</div>';
+        const usageBar = card.querySelector('.token-usage-bar');
+        if (usageBar) {
+          usageBar.insertAdjacentHTML('afterend', limitHtml);
+        }
+      }
   } else {
     const errMsg = item.error || "Unknown error";
     card.innerHTML = `

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import structlog
 from typing import AsyncGenerator
@@ -45,6 +44,8 @@ async def collect_and_translate_anthropic_nonstream(
             thinking_parts.append(event.get("text", ""))
 
         elif event_type == "tool-call":
+            if event.get("providerExecuted"):
+                continue
             tc = {
                 "type": "tool_use",
                 "id": event.get("toolCallId", generate_id("toolu_", 12)),
@@ -60,12 +61,9 @@ async def collect_and_translate_anthropic_nonstream(
                 input_tokens=raw_usage.get("inputTokens", 0),
                 output_tokens=raw_usage.get("outputTokens", 0),
             )
-            try:
-                from cc_adapter.core.token_recorder import record_daily_tokens
+            from cc_adapter.core.token_recorder import schedule_token_record
 
-                asyncio.ensure_future(record_daily_tokens(usage.input_tokens or 0, usage.output_tokens or 0))
-            except Exception:
-                pass
+            schedule_token_record(usage.input_tokens or 0, usage.output_tokens or 0, model=model)
 
         elif event_type == "error":
             err = event.get("error", {})
@@ -203,6 +201,8 @@ async def translate_anthropic_stream(
             )
 
         elif event_type == "tool-call":
+            if event.get("providerExecuted"):
+                continue
             if not has_started:
                 yield _message_start_event()
                 has_started = True
@@ -259,12 +259,9 @@ async def translate_anthropic_stream(
             raw_usage = event.get("totalUsage") or {}
             input_t = raw_usage.get("inputTokens", 0)
             output_t = raw_usage.get("outputTokens", 0)
-            try:
-                from cc_adapter.core.token_recorder import record_daily_tokens
+            from cc_adapter.core.token_recorder import schedule_token_record
 
-                asyncio.ensure_future(record_daily_tokens(input_t, output_t))
-            except Exception:
-                pass
+            schedule_token_record(input_t, output_t, model=model)
             yield _anthropic_sse(
                 "message_delta",
                 {

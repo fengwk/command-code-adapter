@@ -91,10 +91,36 @@ async def query_token_usage(base_url: str, api_key: str, timeout: float = 15.0) 
                 }
 
             if not isinstance(usage_resp, Exception) and usage_resp is not None and usage_resp.status_code < 400:
+                window_limits = (credits_data or {}).get("windowLimits") or {}
                 usage_data = usage_resp.json()
+                five_hour = window_limits.get("fiveHour") or {}
+                weekly = window_limits.get("weekly") or {}
+                # ponytail: compute limited locally from individual windows;
+                # upstream may report limited=true even when no window is at cap.
+                five_hour_limited = (five_hour.get("cap") or 0) > 0 and (five_hour.get("used") or 0) >= (five_hour.get("cap") or 0)
+                weekly_limited = (weekly.get("cap") or 0) > 0 and (weekly.get("used") or 0) >= (weekly.get("cap") or 0)
                 result["usage"] = {
                     "total_cost": usage_data.get("totalCost", 0),
                     "total_count": usage_data.get("totalCount", 0),
+                    "limited": five_hour_limited or weekly_limited,
+                    "fiveHour": (
+                        {
+                            "used": five_hour.get("used", 0),
+                            "cap": five_hour.get("cap", 0),
+                            "resetAt": five_hour.get("resetAt", 0),
+                        }
+                        if five_hour
+                        else None
+                    ),
+                    "weekly": (
+                        {
+                            "used": weekly.get("used", 0),
+                            "cap": weekly.get("cap", 0),
+                            "resetAt": weekly.get("resetAt", 0),
+                        }
+                        if weekly
+                        else None
+                    ),
                     "models": [
                         {
                             "model_id": m.get("model", ""),
@@ -170,27 +196,37 @@ async def query_daily_usage(
     for i in range(len(boundaries) - 1):
         cur = snapshots[i]
         nxt = snapshots[i + 1]
-        if cur is None or nxt is None:
+        if cur is None or (nxt is None and boundaries[i] != date_type.today()):
             continue
 
-        day_cost = round(max(0, cur.get("totalCost", 0) - nxt.get("totalCost", 0)), 4)
-        day_count = max(0, cur.get("totalCount", 0) - nxt.get("totalCount", 0))
-
-        cur_models = [
-            {"model_id": m.get("model", ""), "cost": m.get("totalCost", 0), "count": m.get("count", 0)}
-            for m in cur.get("models", [])
-        ]
-        nxt_models = [
-            {"model_id": m.get("model", ""), "cost": m.get("totalCost", 0), "count": m.get("count", 0)}
-            for m in nxt.get("models", [])
-        ]
+        # ponytail: nxt can be None when boundary is a future date (e.g. end_date=today,
+        # end_date+1=tomorrow). Use cur directly without subtraction.
+        if nxt is not None:
+            day_cost = round(max(0, cur.get("totalCost", 0) - nxt.get("totalCost", 0)), 4)
+            day_count = max(0, cur.get("totalCount", 0) - nxt.get("totalCount", 0))
+            cur_models = [
+                {"model_id": m.get("model", ""), "cost": m.get("totalCost", 0), "count": m.get("count", 0)}
+                for m in cur.get("models", [])
+            ]
+            nxt_models = [
+                {"model_id": m.get("model", ""), "cost": m.get("totalCost", 0), "count": m.get("count", 0)}
+                for m in nxt.get("models", [])
+            ]
+            models = _sub_models(cur_models, nxt_models)
+        else:
+            day_cost = cur.get("totalCost", 0)
+            day_count = cur.get("totalCount", 0)
+            models = [
+                {"model_id": m.get("model", ""), "cost": m.get("totalCost", 0), "count": m.get("count", 0)}
+                for m in cur.get("models", [])
+            ]
 
         daily_results.append(
             {
                 "date": boundaries[i].isoformat(),
                 "total_cost": day_cost,
                 "total_count": day_count,
-                "models": _sub_models(cur_models, nxt_models),
+                "models": models,
             }
         )
 

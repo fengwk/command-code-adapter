@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from typing import AsyncGenerator
@@ -84,12 +83,9 @@ def _parse_usage(raw_usage: dict | None, model: str, start_time: float) -> Usage
         total=usage.total_tokens,
         elapsed=f"{elapsed:.1f}s",
     )
-    try:
-        from cc_adapter.core.token_recorder import record_daily_tokens
+    from cc_adapter.core.token_recorder import schedule_token_record
 
-        asyncio.ensure_future(record_daily_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0))
-    except Exception:
-        pass
+    schedule_token_record(usage.prompt_tokens or 0, usage.completion_tokens or 0, model=model)
     return usage
 
 

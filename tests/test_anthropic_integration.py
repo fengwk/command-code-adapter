@@ -53,7 +53,7 @@ def _parse_sse(text: str) -> list[dict]:
 def _setup(
     cfg_overrides: dict | None = None, events: list[dict] | None = None, events_second: list[dict] | None = None
 ):
-    base = {"cc_api_key": "test_key_123", "web_search_provider": "", "deepseek_api_key": ""}
+    base = {"cc_api_key": "test_key_123"}
     if cfg_overrides:
         base.update(cfg_overrides)
     cfg = AppConfig(**base)
@@ -64,6 +64,38 @@ def _setup(
         _make_mock_generate(mock_client, events, events_second)
     admin_init(cfg, mock_client)
     return cfg, mock_client
+
+
+@pytest.mark.asyncio
+async def test_claude_code_message_level_system_role_is_normalized(client):
+    captured_body: dict[str, Any] = {}
+    _, mock_client = _setup()
+
+    async def _generate(body, extra_headers=None):
+        captured_body.update(body)
+        yield {"type": "text-delta", "text": "OK"}
+        yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 1}}
+
+    mock_client.generate = _generate
+    payload = {
+        "model": "deepseek/deepseek-v4-pro",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "Claude Code internal system instructions"},
+            {"role": "user", "content": "test"},
+        ],
+        "stream": False,
+    }
+
+    async with client as c:
+        resp = await c.post("/v1/messages", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"][0]["text"] == "OK"
+    assert captured_body["params"]["system"] == "Claude Code internal system instructions"
+    assert [m["role"] for m in captured_body["params"]["messages"]] == ["user", "user"]
+    assert all(m["role"] != "system" for m in captured_body["params"]["messages"])
 
 
 # ====== Non-streaming tool call tests ======
@@ -521,7 +553,6 @@ async def test_nonstream_access_key_auth(client):
 @pytest.mark.asyncio
 async def test_stream_empty_returns_error(client):
     _setup(
-        cfg_overrides={"web_search_provider": ""},
         events=[
             {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 0, "outputTokens": 0}},
         ],
@@ -566,7 +597,6 @@ async def test_stream_empty_both_attempts_returns_error(client):
 @pytest.mark.asyncio
 async def test_stream_empty_text_delta_returns_error(client):
     _setup(
-        cfg_overrides={"web_search_provider": ""},
         events=[
             {"type": "text-delta", "text": ""},
             {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 0, "outputTokens": 0}},

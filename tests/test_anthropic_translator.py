@@ -3,8 +3,14 @@ import logging
 
 import pytest
 
-from cc_adapter.providers.anthropic.models import AnthropicMessage, AnthropicRequest
+from cc_adapter.providers.anthropic.models import (
+    AnthropicMessage,
+    AnthropicRequest,
+    AnthropicToolParam,
+    normalize_system_messages,
+)
 from cc_adapter.providers.anthropic.request import AnthropicTranslator
+from cc_adapter.core.errors import AdapterError
 from cc_adapter.providers.anthropic.response import (
     collect_and_translate_anthropic_nonstream,
     translate_anthropic_stream,
@@ -21,10 +27,9 @@ def test_basic_text_message(translator):
         model="claude-sonnet-4-6",
         messages=[AnthropicMessage(role="user", content="hello")],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "anthropic:claude-sonnet-4-6"
     assert body["params"]["messages"][0]["content"] == [{"type": "text", "text": "hello"}]
-    assert "Authorization" not in headers
 
 
 def test_system_prompt_string(translator):
@@ -33,7 +38,7 @@ def test_system_prompt_string(translator):
         messages=[AnthropicMessage(role="user", content="hi")],
         system="You are helpful.",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["system"] == "You are helpful."
 
 
@@ -43,8 +48,109 @@ def test_system_prompt_list(translator):
         messages=[AnthropicMessage(role="user", content="hi")],
         system=[{"type": "text", "text": "You are helpful."}],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["system"] == "You are helpful."
+
+
+def test_normalize_without_message_level_system_keeps_request_unchanged(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="assistant", content="hello"),
+        ],
+    )
+    normalized = normalize_system_messages(req)
+    body = translator.translate(normalized)
+
+    assert normalized is req
+    assert [m.role for m in normalized.messages] == ["user", "assistant"]
+    assert "system" not in body["params"]
+    assert [m["role"] for m in body["params"]["messages"]] == ["user", "assistant"]
+
+
+def test_message_level_system_moves_to_top_level_system(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            AnthropicMessage(role="system", content="You are helpful."),
+            AnthropicMessage(role="user", content="hi"),
+        ],
+    )
+    body = translator.translate(req)
+
+    assert body["params"]["system"] == "You are helpful."
+    assert [m["role"] for m in body["params"]["messages"]] == ["user"]
+
+
+def test_top_level_and_message_level_system_are_merged_in_order(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        system="Top level instructions.",
+        messages=[
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="Message instructions."),
+        ],
+    )
+    body = translator.translate(req)
+
+    assert body["params"]["system"] == "Top level instructions.\n\nMessage instructions."
+    assert [m["role"] for m in body["params"]["messages"]] == ["user"]
+
+
+def test_multiple_message_level_systems_are_merged_in_original_order(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            AnthropicMessage(role="system", content="first"),
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="second"),
+            AnthropicMessage(role="assistant", content="hello"),
+            AnthropicMessage(role="system", content="third"),
+        ],
+    )
+    body = translator.translate(req)
+
+    assert body["params"]["system"] == "first\n\nsecond\n\nthird"
+    assert [m["role"] for m in body["params"]["messages"]] == ["user", "assistant"]
+
+
+def test_message_level_system_content_blocks_extract_text(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "block one"},
+                    {"type": "image", "source": {"type": "base64", "data": "abc"}},
+                    {"type": "text", "text": "block two"},
+                ],
+            ),
+            AnthropicMessage(role="user", content="hi"),
+        ],
+    )
+    body = translator.translate(req)
+
+    assert body["params"]["system"] == "block one block two"
+    assert [m["role"] for m in body["params"]["messages"]] == ["user"]
+
+
+def test_message_level_system_in_middle_preserves_non_system_order(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            AnthropicMessage(role="user", content="hello"),
+            AnthropicMessage(role="system", content="internal instructions"),
+            AnthropicMessage(role="assistant", content="hello back"),
+            AnthropicMessage(role="user", content="test"),
+        ],
+    )
+    body = translator.translate(req)
+
+    assert body["params"]["system"] == "internal instructions"
+    assert [m["role"] for m in body["params"]["messages"]] == ["user", "assistant", "user"]
+    assert [m["content"][0]["text"] for m in body["params"]["messages"]] == ["hello", "hello back", "test"]
 
 
 def test_tool_definition(translator):
@@ -63,7 +169,7 @@ def test_tool_definition(translator):
             }
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["tools"]) == 1
     assert body["params"]["tools"][0]["name"] == "read"
     assert body["params"]["tools"][0]["input_schema"]["properties"]["path"]["type"] == "string"
@@ -75,7 +181,7 @@ def test_tool_choice_auto(translator):
         messages=[AnthropicMessage(role="user", content="hi")],
         tool_choice={"type": "auto"},
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "auto"}
 
 
@@ -85,7 +191,7 @@ def test_tool_choice_tool(translator):
         messages=[AnthropicMessage(role="user", content="hi")],
         tool_choice={"type": "tool", "name": "read"},
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["tool_choice"] == {"type": "tool", "name": "read"}
 
 
@@ -95,7 +201,7 @@ def test_thinking_maps_to_reasoning_effort_low(translator):
         messages=[AnthropicMessage(role="user", content="hello")],
         thinking={"type": "enabled", "budget_tokens": 2000},
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "low"
 
 
@@ -105,7 +211,7 @@ def test_thinking_maps_to_reasoning_effort_high(translator):
         messages=[AnthropicMessage(role="user", content="hello")],
         thinking={"type": "enabled", "budget_tokens": 12000},
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "high"
 
 
@@ -115,7 +221,7 @@ def test_thinking_maps_to_reasoning_effort_xhigh(translator):
         messages=[AnthropicMessage(role="user", content="hello")],
         thinking={"type": "enabled", "budget_tokens": 20000},
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "xhigh"
 
 
@@ -124,7 +230,7 @@ def test_no_thinking_omits_reasoning_effort(translator):
         model="claude-sonnet-4-6",
         messages=[AnthropicMessage(role="user", content="hello")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert "reasoning_effort" not in body["params"]
 
 
@@ -146,7 +252,7 @@ def test_tool_use_content_block(translator):
             ),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     msg = body["params"]["messages"][1]
     assert msg["content"] == [
         {
@@ -186,7 +292,7 @@ def test_multi_turn_tool_use_tool_result(translator):
             ),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     msgs = body["params"]["messages"]
     assert msgs[0]["role"] == "user"
     assert msgs[1]["role"] == "assistant"
@@ -233,7 +339,7 @@ def test_multi_turn_mixed_text_and_tool_result(translator):
             ),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     msgs = body["params"]["messages"]
     assert msgs[2]["role"] == "user"
     assert msgs[2]["content"] == [{"type": "text", "text": "Now write the result"}]
@@ -264,7 +370,7 @@ def test_tool_result_content_block(translator):
             ),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["messages"]) == 1
     assert body["params"]["messages"][0]["role"] == "tool"
     assert body["params"]["messages"][0]["content"] == [
@@ -312,7 +418,7 @@ def test_image_content_block_translated(translator):
             ),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     content = body["params"]["messages"][0]["content"]
     assert content == [
         {"type": "image", "image": "data:image/jpeg;base64,abc"},
@@ -367,6 +473,42 @@ async def test_nonstream_with_tool_calls():
     assert resp.content[1]["type"] == "tool_use"
     assert resp.content[1]["name"] == "read"
     assert resp.stop_reason == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_nonstream_tool_call_input_is_coerced_to_object():
+    async def fake_stream():
+        yield {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": [None]}
+        yield {"type": "finish", "finishReason": "tool_calls", "totalUsage": {"inputTokens": 1, "outputTokens": 1}}
+
+    resp = await collect_and_translate_anthropic_nonstream(fake_stream(), "claude-sonnet-4-6")
+    assert resp.content[0]["input"] == {}
+
+
+@pytest.mark.asyncio
+async def test_nonstream_hides_provider_executed_web_tool_events():
+    async def fake_stream():
+        yield {
+            "type": "tool-call",
+            "toolCallId": "call_1",
+            "toolName": "web_search",
+            "input": {"query": "latest news"},
+            "providerExecuted": True,
+        }
+        yield {
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "web_search",
+            "output": {"type": "text", "value": "Search result"},
+            "providerExecuted": True,
+        }
+        yield {"type": "text-delta", "text": "Answer"}
+        yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 15}}
+
+    resp = await collect_and_translate_anthropic_nonstream(fake_stream(), "claude-sonnet-4-6")
+
+    assert resp.content == [{"type": "text", "text": "Answer"}]
+    assert resp.stop_reason == "end_turn"
 
 
 @pytest.mark.asyncio
@@ -496,3 +638,101 @@ async def test_stream_with_tool_call():
     assert events[4][0] == "message_delta"
     assert events[4][1]["delta"]["stop_reason"] == "tool_use"
     assert events[5][0] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_stream_tool_call_non_object_input_becomes_object():
+    async def fake_stream():
+        yield {"type": "tool-call", "toolCallId": "call_1", "toolName": "read", "input": [None]}
+        yield {"type": "finish", "finishReason": "tool_calls", "totalUsage": {"inputTokens": 1, "outputTokens": 1}}
+
+    chunks = [chunk async for chunk in translate_anthropic_stream(fake_stream(), "claude-sonnet-4-6")]
+    events = _parse_sse_events("".join(chunks))
+    assert events[1][1]["content_block"]["input"] == {}
+
+
+@pytest.mark.asyncio
+async def test_stream_hides_provider_executed_web_tool_events():
+    async def fake_stream():
+        yield {
+            "type": "tool-call",
+            "toolCallId": "call_1",
+            "toolName": "web_fetch",
+            "input": {"url": "https://example.com"},
+            "providerExecuted": True,
+        }
+        yield {
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "web_fetch",
+            "output": {"type": "error-text", "value": "url_not_accessible"},
+            "providerExecuted": True,
+        }
+        yield {"type": "text-delta", "text": "Could not fetch the page."}
+        yield {"type": "finish", "finishReason": "end_turn", "totalUsage": {"inputTokens": 10, "outputTokens": 5}}
+
+    chunks = [c async for c in translate_anthropic_stream(fake_stream(), "claude-sonnet-4-6")]
+    events = _parse_sse_events("".join(chunks))
+
+    assert [data["content_block"]["type"] for event, data in events if event == "content_block_start"] == ["text"]
+    assert next(data for event, data in events if event == "message_delta")["delta"]["stop_reason"] == "end_turn"
+
+
+def test_converts_server_web_search_tool_to_function(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="search the web")],
+        tools=[AnthropicToolParam(name="web_search", type="web_search_20250305")],
+    )
+    cc_body = translator.translate(req)
+    tools = cc_body["params"]["tools"]
+    assert len(tools) == 1
+    assert tools[0]["name"] == "web_search"
+    assert "query" in tools[0]["input_schema"]["properties"]
+    assert "numResults" in tools[0]["input_schema"]["properties"]
+
+
+def test_unknown_server_tool_still_raises_error(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="test")],
+        tools=[AnthropicToolParam(name="code_execution", type="code_execution_20250522")],
+    )
+    with pytest.raises(AdapterError, match="not supported"):
+        translator.translate(req)
+
+
+def test_server_web_tool_options_are_rejected(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="search the web")],
+        tools=[
+            AnthropicToolParam(
+                name="web_search", type="web_search_20250305", allowed_domains=["example.com"], max_uses=1
+            )
+        ],
+    )
+    with pytest.raises(AdapterError, match="allowed_domains, max_uses"):
+        translator.translate(req)
+
+
+def test_mixed_web_and_function_tools(translator):
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=100,
+        messages=[AnthropicMessage(role="user", content="test")],
+        tools=[
+            AnthropicToolParam(name="web_search", type="web_search_20250305"),
+            AnthropicToolParam(
+                name="get_weather", input_schema={"type": "object", "properties": {"city": {"type": "string"}}}
+            ),
+        ],
+    )
+    cc_body = translator.translate(req)
+    tools = cc_body["params"]["tools"]
+    assert len(tools) == 2
+    assert tools[0]["name"] == "web_search"
+    assert tools[1]["name"] == "get_weather"

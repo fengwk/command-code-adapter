@@ -314,6 +314,47 @@ body {
 .token-usage-bar-fill.warning { background: var(--warning); }
 .token-usage-bar-fill.danger { background: var(--error); }
 .token-models { font-size: 11px; color: var(--text-muted); }
+.token-limits {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.token-limit-alert {
+  color: var(--error);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.token-limit-row {
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.token-limit-label {
+  color: var(--text-secondary);
+  margin-right: 8px;
+}
+.token-limit-value {
+  font-weight: 600;
+  color: var(--text);
+}
+.token-limit-reset {
+  color: var(--text-muted);
+  margin-left: 8px;
+  font-size: 11px;
+}
+.token-limit-bar-track {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-top: 4px;
+  overflow: hidden;
+}
+.token-limit-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
 .token-error-text { font-size: 13px; color: var(--error); }
 .token-label-badge {
   display: inline-block;
@@ -536,8 +577,10 @@ body {
   gap: 3px;
   margin-bottom: 4px;
   padding-left: 24px;
-  overflow-x: hidden;
+  overflow-x: auto;
 }
+.heatmap-month-labels::-webkit-scrollbar { display: none; }
+.heatmap-grid::-webkit-scrollbar { display: none; }
 .heatmap-month-label {
   font-size: 11px;
   color: var(--text-muted);

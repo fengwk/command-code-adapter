@@ -39,13 +39,12 @@ def test_basic_message_translation(translator):
         model="claude-sonnet-4-6",
         messages=[ChatMessage(role="user", content="hello")],
     )
-    body, headers = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "anthropic:claude-sonnet-4-6"
     assert body["params"]["messages"][0]["content"] == [{"type": "text", "text": "hello"}]
     assert body["params"]["stream"] is False
     assert "env" not in body["config"]
     assert body["config"]["additionalDirectories"] == []
-    assert "Authorization" not in headers
 
 
 def test_system_prompt_extraction(translator):
@@ -56,7 +55,7 @@ def test_system_prompt_extraction(translator):
             ChatMessage(role="user", content="hi"),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["system"] == "You are a helpful assistant."
     assert len(body["params"]["messages"]) == 1
     assert body["params"]["messages"][0]["role"] == "user"
@@ -76,7 +75,7 @@ def test_tool_translation(translator):
             )
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert len(body["params"]["tools"]) == 1
     assert body["params"]["tools"][0]["name"] == "read_file"
 
@@ -100,7 +99,7 @@ def test_tool_history_converted_to_command_code_blocks(translator):
             ChatMessage(role="tool", content="file contents here", tool_call_id="call_1"),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     msgs = body["params"]["messages"]
     assert len(msgs) == 3
     assert msgs[0]["role"] == "user"
@@ -139,7 +138,7 @@ def test_tool_call_arguments_converted_to_command_code_names(translator):
             )
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["messages"][0]["content"] == [
         {
             "type": "tool-call",
@@ -158,7 +157,7 @@ def test_content_wrapped_in_array(translator):
             ChatMessage(role="assistant", content="hi there"),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     msgs = body["params"]["messages"]
     assert msgs[0]["content"] == [{"type": "text", "text": "hello"}]
     assert msgs[1]["content"] == [{"type": "text", "text": "hi there"}]
@@ -171,7 +170,7 @@ def test_none_content_wrapped_as_empty_string(translator):
             ChatMessage(role="assistant", content=None),
         ],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["messages"][0]["content"] == [{"type": "text", "text": ""}]
 
 
@@ -181,7 +180,7 @@ def test_stream_true_passed_through(translator):
         messages=[ChatMessage(role="user", content="hi")],
         stream=True,
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["stream"] is True
 
 
@@ -190,7 +189,7 @@ def test_normalize_deepseek_model(translator):
         model="deepseek-v4-flash",
         messages=[ChatMessage(role="user", content="hi")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "deepseek/deepseek-v4-flash"
 
 
@@ -199,7 +198,7 @@ def test_normalize_deepseek_v4_pro(translator):
         model="deepseek-v4-pro",
         messages=[ChatMessage(role="user", content="hi")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "deepseek/deepseek-v4-pro"
 
 
@@ -208,7 +207,7 @@ def test_normalize_qualified_model_passthrough(translator):
         model="deepseek/deepseek-v4-flash",
         messages=[ChatMessage(role="user", content="hi")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "deepseek/deepseek-v4-flash"
 
 
@@ -217,7 +216,7 @@ def test_normalize_default_provider_model_unchanged(translator):
         model="claude-sonnet-4-6",
         messages=[ChatMessage(role="user", content="hi")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["model"] == "anthropic:claude-sonnet-4-6"
 
 
@@ -227,7 +226,7 @@ def test_reasoning_effort_high_passthrough(translator):
         messages=[ChatMessage(role="user", content="hello")],
         reasoning_effort="high",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "high"
     assert "system" not in body["params"]
 
@@ -238,7 +237,7 @@ def test_reasoning_effort_low_clamps_to_high_for_deepseek(translator):
         messages=[ChatMessage(role="user", content="hello")],
         reasoning_effort="low",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "high"
     assert "system" not in body["params"]
 
@@ -249,7 +248,7 @@ def test_reasoning_effort_xhigh_clamps_to_max_for_deepseek(translator):
         messages=[ChatMessage(role="user", content="hello")],
         reasoning_effort="xhigh",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "max"
     assert "system" not in body["params"]
 
@@ -260,7 +259,7 @@ def test_reasoning_effort_off_passthrough(translator):
         messages=[ChatMessage(role="user", content="hello")],
         reasoning_effort="off",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "off"
     assert "system" not in body["params"]
 
@@ -271,7 +270,7 @@ def test_reasoning_effort_medium_passthrough_for_claude(translator):
         messages=[ChatMessage(role="user", content="hello")],
         reasoning_effort="medium",
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert body["params"]["reasoning_effort"] == "medium"
     assert "system" not in body["params"]
 
@@ -281,5 +280,5 @@ def test_reasoning_effort_none_not_in_params(translator):
         model="deepseek-v4-flash",
         messages=[ChatMessage(role="user", content="hello")],
     )
-    body, _ = translator.translate(req)
+    body = translator.translate(req)
     assert "reasoning_effort" not in body["params"]

@@ -1,5 +1,5 @@
 import pytest
-from cc_adapter.core.utils import generate_id, normalize_api_keys
+from cc_adapter.core.utils import generate_id, normalize_api_keys, scrub_pii
 
 
 class TestNormalizeApiKeys:
@@ -52,6 +52,10 @@ class TestGenerateId:
     def test_unique_values(self):
         results = {generate_id() for _ in range(100)}
         assert len(results) == 100  # all unique
+
+
+def test_scrub_pii_keeps_normal_model_response_text_unchanged():
+    assert scrub_pii("The answer is 42") == "The answer is 42"
 
 
 def test_get_or_create_client_fallback():

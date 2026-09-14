@@ -8,8 +8,6 @@ import structlog
 def isolate_auth_env(monkeypatch):
     monkeypatch.setenv("CC_ADAPTER_ACCESS_KEY", "")
     monkeypatch.setenv("CC_ADAPTER_ADMIN_PASSWORD", "")
-    monkeypatch.setenv("CC_ADAPTER_WEB_SEARCH_PROVIDER", "")
-    monkeypatch.setenv("CC_ADAPTER_DEEPSEEK_API_KEY", "")
 
 
 @pytest.fixture(autouse=True, scope="session")

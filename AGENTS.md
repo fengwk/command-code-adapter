@@ -57,10 +57,6 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_HTTP2` | `false` | |
 | `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
-| `CC_ADAPTER_WEB_SEARCH_PROVIDER` | — | Set to `"deepseek"` to forward Anthropic `web_search` to DeepSeek |
-| `CC_ADAPTER_DEEPSEEK_API_KEY` | — | DeepSeek API key for web_search forwarding |
-| `CC_ADAPTER_DEEPSEEK_ANTHROPIC_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible endpoint |
-| `CC_ADAPTER_WEB_SEARCH_MODEL` | — | Optional model override for forwarded web_search requests |
 
 ## Architecture
 

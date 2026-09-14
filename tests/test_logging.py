@@ -6,6 +6,8 @@ import pytest
 import structlog
 
 from cc_adapter.core.logging import configure_logging, filter_sensitive_data, PrettyConsoleRenderer
+from cc_adapter.core import log_buffer
+from cc_adapter.core.utils import scrub_pii
 
 
 def test_configure_logging_json_output(capsys):
@@ -119,6 +121,24 @@ def test_filter_sensitive_data_case_insensitive():
     result = filter_sensitive_data(None, "info", event)
     assert result["Authorization"] == "***"
     assert result["X-Api-Key"] == "***"
+
+
+def test_scrub_pii_and_log_buffer_hide_diagnostic_secrets():
+    message = "failed at /home/alice/project, C:\\Users\\alice\\repo, ~/repo with sk-live_123456 and ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+    scrubbed = scrub_pii(message)
+    assert "/home/alice" not in scrubbed
+    assert "C:\\Users\\alice" not in scrubbed
+    assert "sk-live_123456" not in scrubbed
+    assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in scrubbed
+
+    log_buffer.clear()
+    configure_logging(log_format="json", log_level="INFO")
+    import structlog
+
+    structlog.get_logger("test.scrub").error("upstream.failed", error=message)
+    entry = log_buffer.get_entries(level="ERROR", limit=1)[0]
+    assert "/home/alice" not in str(entry)
+    assert "sk-live_123456" not in str(entry)
 
 
 def test_console_renderer_output_format():

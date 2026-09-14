@@ -11,9 +11,7 @@ class TestKeyPoolSelectKey:
     async def test_select_key_fetches_credits_on_first_call(self):
         pool = KeyPool(keys=["key1", "key2", "key3"], base_url="https://api.example.com")
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "credits": {"monthlyCredits": 0, "purchasedCredits": 0, "freeCredits": 0}
-        }
+        mock_response.json.return_value = {"credits": {"monthlyCredits": 0, "purchasedCredits": 0, "freeCredits": 0}}
         mock_response.raise_for_status = MagicMock()
         mock_client = AsyncMock()
         mock_client.__aenter__.return_value.get.return_value = mock_response

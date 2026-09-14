@@ -39,10 +39,7 @@ class ChatMessage(BaseModel):
     @classmethod
     def coerce_content(cls, v):
         if isinstance(v, list):
-            has_image = any(
-                isinstance(item, dict) and item.get("type") == "image_url"
-                for item in v
-            )
+            has_image = any(isinstance(item, dict) and item.get("type") == "image_url" for item in v)
             if has_image:
                 return v
             parts = []

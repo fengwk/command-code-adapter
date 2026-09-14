@@ -99,6 +99,15 @@ class TestResponsesStreamState:
         add_events = [c for c in chunks if "response.output_item.added" in c]
         assert len(add_events) == 1
 
+    def test_process_tool_call_non_object_input_becomes_object(self):
+        state = _ResponsesStreamState("resp_1", "test-model", 1234567890.0)
+        chunks = list(
+            state.process_event(
+                _make_cc_event("tool-call", toolName="read_file", toolCallId="call_abc123", input=[None])
+            )
+        )
+        assert any('"arguments": "{}"' in chunk for chunk in chunks)
+
     def test_process_finish_with_content(self):
         state = _ResponsesStreamState("resp_1", "test-model", 1234567890.0)
         state.has_any_output = True
@@ -213,6 +222,15 @@ class TestCollectResponsesNonstream:
         assert result["status"] == "completed"
         assert len(result["output"]) == 1
         assert result["output"][0]["type"] == "function_call"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_input_is_coerced_to_object(self):
+        async def mock_stream():
+            yield _make_cc_event("tool-call", toolName="read", toolCallId="call_1", input='{"filePath":"/f"}')
+            yield _make_cc_event("finish", totalUsage={"input": 1, "output": 1})
+
+        result = await collect_and_translate_responses_nonstream(mock_stream(), "test-model")
+        assert result["output"][0]["arguments"] == '{"filePath": "/f"}'
 
     @pytest.mark.asyncio
     async def test_empty_response_raises(self):

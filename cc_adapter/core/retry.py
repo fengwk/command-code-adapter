@@ -1,22 +1,10 @@
 from __future__ import annotations
 
-from typing import AsyncGenerator, Awaitable, Callable, TypeVar
+from typing import AsyncGenerator, Callable
 
 import structlog
 
 from cc_adapter.core.errors import AdapterError
-
-T = TypeVar("T")
-
-
-async def retry_on_empty(
-    generate_fn: Callable[[], AsyncGenerator[dict, None]],
-    translate_fn: Callable[[AsyncGenerator[dict, None]], Awaitable[T]],
-    logger: structlog.stdlib.BoundLogger,
-    label: str = "",
-) -> T:
-    cc_stream = generate_fn()
-    return await translate_fn(cc_stream)
 
 
 async def stream_with_retry(

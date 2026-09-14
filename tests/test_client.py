@@ -194,9 +194,7 @@ class TestClientEdgeCases:
 
         with patch.object(httpx.AsyncClient, "stream") as mock_stream:
             mock_stream.side_effect = httpx.TimeoutException("timed out")
-            client = CommandCodeClient(
-                base_url="https://api.commandcode.ai", api_key="k1"
-            )
+            client = CommandCodeClient(base_url="https://api.commandcode.ai", api_key="k1")
             with pytest.raises(TimeoutError_, match="timed out"):
                 async for _ in client.generate({"params": {"model": "m", "messages": []}}):
                     pass

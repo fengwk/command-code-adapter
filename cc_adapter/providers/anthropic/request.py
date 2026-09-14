@@ -3,8 +3,7 @@ from __future__ import annotations
 import structlog
 from typing import Any
 
-from cc_adapter.providers.anthropic.models import AnthropicRequest
-from cc_adapter.command_code.headers import make_cc_headers
+from cc_adapter.providers.anthropic.models import AnthropicRequest, extract_system_text, normalize_system_messages
 from cc_adapter.providers.shared.model_mapping import resolve_model_id, clamp_reasoning_effort
 from cc_adapter.providers.shared.tool_mapping import make_tool_call_block, make_tool_result_block, normalize_schema
 from cc_adapter.command_code.body import make_config, make_cc_body
@@ -27,21 +26,11 @@ def _budget_to_effort(budget: int | None) -> str | None:
     return "xhigh"
 
 
-def _extract_system_text(system: str | list[dict[str, Any]] | None) -> str | None:
-    if system is None:
-        return None
-    if isinstance(system, str):
-        return system
-    texts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
-    return " ".join(texts) if texts else None
-
-
 class AnthropicTranslator:
-    def translate(self, req: AnthropicRequest) -> tuple[dict[str, Any], dict[str, Any]]:
+    def translate(self, req: AnthropicRequest) -> dict[str, Any]:
+        req = normalize_system_messages(req)
         self._warn_unsupported(req)
-        cc_body = self._build_body(req)
-        cc_headers = make_cc_headers()
-        return cc_body, cc_headers
+        return self._build_body(req)
 
     def _warn_unsupported(self, req: AnthropicRequest) -> None:
         for param in _NOT_SUPPORTED:
@@ -57,19 +46,42 @@ class AnthropicTranslator:
             "stream": True,
         }
 
-        system_text = _extract_system_text(req.system)
+        system_text = extract_system_text(req.system)
         if system_text:
             params["system"] = system_text
 
         if req.tools:
-            params["tools"] = [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": normalize_schema(self._require_tool_schema(t)),
-                }
-                for t in req.tools
-            ]
+            from cc_adapter.providers.shared.web_search import is_anthropic_web_tool, anthropic_web_tool_to_function
+
+            cc_tools = []
+            for t in req.tools:
+                if is_anthropic_web_tool(t):
+                    converted = anthropic_web_tool_to_function(t)
+                    unsupported = sorted(
+                        name for name, value in (t.model_extra or {}).items() if value not in (None, False)
+                    )
+                    if unsupported:
+                        raise AdapterError(
+                            message=f"Anthropic server tool options are not supported: {', '.join(unsupported)}",
+                            status_code=400,
+                        )
+
+                    cc_tools.append(
+                        {
+                            "name": converted["name"],
+                            "description": converted["description"],
+                            "input_schema": normalize_schema(converted["input_schema"]),
+                        }
+                    )
+                else:
+                    cc_tools.append(
+                        {
+                            "name": t.name,
+                            "description": t.description or "",
+                            "input_schema": normalize_schema(self._require_tool_schema(t)),
+                        }
+                    )
+            params["tools"] = cc_tools
         if req.tool_choice:
             tc = req.tool_choice
             choice: dict[str, Any] = {"type": tc.type}
@@ -95,8 +107,8 @@ class AnthropicTranslator:
         if tool.type:
             raise AdapterError(
                 message=(
-                    f"Anthropic server tool '{tool.name}' cannot be translated to Command Code; "
-                    "enable DeepSeek web_search forwarding for server-side tools"
+                    f"Anthropic server tool '{tool.name}' is not supported. "
+                    f"Only web_search and web_fetch server tools can be translated."
                 ),
                 status_code=400,
             )

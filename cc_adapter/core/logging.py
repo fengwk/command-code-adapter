@@ -12,6 +12,7 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from cc_adapter.core import log_buffer
+from cc_adapter.core.utils import scrub_pii
 
 
 SENSITIVE_KEYS = {
@@ -37,12 +38,19 @@ def _redact_sensitive_keys(d: dict[str, Any]) -> None:
         kl = k.lower()
         if kl in SENSITIVE_KEYS_LOWER:
             d[k] = "***"
-        elif isinstance(v, dict):
-            _redact_sensitive_keys(v)
-        elif isinstance(v, list):
-            for item in v:
-                if isinstance(item, dict):
-                    _redact_sensitive_keys(item)
+        else:
+            d[k] = _scrub_log_value(v)
+
+
+def _scrub_log_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return scrub_pii(value)
+    if isinstance(value, dict):
+        _redact_sensitive_keys(value)
+        return value
+    if isinstance(value, list):
+        return [_scrub_log_value(item) for item in value]
+    return value
 
 
 def filter_sensitive_data(_logger: logging.Logger, _method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
