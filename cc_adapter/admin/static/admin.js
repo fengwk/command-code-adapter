@@ -86,6 +86,11 @@ const i18n = {
     keysConfigured: "已配置 {n} 个 Key",
     keysManagedInTab: "在「Keys」页添加、删除、启停",
     keysManageButton: "去 Keys 页管理",
+    // 新会话的 Key 分发模式
+    distributionLabel: "Key 分发模式",
+    distributionRoundRobin: "轮询",
+    distributionFillFirst: "主号优先",
+    distributionHint: "新会话的落点：轮询沿配置顺序依次分配，主号优先始终使用第一个可用 Key；已绑定会话不受切换影响，额度与冷却规则也不变。",
     tokenManagerEmpty: "请先添加至少一个 Key",
     tokenManagerResult: "新增 {added} 个，已存在 {existing} 个，失败 {failed} 个",
     tokenManagerHint: "此处只新增 Key（不会覆盖已有列表）；删除与启停在「Keys」页。",
@@ -209,6 +214,11 @@ const i18n = {
     keysConfigured: "{n} key(s) configured",
     keysManagedInTab: "Add, remove or switch keys in the Keys tab",
     keysManageButton: "Manage in the Keys tab",
+    // Key distribution mode for new sessions
+    distributionLabel: "Key distribution",
+    distributionRoundRobin: "Round-robin",
+    distributionFillFirst: "Fill-first",
+    distributionHint: "Where a new session starts: round-robin walks the configured key order, fill-first always uses the first usable key. Switching never moves a bound session, and credits/cooldown rules stay unchanged.",
     tokenManagerEmpty: "Add at least one key first",
     tokenManagerResult: "added {added}, already configured {existing}, failed {failed}",
     tokenManagerHint: "This dialog only adds keys (it never rewrites the pool); removal and the on/off switch live in the Keys tab.",
@@ -931,6 +941,14 @@ async function renderConfig() {
           <label>CC_ADAPTER_DEFAULT_MODEL</label>
           <input type="text" id="cfg-default-model">
         </div>
+        <div class="form-group">
+          <label>CC_ADAPTER_DISTRIBUTION — ${t("distributionLabel")}</label>
+          <select id="cfg-distribution">
+            <option value="round-robin">${t("distributionRoundRobin")}</option>
+            <option value="fill-first">${t("distributionFillFirst")}</option>
+          </select>
+          <span class="cfg-key-hint">${t("distributionHint")}</span>
+        </div>
         <div class="form-actions">
           <button class="btn btn-primary" id="cfg-save">${t("save")}</button>
           <button class="btn btn-secondary" id="cfg-cancel">${t("cancel")}</button>
@@ -986,6 +1004,12 @@ async function loadConfig() {
     document.getElementById("cfg-port").value = configData.port;
     document.getElementById("cfg-log-level").value = configData.log_level;
     document.getElementById("cfg-default-model").value = configData.default_model;
+    // A value the UI does not offer (older server, hand-edited config) keeps the default
+    // option selected instead of blanking the select.
+    const distribution = configData.distribution;
+    if (distribution === "round-robin" || distribution === "fill-first") {
+      document.getElementById("cfg-distribution").value = distribution;
+    }
   } catch { showToast(t("saveFailed"), "error"); }
 }
 
@@ -1001,6 +1025,8 @@ async function saveConfig() {
   if (logLevel !== configData.log_level) body.log_level = logLevel;
   const defaultModelVal = document.getElementById("cfg-default-model").value;
   if (defaultModelVal !== configData.default_model) body.default_model = defaultModelVal;
+  const distribution = document.getElementById("cfg-distribution").value;
+  if (distribution !== configData.distribution) body.distribution = distribution;
   if (Object.keys(body).length === 0) { showToast("No changes", "success"); return; }
   try {
     const resp = await api("PUT", "/admin/api/config", body);

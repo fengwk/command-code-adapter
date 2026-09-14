@@ -83,6 +83,74 @@ async def test_update_config_uses_first_configured_key_for_client(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_get_config_reports_the_live_distribution_mode(tmp_path, monkeypatch):
+    """GET returns the mode that is actually in force, not just the stored one."""
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
+    from cc_adapter.core.auth import generate_token
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        before = await client.get("/admin/api/config", headers={"Authorization": f"Bearer {my_token}"})
+        client_impl.scheduler.set_distribution("fill-first")  # e.g. a runtime switch
+        after = await client.get("/admin/api/config", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert before.status_code == 200
+    assert before.json()["distribution"] == "round-robin"
+    assert after.json()["distribution"] == "fill-first"
+
+
+@pytest.mark.asyncio
+async def test_update_config_switches_the_distribution_without_a_rebuild(tmp_path, monkeypatch):
+    """PUT {"distribution"} takes effect on the live scheduler and survives the next GET."""
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    client_before = _init_multi_key_client(["key1111", "key2222"])
+    await client_before.scheduler.select("claude:running", explicit=True)  # binds key1111
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put(
+            "/admin/api/config",
+            json={"distribution": "fill-first"},
+            headers={"Authorization": f"Bearer {my_token}"},
+        )
+        after = await client.get("/admin/api/config", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json()["distribution"] == "fill-first"
+    assert after.json()["distribution"] == "fill-first"
+    assert get_client() is client_before  # applied in place: no client rebuild
+    assert get_config().distribution == "fill-first"
+    assert client_before.scheduler.distribution == "fill-first"
+    assert client_before.scheduler.key_state("key1111")["sessions"] == 1  # binding survived
+    assert "CC_ADAPTER_DISTRIBUTION=fill-first" in (tmp_path / ".env").read_text()
+
+
+@pytest.mark.asyncio
+async def test_update_config_falls_back_from_an_unknown_distribution(tmp_path, monkeypatch):
+    """A bad value is corrected to the default instead of erroring the whole save."""
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_config
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put(
+            "/admin/api/config",
+            json={"distribution": "sideways"},
+            headers={"Authorization": f"Bearer {my_token}"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["distribution"] == "round-robin"
+    assert get_config().distribution == "round-robin"
+    assert client_impl.scheduler.distribution == "round-robin"
+
+
+@pytest.mark.asyncio
 async def test_update_config_persists_prefixed_env_keys(tmp_path, monkeypatch):
     # Pin the panel config file into the temp dir (runtime data lives next to it).
     monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
@@ -235,6 +303,23 @@ def test_admin_js_token_manager_saves_full_keys():
     assert "const keyVal = row.dataset.key;" in src
     assert 'codeEl.textContent.replace("...", "")' not in src
     assert 'querySelector("code")' not in src
+
+
+def test_admin_js_config_form_exposes_the_distribution_select():
+    """Static guard: both modes are offered on the config form and wired through load/save."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    # The select offers the two wire values, labelled through t()
+    assert '<select id="cfg-distribution">' in src
+    assert '<option value="round-robin">${t("distributionRoundRobin")}</option>' in src
+    assert '<option value="fill-first">${t("distributionFillFirst")}</option>' in src
+    # loadConfig restores the stored mode, saveConfig only sends a changed one
+    assert 'document.getElementById("cfg-distribution").value = distribution;' in src
+    assert "if (distribution !== configData.distribution) body.distribution = distribution;" in src
+    # Label, both options and the hint exist in zh and en
+    for key in ("distributionLabel", "distributionRoundRobin", "distributionFillFirst", "distributionHint"):
+        assert src.count(f"{key}:") == 2
 
 
 def _init_multi_key_client(keys: list[str]):

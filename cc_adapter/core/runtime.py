@@ -26,6 +26,7 @@ def create_client(cfg: AppConfig, *, timeout: float | None = None) -> CommandCod
         key_cooldown_base=cfg.key_cooldown_base,
         key_cooldown_max=cfg.key_cooldown_max,
         key_credit_cooldown=cfg.key_credit_cooldown,
+        key_distribution=cfg.distribution,
     )
 
 

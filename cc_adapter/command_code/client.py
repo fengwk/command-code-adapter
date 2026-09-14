@@ -9,6 +9,7 @@ import httpx
 
 from cc_adapter.core.constants import (
     CLIENT_CLOSE_GRACE_SECONDS,
+    DEFAULT_DISTRIBUTION,
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
     KEY_CREDIT_COOLDOWN,
@@ -117,6 +118,7 @@ class CommandCodeClient:
         key_cooldown_base: float = KEY_COOLDOWN_BASE,
         key_cooldown_max: float = KEY_COOLDOWN_MAX,
         key_credit_cooldown: float = KEY_CREDIT_COOLDOWN,
+        key_distribution: str = DEFAULT_DISTRIBUTION,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -148,6 +150,7 @@ class CommandCodeClient:
                 cooldown_base=key_cooldown_base,
                 cooldown_max=key_cooldown_max,
                 credit_cooldown=key_credit_cooldown,
+                distribution=key_distribution,
             )
         else:
             self.scheduler = None
@@ -275,9 +278,9 @@ class CommandCodeClient:
 
         while True:
             if self.scheduler is not None:
-                # Explicit client session identities stick to their key (round robin
-                # for new ones); requests without one go to the first usable key. The
-                # per-key load keeps one account from looking like an unbounded relay.
+                # A session that already owns a key sticks to it; a new one is dealt by the
+                # configured distribution (round-robin or fill-first). The per-key load keeps
+                # one account from looking like an unbounded relay.
                 key = await self.scheduler.select(
                     signal.flag, explicit=signal.explicit, exclude=tried_keys, load=self.key_load
                 )

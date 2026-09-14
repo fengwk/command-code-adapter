@@ -6,7 +6,13 @@ from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from cc_adapter.core.constants import KEY_COOLDOWN_BASE, KEY_COOLDOWN_MAX, KEY_CREDIT_COOLDOWN
+from cc_adapter.core.constants import (
+    DEFAULT_DISTRIBUTION,
+    KEY_COOLDOWN_BASE,
+    KEY_COOLDOWN_MAX,
+    KEY_CREDIT_COOLDOWN,
+    normalize_distribution,
+)
 from cc_adapter.core.utils import normalize_api_keys
 
 
@@ -59,6 +65,11 @@ class AppConfig(BaseSettings):
     key_cooldown_max: float = KEY_COOLDOWN_MAX
     key_credit_cooldown: float = KEY_CREDIT_COOLDOWN
 
+    # First-sight distribution of new sessions over the key pool: "round-robin" or
+    # "fill-first". Switchable at runtime from the admin panel; the value here is what a
+    # client rebuild starts from.
+    distribution: str = DEFAULT_DISTRIBUTION
+
     zdr: bool = True
 
     oss_primary_provider: str = ""
@@ -67,6 +78,12 @@ class AppConfig(BaseSettings):
     @classmethod
     def coerce_api_key(cls, v):
         return normalize_api_keys(v)
+
+    @field_validator("distribution", mode="before")
+    @classmethod
+    def coerce_distribution(cls, v):
+        # Unknown/odd spellings fall back to the default instead of failing startup.
+        return normalize_distribution(v)
 
 
 def get_config_or_default() -> AppConfig:

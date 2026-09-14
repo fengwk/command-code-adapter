@@ -18,7 +18,7 @@ from cc_adapter.core.runtime import (
 )
 from cc_adapter.core.token_recorder import query_daily_tokens
 from cc_adapter.core.config import DEFAULT_MODEL
-from cc_adapter.core.constants import VERSION
+from cc_adapter.core.constants import DEFAULT_DISTRIBUTION, VERSION
 from cc_adapter.command_code.body import make_cc_body, make_config
 from cc_adapter.admin.config_manager import ConfigManager
 from cc_adapter.admin.usage_client import query_all_tokens, query_daily_usage
@@ -46,6 +46,7 @@ class ConfigUpdate(BaseModel):
     log_level: str | None = None
     log_format: str | None = None
     default_model: str | None = None
+    distribution: str | None = None
 
 
 async def verify_auth(authorization: str | None = Header(None)):
@@ -76,6 +77,20 @@ async def login(req: LoginRequest):
     return LoginResponse(token=token)
 
 
+def _effective_distribution(cfg) -> str:
+    """The mode that is actually in force: the live scheduler's, else the stored config.
+
+    The scheduler owns the value once it exists (the panel switches it in place), and a
+    single-key pool has no scheduler, so there the config file is the source of truth.
+    """
+    from cc_adapter.core.runtime import get_client
+
+    scheduler = getattr(get_client(), "scheduler", None)
+    if scheduler is not None:
+        return scheduler.distribution
+    return cfg.distribution if cfg else DEFAULT_DISTRIBUTION
+
+
 @router.get("/config")
 async def get_config_endpoint(_=Depends(verify_auth)):
     cfg = get_config()
@@ -91,6 +106,7 @@ async def get_config_endpoint(_=Depends(verify_auth)):
         "log_format": cfg.log_format if cfg else "console",
         "admin_password_configured": bool(cfg and cfg.admin_password),
         "default_model": cfg.default_model if cfg else DEFAULT_MODEL,
+        "distribution": _effective_distribution(cfg),
     }
 
 

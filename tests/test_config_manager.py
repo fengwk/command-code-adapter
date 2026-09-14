@@ -10,6 +10,7 @@ import pytest
 
 from cc_adapter.admin.config_manager import ConfigManager, FIELD_MAP, _apply_config_fields
 from cc_adapter.core.config import AppConfig, env_file_path
+from cc_adapter.core.constants import DISTRIBUTION_FILL_FIRST, DISTRIBUTION_ROUND_ROBIN
 
 
 class TestApplyConfigFields:
@@ -24,6 +25,18 @@ class TestApplyConfigFields:
         changed = _apply_config_fields(cfg, {"cc_base_url": "https://new.example.com"})
         assert cfg.cc_base_url == "https://new.example.com"
         assert changed  # cc_base_url is a client field
+
+    def test_distribution_update_is_normalized_and_keeps_the_client(self):
+        """The mode is applied in place, so the stored value must be canonical and unremarkable."""
+        cfg = AppConfig()
+        changed = _apply_config_fields(cfg, {"distribution": "Fill_First"})
+        assert cfg.distribution == DISTRIBUTION_FILL_FIRST
+        assert not changed  # switching the distribution must not rebuild the client
+
+    def test_an_unknown_distribution_update_stores_the_default(self):
+        cfg = AppConfig(distribution="fill-first")
+        _apply_config_fields(cfg, {"distribution": "sideways"})
+        assert cfg.distribution == DISTRIBUTION_ROUND_ROBIN
 
     def test_api_key_normalization_single_string(self):
         cfg = AppConfig(cc_api_key="single-key")
@@ -64,6 +77,23 @@ class TestUpdateEnvFile:
             ConfigManager.update_env_file({"cc_api_key": "new-key"}, env_path)
             content = env_path.read_text()
             assert "new-key" in content
+
+    def test_update_distribution_writes_the_canonical_mode(self):
+        """The config file must not keep the raw panel spelling (it is what operators read)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("CC_ADAPTER_DISTRIBUTION=round-robin\n")
+            ConfigManager.update_env_file({"distribution": "Fill_First"}, env_path)
+            assert env_path.read_text() == f"CC_ADAPTER_DISTRIBUTION={DISTRIBUTION_FILL_FIRST}\n"
+
+    def test_add_distribution_writes_the_canonical_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("CC_ADAPTER_PORT=8080\n")
+            ConfigManager.update_env_file({"distribution": "sideways"}, env_path)
+            content = env_path.read_text()
+            assert f"CC_ADAPTER_DISTRIBUTION={DISTRIBUTION_ROUND_ROBIN}\n" in content
+            assert "sideways" not in content
 
     def test_update_api_key_json_list_to_list(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -182,6 +212,75 @@ class TestRecreateClient:
             state_init(*previous)
 
 
+class TestDistributionUpdate:
+    """A mode switch is applied to the live scheduler in place; nothing is rebuilt.
+
+    Each test installs a client into the runtime singleton, so it restores whatever was
+    there before and closes its own pools: a client left behind keeps serving later test
+    files, and its httpx pools belong to this test's (closed) event loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_update_switches_the_live_scheduler_without_a_rebuild(self):
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        keys = ["cc-key-alpha-1111", "cc-key-beta-2222"]
+        cfg = AppConfig(cc_api_key=keys)
+        client = CommandCodeClient(base_url=cfg.cc_base_url, api_key=keys[0], api_keys=keys)
+        client.scheduler._credits = {key: 100 for key in keys}
+        client.scheduler._last_fetch = time.monotonic()
+        sticky = "header:running-conversation"
+        assert await client.scheduler.select(sticky, explicit=True) == keys[0]
+        assert await client.scheduler.select("header:second", explicit=True) == keys[1]
+        previous = (get_config(), get_client())
+        state_init(cfg, client)
+        try:
+            await ConfigManager.apply_config_update({"distribution": "fill-first"})
+
+            assert get_client() is client  # same object: no rebuild, so no re-dealt bindings
+            assert client.scheduler.distribution == DISTRIBUTION_FILL_FIRST
+            assert cfg.distribution == DISTRIBUTION_FILL_FIRST
+            # Both running conversations keep their account ...
+            assert await client.scheduler.select(sticky, explicit=True) == keys[0]
+            assert await client.scheduler.select("header:second", explicit=True) == keys[1]
+            # ... while a new one follows the new mode
+            assert await client.scheduler.select("header:third", explicit=True) == keys[0]
+        finally:
+            state_init(*previous)
+            await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_update_without_a_scheduler_only_stores_the_mode(self):
+        """A single-key pool has no scheduler; the mode applies to the next rebuild."""
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        cfg = AppConfig(cc_api_key=["only-key-1234"])
+        client = CommandCodeClient(base_url=cfg.cc_base_url, api_key="only-key-1234")
+        assert client.scheduler is None
+        previous = (get_config(), get_client())
+        state_init(cfg, client)
+        try:
+            await ConfigManager.apply_config_update({"distribution": DISTRIBUTION_FILL_FIRST})
+            assert cfg.distribution == DISTRIBUTION_FILL_FIRST
+            assert get_client() is client
+        finally:
+            state_init(*previous)
+            await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_update_survives_a_runtime_without_a_client(self, monkeypatch):
+        """Nothing has been initialised yet: the mode is stored, not crashed on."""
+        from cc_adapter.core import runtime
+
+        cfg = AppConfig(cc_api_key=["only-key-1234"])
+        monkeypatch.setattr(runtime, "_config", cfg)
+        monkeypatch.setattr(runtime, "_cc_client", None)
+        await ConfigManager.apply_config_update({"distribution": DISTRIBUTION_FILL_FIRST})
+        assert cfg.distribution == DISTRIBUTION_FILL_FIRST
+
+
 class TestFieldMap:
     def test_field_map_covers_key_fields(self):
         for field in [
@@ -192,6 +291,7 @@ class TestFieldMap:
             "log_level",
             "log_format",
             "default_model",
+            "distribution",
             "zdr",
         ]:
             assert field in FIELD_MAP
@@ -199,6 +299,41 @@ class TestFieldMap:
     def test_field_map_env_prefix(self):
         for env_key in FIELD_MAP.values():
             assert env_key.startswith("CC_ADAPTER_")
+
+
+class TestDistributionConfig:
+    """`CC_ADAPTER_DISTRIBUTION` chooses the first-sight distribution of new sessions."""
+
+    def test_default_is_round_robin(self, monkeypatch):
+        monkeypatch.delenv("CC_ADAPTER_DISTRIBUTION", raising=False)
+        assert AppConfig().distribution == DISTRIBUTION_ROUND_ROBIN
+
+    def test_env_var_is_honoured(self, monkeypatch):
+        monkeypatch.setenv("CC_ADAPTER_DISTRIBUTION", "fill-first")
+        assert AppConfig().distribution == DISTRIBUTION_FILL_FIRST
+
+    def test_an_unknown_env_value_normalizes_to_the_default(self, monkeypatch):
+        """A typo must not leave the deployment without a working mode."""
+        monkeypatch.setenv("CC_ADAPTER_DISTRIBUTION", "sideways")
+        assert AppConfig().distribution == DISTRIBUTION_ROUND_ROBIN
+
+    def test_config_file_value_is_honoured_and_normalized(self, tmp_path):
+        """The dotenv file is a settings source too (fresh process, own env file)."""
+        custom = tmp_path / "cc-adapter.env"
+        custom.write_text("CC_ADAPTER_DISTRIBUTION=FillFirst\n")  # sloppy spelling on purpose
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CC_ADAPTER_")}
+        env["CC_ADAPTER_ENV_FILE"] = str(custom)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        proc = subprocess.run(
+            [sys.executable, "-c", "from cc_adapter.core.config import AppConfig; print(AppConfig().distribution)"],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == DISTRIBUTION_FILL_FIRST
 
 
 class TestEnvFilePath:

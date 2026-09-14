@@ -16,6 +16,10 @@ import pytest
 
 from cc_adapter.core import key_scheduler as ks
 from cc_adapter.core.constants import (
+    DEFAULT_DISTRIBUTION,
+    DISTRIBUTION_FILL_FIRST,
+    DISTRIBUTION_MODES,
+    DISTRIBUTION_ROUND_ROBIN,
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
     KEY_CREDIT_COOLDOWN,
@@ -33,9 +37,11 @@ BASE_URL = "https://api.example.com"
 K1, K2, K3 = "cc-key-alpha-1111", "cc-key-beta-2222", "cc-key-gamma-3333"
 
 
-def make_scheduler(keys: list[str], credits: dict[str, int] | None = None) -> KeyScheduler:
+def make_scheduler(
+    keys: list[str], credits: dict[str, int] | None = None, distribution: str = DEFAULT_DISTRIBUTION
+) -> KeyScheduler:
     """Scheduler with a fresh credits snapshot, so select() never blocks on a fetch."""
-    sched = KeyScheduler(keys=keys, base_url=BASE_URL)
+    sched = KeyScheduler(keys=keys, base_url=BASE_URL, distribution=distribution)
     if credits is not None:
         sched._credits.update(credits)
     sched._last_fetch = time.monotonic()
@@ -148,16 +154,18 @@ class TestSessionAffinityCache:
 
 
 class TestFillFirstSelection:
+    """`fill-first` mode: every new conversation starts at the first usable key."""
+
     @pytest.mark.asyncio
     async def test_repeated_select_without_session_identity_keeps_first_usable_key(self):
-        """Non-explicit traffic is fill-first: it must not rotate away from the head."""
-        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        """Fill-first traffic must not rotate away from the head."""
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100}, distribution=DISTRIBUTION_FILL_FIRST)
         assert [await sched.select(None, explicit=False) for _ in range(3)] == [K1, K1, K1]
 
     @pytest.mark.asyncio
     async def test_implicit_session_flag_binds_the_fill_first_head(self):
         """A content-anchored conversation is bound too, but still starts at the head."""
-        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100}, distribution=DISTRIBUTION_FILL_FIRST)
         assert await sched.select("msg:implicit", explicit=False) == K1
         assert sched._affinity.get_and_refresh("msg:implicit") == K1
         assert sched._affinity.stats()["entries"] == 1
@@ -171,7 +179,7 @@ class TestFillFirstSelection:
         cooldown expires, so the same content would reappear under two accounts
         every time the head key cools and recovers.
         """
-        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100}, distribution=DISTRIBUTION_FILL_FIRST)
         flag = "msg:conversation"
         assert await sched.select(flag, explicit=False) == K1
         sched.report(K1, ok=False, status=429, session_flag=flag)  # K1 cools: migrate once
@@ -197,6 +205,8 @@ class TestFillFirstSelection:
 
 
 class TestRoundRobinBindings:
+    """`round-robin` mode (the default): every new conversation takes the next ring slot."""
+
     @pytest.mark.asyncio
     async def test_unbound_explicit_sessions_rotate_in_configured_order(self):
         sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
@@ -220,6 +230,88 @@ class TestRoundRobinBindings:
         sched.report(K2, ok=False, status=402)
         picked = [await sched.select(f"header:s{i}", explicit=True) for i in range(3)]
         assert picked == [K1, K3, K1]
+
+
+class TestDistributionMode:
+    """The first-sight distribution is configurable; stickiness and the cap outrank it."""
+
+    def test_defaults_to_round_robin_and_normalizes_the_configured_value(self):
+        assert KeyScheduler([K1, K2], BASE_URL).distribution == DISTRIBUTION_ROUND_ROBIN
+        assert KeyScheduler([K1, K2], BASE_URL, distribution="FillFirst").distribution == DISTRIBUTION_FILL_FIRST
+        assert KeyScheduler([K1, K2], BASE_URL, distribution="bogus").distribution == DISTRIBUTION_ROUND_ROBIN
+
+    @pytest.mark.asyncio
+    async def test_round_robin_rotates_content_anchored_sessions_too(self):
+        """The mode - not `explicit` - decides, so a content anchor rotates as well.
+
+        The rotation is a *first-sight* decision either way: re-reading an anchored
+        conversation returns its bound key.
+        """
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        flags = [f"msg:anchor-{i}" for i in range(4)]
+        assert [await sched.select(flag, explicit=False) for flag in flags] == [K1, K2, K3, K1]
+        assert [await sched.select(flag, explicit=False) for flag in flags] == [K1, K2, K3, K1]  # sticky
+
+    @pytest.mark.asyncio
+    async def test_round_robin_rotates_requests_without_a_session_too(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        assert [await sched.select(None, explicit=False) for _ in range(3)] == [K1, K2, K1]
+
+    @pytest.mark.asyncio
+    async def test_fill_first_sends_every_new_stream_to_the_head_key(self):
+        """Client identity, content anchor or no session at all: fill-first stays on the head."""
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100}, distribution=DISTRIBUTION_FILL_FIRST)
+        assert sched.distribution == DISTRIBUTION_FILL_FIRST
+        assert await sched.select("header:s1", explicit=True) == K1
+        assert await sched.select("msg:anchor", explicit=False) == K1
+        assert await sched.select(None, explicit=False) == K1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", DISTRIBUTION_MODES)
+    async def test_an_existing_binding_outlives_a_recovered_key_in_both_modes(self, mode):
+        """Stickiness is what keeps a conversation out of two accounts, mode included."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100}, distribution=mode)
+        flag = "header:bound"
+        assert await sched.select(flag, explicit=True) == K1
+        sched.report(K1, ok=False, status=429, reason="rate_limited", session_flag=flag)
+        assert await sched.select(flag, explicit=True) == K2  # migrated once
+        expire_cooldown(sched, K1)  # the original key is healthy again
+        assert await sched.select(flag, explicit=True) == K2  # ... and the session stays put
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", DISTRIBUTION_MODES)
+    async def test_a_saturated_pool_still_yields_the_least_loaded_key(self, mode):
+        """The cap outranks the mode: ring rotation would ignore the load order."""
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100}, distribution=mode)
+        load = {K1: 9, K2: 5, K3: 7}
+        assert await sched.select("header:s1", explicit=True, load=load.get) == K2
+        assert await sched.select(None, explicit=False, load=load.get) == K2
+
+    @pytest.mark.asyncio
+    async def test_set_distribution_switches_a_live_scheduler(self):
+        """A mode switch only re-deals *new* conversations; running ones keep their key."""
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        assert await sched.select("header:s1", explicit=True) == K1
+        assert await sched.select("header:s2", explicit=True) == K2
+
+        assert sched.set_distribution("fill-first") == DISTRIBUTION_FILL_FIRST
+        # the two running conversations stay where they are ...
+        assert await sched.select("header:s1", explicit=True) == K1
+        assert await sched.select("header:s2", explicit=True) == K2
+        # ... while a new one starts at the head key from now on
+        assert await sched.select("header:s3", explicit=True) == K1
+
+        assert sched.set_distribution(DISTRIBUTION_ROUND_ROBIN) == DISTRIBUTION_ROUND_ROBIN
+        assert await sched.select("header:s4", explicit=True) == K3  # the ring resumes after K2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["nope", "", None, 7])
+    async def test_an_unknown_mode_falls_back_to_the_default(self, value):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100}, distribution=DISTRIBUTION_FILL_FIRST)
+        assert sched.set_distribution(value) == DISTRIBUTION_ROUND_ROBIN
+        assert sched.distribution == DISTRIBUTION_ROUND_ROBIN
+        assert await sched.select("header:s1", explicit=True) == K1  # the fallback is live ...
+        assert await sched.select("header:s2", explicit=True) == K2  # ... and it rotates
 
 
 class TestConcurrencyCap:
@@ -270,7 +362,7 @@ class TestConcurrencyCap:
 
     @pytest.mark.asyncio
     async def test_without_a_load_source_the_cap_is_not_applied(self):
-        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100}, distribution=DISTRIBUTION_FILL_FIRST)
         assert await sched.select(None, explicit=False) == K1
         assert await sched.select("header:s1", explicit=True) == K1
 
@@ -1001,10 +1093,17 @@ class TestLogging:
         events = recorder.events
         assert [event for event, _ in events] == ["key.bind", "key.cooldown", "key.disabled", "key.select"]
         assert events[0][1] == {"session": flag[:8], "key": K1[-4:], "explicit": True}
-        assert events[3][1] == {"key": K2[-4:], "reason": "no-session"}  # K1 is disabled, fill-first moves on
+        assert events[3][1] == {"key": K2[-4:], "reason": "no-session"}  # K1 is disabled, so K2 is the only usable key
         for _, kwargs in events:
             assert flag not in str(kwargs)
             assert K1 not in str(kwargs)
+
+    def test_logs_the_distribution_switch_with_the_effective_mode(self, monkeypatch):
+        recorder = _RecordingLogger()
+        monkeypatch.setattr(ks, "logger", recorder)
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.set_distribution("FillFirst")  # normalized before it is logged
+        assert recorder.events == [("key.distribution", {"distribution": DISTRIBUTION_FILL_FIRST})]
 
     def test_logs_the_admin_switch_with_the_key_suffix_and_unbound_count(self, monkeypatch):
         recorder = _RecordingLogger()

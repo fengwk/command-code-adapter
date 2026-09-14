@@ -35,6 +35,37 @@ KEY_FORBIDDEN_COOLDOWN: float = 7200.0
 # answers an unbounded number of simultaneous requests looks like a relay, not like a
 # developer's CLI; the scheduler spreads the excess over the other usable keys.
 KEY_MAX_CONCURRENT_STREAMS: int = 4
+
+# How a *new* session is dealt over the configured keys. "round-robin" walks the ring
+# (the default: fresh client identities should not all land on the same account),
+# "fill-first" always starts at the first usable key. The mode is switchable at runtime
+# from the admin panel and never moves a session that is already bound to a key.
+DISTRIBUTION_ROUND_ROBIN = "round-robin"
+DISTRIBUTION_FILL_FIRST = "fill-first"
+DISTRIBUTION_MODES: tuple[str, ...] = (DISTRIBUTION_ROUND_ROBIN, DISTRIBUTION_FILL_FIRST)
+DEFAULT_DISTRIBUTION = DISTRIBUTION_ROUND_ROBIN
+
+# The two modes without separators, so a hand-written dotenv value ("round_robin",
+# "fillFirst") loads as the mode it means.
+_DISTRIBUTION_ALIASES: dict[str, str] = {
+    "roundrobin": DISTRIBUTION_ROUND_ROBIN,
+    "fillfirst": DISTRIBUTION_FILL_FIRST,
+}
+
+
+def normalize_distribution(value: object) -> str:
+    """Canonicalize a configured distribution mode; never raises.
+
+    Accepts the two modes case-insensitively and tolerates the ``_``/space spellings of
+    both; anything unrecognised (including a non-string) falls back to the default, so a
+    typo in the config file cannot leave a deployment without a working mode.
+    """
+    if not isinstance(value, str):
+        return DEFAULT_DISTRIBUTION
+    compact = value.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    return _DISTRIBUTION_ALIASES.get(compact, DEFAULT_DISTRIBUTION)
+
+
 SESSION_AFFINITY_TTL: float = 3600.0
 SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 

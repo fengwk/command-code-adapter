@@ -510,8 +510,13 @@ class TestSessionAffinityRouting:
         assert used_keys == ["key1", "key2", "key1", "key2"]
 
     @pytest.mark.asyncio
-    async def test_no_session_requests_use_first_usable_key(self):
-        """Requests without a session identity always go to the first usable key."""
+    async def test_round_robin_rotates_requests_without_a_session_identity_too(self):
+        """An unidentified request is a new conversation as well, so the mode rotates it.
+
+        A body the adapter cannot identify gets a content anchor: a *different* body is
+        a new conversation and takes the next ring slot, while repeating one of the
+        bodies is the same conversation again and stays on the key it was bound to.
+        """
         client = self._client()
         used_keys: list[str] = []
 
@@ -519,19 +524,48 @@ class TestSessionAffinityRouting:
             used_keys.append(headers["Authorization"].split()[1])
             return _sse_ok()
 
+        def body(text: str) -> dict:
+            return {"params": {"model": "test", "messages": [{"role": "user", "content": text}]}}
+
         with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
-            # two explicit sessions move the round-robin cursor to key2 ...
-            for session_id in ("s1", "s2"):
+            # three distinct conversations, none of them carrying a client identity ...
+            for text in ("first", "second", "third"):
+                async for _ in client.generate(body(text)):
+                    pass
+            assert used_keys == ["key1", "key2", "key1"]  # ... rotate over the ring
+            # ... and the conversation that already ran comes back to its own key
+            async for _ in client.generate(body("second")):
+                pass
+
+        assert used_keys == ["key1", "key2", "key1", "key2"]
+
+    @pytest.mark.asyncio
+    async def test_fill_first_keeps_new_sessions_on_the_head_key(self):
+        """CC_ADAPTER_DISTRIBUTION reaches the scheduler through create_client()."""
+        from cc_adapter.core.config import AppConfig
+        from cc_adapter.core.runtime import create_client
+
+        cfg = AppConfig(cc_api_key=["key1", "key2"], distribution="fill-first")
+        client = create_client(cfg)
+        assert client.scheduler.distribution == "fill-first"
+        client.scheduler._credits = {"key1": 100, "key2": 100}
+        client.scheduler._last_fetch = time.monotonic()
+        used_keys: list[str] = []
+
+        def mock_stream(method, url, json, headers, **kwargs):
+            used_keys.append(headers["Authorization"].split()[1])
+            return _sse_ok()
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            for session_id in ("s1", "s2"):  # two *different* conversations
                 async for _ in client.generate(
                     {"params": {"model": "test", "messages": []}},
                     {"x-claude-code-session-id": session_id},
                 ):
                     pass
-            # ... yet a session-less request still lands on the first usable key
-            async for _ in client.generate({"params": {"model": "test", "messages": []}}):
-                pass
 
-        assert used_keys == ["key1", "key2", "key1"]
+        assert used_keys == ["key1", "key1"]  # both start on the head account
+        await client.aclose()
 
     @pytest.mark.asyncio
     async def test_session_rebinds_after_key_failure(self, error_response_402):

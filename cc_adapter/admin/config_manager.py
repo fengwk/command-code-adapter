@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from cc_adapter.core.config import AppConfig, env_file_path
+from cc_adapter.core.constants import normalize_distribution
 from cc_adapter.core.utils import normalize_api_keys
 from cc_adapter.command_code.client import CommandCodeClient
 
@@ -22,6 +23,7 @@ FIELD_MAP = {
     "log_level": "CC_ADAPTER_LOG_LEVEL",
     "log_format": "CC_ADAPTER_LOG_FORMAT",
     "default_model": "CC_ADAPTER_DEFAULT_MODEL",
+    "distribution": "CC_ADAPTER_DISTRIBUTION",
     "zdr": "CC_ADAPTER_ZDR",
 }
 
@@ -33,10 +35,29 @@ def _apply_config_fields(cfg: AppConfig, updates: dict[str, Any]) -> bool:
     for field, value in updates.items():
         if field == "cc_api_key":
             value = normalize_api_keys(value)
+        elif field == "distribution":
+            # Store the canonical mode, so a later client rebuild and the panel's GET
+            # report the same value the live scheduler already runs.
+            value = normalize_distribution(value)
         setattr(cfg, field, value)
         if field in _CONFIG_CLIENT_FIELDS:
             changed_client = True
     return changed_client
+
+
+def _apply_live_distribution(value: Any) -> None:
+    """Point the running scheduler at the new mode (no client rebuild, no binding loss).
+
+    A single-key pool has no scheduler, so there the mode only takes effect once a
+    client is created with the updated config (adding a key rebuilds it anyway).
+    """
+    from cc_adapter.core.runtime import get_client
+
+    scheduler = getattr(get_client(), "scheduler", None)
+    if scheduler is None:
+        return
+    effective = scheduler.set_distribution(value)
+    logger.info("admin.config.distribution", distribution=effective)
 
 
 def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
@@ -59,6 +80,20 @@ def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
     return old
 
 
+def _env_line(field: str, value: Any) -> str:
+    """Render one ``KEY=value`` dotenv line, with the field's own normalization.
+
+    The file is what an operator reads and what ``AppConfig`` reloads, so a field that
+    is validated in memory (the key pool, the distribution mode) is stored in the same
+    canonical form instead of the raw panel input.
+    """
+    if field == "cc_api_key":
+        return f"{FIELD_MAP[field]}={json.dumps(normalize_api_keys(value))}\n"
+    if field == "distribution":
+        return f"{FIELD_MAP[field]}={normalize_distribution(value)}\n"
+    return f"{FIELD_MAP[field]}={value}\n"
+
+
 class ConfigManager:
     @staticmethod
     def update_env_file(updates: dict[str, Any], env_path: str | Path | None = None) -> None:
@@ -78,22 +113,12 @@ class ConfigManager:
             key = stripped.split("=", 1)[0].strip()
             for field_name, env_key in FIELD_MAP.items():
                 if key == env_key and field_name in updates:
-                    value = (
-                        normalize_api_keys(updates[field_name]) if field_name == "cc_api_key" else updates[field_name]
-                    )
-                    if field_name == "cc_api_key":
-                        lines[i] = f"{env_key}={json.dumps(value)}\n"
-                    else:
-                        lines[i] = f"{env_key}={value}\n"
+                    lines[i] = _env_line(field_name, updates[field_name])
                     existing_keys.add(field_name)
 
-        for field_name, env_key in FIELD_MAP.items():
+        for field_name in FIELD_MAP:
             if field_name in updates and field_name not in existing_keys:
-                value = normalize_api_keys(updates[field_name]) if field_name == "cc_api_key" else updates[field_name]
-                if field_name == "cc_api_key":
-                    lines.append(f"{env_key}={json.dumps(value)}\n")
-                else:
-                    lines.append(f"{env_key}={updates[field_name]}\n")
+                lines.append(_env_line(field_name, updates[field_name]))
 
         content = "".join(lines)
         try:
@@ -123,6 +148,10 @@ class ConfigManager:
         if cfg is None:
             return
         changed_client = _apply_config_fields(cfg, updates)
+        if "distribution" in updates:
+            # Applied in place: switching the mode must not rebuild the client, because a
+            # rebuild would re-deal the bindings of every running conversation.
+            _apply_live_distribution(updates["distribution"])
         if changed_client:
             old = _recreate_client(cfg)
             if old is not None:

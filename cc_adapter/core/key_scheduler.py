@@ -15,8 +15,11 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
   would otherwise be dragged to another account whenever the head key changes.
   ``export_affinity()`` / ``import_affinity()`` carry those bindings across the
   client rebuild the admin panel performs on every save;
-* fill-first first assignment (first usable key) for conversations without an
-  explicit session identity, round-robin for the ones that carry one;
+* a configurable first-sight distribution (``DISTRIBUTION_ROUND_ROBIN`` - the
+  default - or ``DISTRIBUTION_FILL_FIRST``): a new conversation either walks the
+  configured ring or always starts at the first usable key. The mode is switchable
+  at runtime via ``set_distribution()`` without a client rebuild and without losing
+  a single binding; stickiness and the saturation path outrank it;
 * a manual per-key on/off switch for the admin panel (``disable()`` /
   ``enable()``): an off key is never selected regardless of its credits or
   health, and turning it back on clears the automatic health/credit marks so the
@@ -45,6 +48,8 @@ import structlog
 
 from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.core.constants import (
+    DEFAULT_DISTRIBUTION,
+    DISTRIBUTION_FILL_FIRST,
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
     KEY_CREDIT_COOLDOWN,
@@ -55,6 +60,7 @@ from cc_adapter.core.constants import (
     KEY_MAX_CONCURRENT_STREAMS,
     SESSION_AFFINITY_MAX_ENTRIES,
     SESSION_AFFINITY_TTL,
+    normalize_distribution,
 )
 from cc_adapter.providers.shared.session_extractor import process_identity
 
@@ -152,12 +158,14 @@ class KeyScheduler:
         cooldown_base: float = KEY_COOLDOWN_BASE,
         cooldown_max: float = KEY_COOLDOWN_MAX,
         credit_cooldown: float = KEY_CREDIT_COOLDOWN,
+        distribution: str = DEFAULT_DISTRIBUTION,
     ):
         self._keys = list(keys)
         self._base_url = base_url.rstrip("/")
         self._cooldown_base = float(cooldown_base)
         self._cooldown_max = float(cooldown_max)
         self._credit_cooldown = float(credit_cooldown)
+        self._distribution = normalize_distribution(distribution)
         self._credits: dict[str, int] = {}
         self._last_fetch: float | None = None
         self._last_error: str | None = None
@@ -185,10 +193,15 @@ class KeyScheduler:
     ) -> str | None:
         """Pick the key for one request.
 
-        `explicit` only decides how a conversation is *distributed on first sight*
-        (round-robin for a client-provided identity, fill-first for a content
-        anchor); either way the choice is remembered, so a conversation never
-        bounces between accounts after its key recovers from a cooldown.
+        A *new* stream - a session that is not bound yet, or a request without any
+        session identity at all - is dealt by the configured `distribution`:
+        `round-robin` takes the next key of the configured ring, `fill-first` (and
+        any saturated pool) takes the head of the candidate list. Either way the
+        choice is remembered for a session, so a conversation never bounces between
+        accounts after its key recovers from a cooldown.
+
+        `explicit` no longer decides that distribution; it is information about the
+        caller's identity (client-provided vs. content anchor) and is only logged.
 
         `load` is the caller's in-flight stream counter (`None` - the default -
         disables the concurrency cap, which keeps the scheduler usable on its own).
@@ -202,6 +215,8 @@ class KeyScheduler:
         cap: moving it would make the same conversation show up under a second account,
         which is what the binding exists to prevent. Only an unusable key (cooling,
         disabled, out of credits, or excluded by the caller) moves a bound session.
+        `set_distribution()` switches the mode of a running scheduler; existing
+        bindings and the saturation path both outrank it.
         """
         await self._ensure_credits()
         skip = exclude or set()
@@ -220,20 +235,26 @@ class KeyScheduler:
                 return bound
             # First sight of a conversation, or a key that went unusable. Prefer a key
             # with room; when every key is saturated the least loaded one wins, because
-            # ring rotation would ignore the load order. A client-provided identity
-            # rotates through the ring, a content-anchored one keeps the fill-first
-            # behaviour, yet is bound from now on: without the binding every
-            # conversation would follow the head key's cooldown and back, so one
-            # conversation would show up under two accounts over and over.
-            candidates, spread = self._spread(usable, load)
-            chosen = candidates[0] if (spread or not explicit) else self._next_round_robin(candidates)
+            # ring rotation would ignore the load order. Otherwise the configured
+            # distribution decides, and the choice is bound from now on: without the
+            # binding every conversation would follow the head key's cooldown and back,
+            # so one conversation would show up under two accounts over and over.
+            candidates, saturated = self._spread(usable, load)
+            chosen = self._deal_new_stream(candidates, saturated)
             self._affinity.set(session_flag, chosen)
             logger.info("key.bind", session=session_flag[:8], key=chosen[-4:], explicit=explicit)
             return chosen
 
-        chosen = self._spread(usable, load)[0][0]
+        candidates, saturated = self._spread(usable, load)
+        chosen = self._deal_new_stream(candidates, saturated)
         logger.info("key.select", key=chosen[-4:], reason="no-session")
         return chosen
+
+    def _deal_new_stream(self, candidates: list[str], saturated: bool) -> str:
+        """First key of a *new* stream: the least loaded one when full, else the mode."""
+        if saturated or self._distribution == DISTRIBUTION_FILL_FIRST:
+            return candidates[0]
+        return self._next_round_robin(candidates)
 
     @staticmethod
     def _spread(usable: list[str], load: Callable[[str], int] | None) -> tuple[list[str], bool]:
@@ -269,6 +290,25 @@ class KeyScheduler:
                 return key
         self._cursor_key = candidates[0]
         return candidates[0]
+
+    # ------------------------------------------------------------ distribution
+
+    @property
+    def distribution(self) -> str:
+        """Mode that deals a *new* stream over the candidate keys."""
+        return self._distribution
+
+    def set_distribution(self, value: str) -> str:
+        """Switch the first-sight distribution of a live scheduler; returns the effective mode.
+
+        Only how the next *new* stream is dealt changes: bindings, health and load
+        state stay untouched, so the admin panel can switch the mode in place instead
+        of rebuilding the client (a rebuild would re-deal every running conversation).
+        An unrecognised value falls back to the default instead of raising.
+        """
+        self._distribution = normalize_distribution(value)
+        logger.info("key.distribution", distribution=self._distribution)
+        return self._distribution
 
     # ------------------------------------------------------------------ report
 
