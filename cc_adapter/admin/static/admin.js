@@ -72,6 +72,23 @@ const i18n = {
     keysSwitchOff: "停用",
     keysEnabledToast: "{key} 已启用",
     keysDisabledToast: "{key} 已停用",
+    keysAddTitle: "添加 Key",
+    keysAddPlaceholder: "user_...",
+    keysAddButton: "添加",
+    keysAddHint: "Key 保存在挂载卷上的面板配置文件（.env）中，立即生效并在重启后保留。",
+    keysAddEmpty: "请输入 Key",
+    keysAddToast: "{key} 已添加",
+    keysAddFailed: "添加失败",
+    keysDelete: "删除",
+    keysDeleteConfirm: "确定删除 {key} 吗？该 Key 将立即停止使用。",
+    keysDeleteToast: "{key} 已删除",
+    keysRemoveFailed: "删除失败",
+    keysConfigured: "已配置 {n} 个 Key",
+    keysManagedInTab: "在「Keys」页添加、删除、启停",
+    keysManageButton: "去 Keys 页管理",
+    tokenManagerEmpty: "请先添加至少一个 Key",
+    tokenManagerResult: "新增 {added} 个，已存在 {existing} 个，失败 {failed} 个",
+    tokenManagerHint: "此处只新增 Key（不会覆盖已有列表）；删除与启停在「Keys」页。",
     keyStateOk: "正常",
     keyStateCooling: "冷却",
     keyStateDisabled: "已停用",
@@ -158,6 +175,23 @@ const i18n = {
     keysSwitchOff: "Disable",
     keysEnabledToast: "{key} enabled",
     keysDisabledToast: "{key} disabled",
+    keysAddTitle: "Add Key",
+    keysAddPlaceholder: "user_...",
+    keysAddButton: "Add",
+    keysAddHint: "The key is written to the panel config file (.env) on the mounted volume: it takes effect immediately and survives a restart.",
+    keysAddEmpty: "Enter a key",
+    keysAddToast: "{key} added",
+    keysAddFailed: "Add failed",
+    keysDelete: "Delete",
+    keysDeleteConfirm: "Delete {key}? It stops being used immediately.",
+    keysDeleteToast: "{key} deleted",
+    keysRemoveFailed: "Delete failed",
+    keysConfigured: "{n} key(s) configured",
+    keysManagedInTab: "Add, remove or switch keys in the Keys tab",
+    keysManageButton: "Manage in the Keys tab",
+    tokenManagerEmpty: "Add at least one key first",
+    tokenManagerResult: "added {added}, already configured {existing}, failed {failed}",
+    tokenManagerHint: "This dialog only adds keys (it never rewrites the pool); removal and the on/off switch live in the Keys tab.",
     keyStateOk: "OK",
     keyStateCooling: "Cooling",
     keyStateDisabled: "Disabled",
@@ -723,6 +757,7 @@ function showTokenManager() {
         <input id="tm-key" placeholder="${t("tokenKey")}" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px;font-family:monospace;">
         <button id="tm-add" class="btn btn-primary" style="padding:6px 14px;font-size:13px;">${t("addToken")}</button>
       </div>
+      <div class="key-hint" style="margin-bottom:8px;">${t("tokenManagerHint")}</div>
       <div id="tm-list"></div>
       <div class="form-actions" style="margin-top:16px;">
         <button id="tm-save" class="btn btn-primary">${t("tokenSave")}</button>
@@ -765,14 +800,32 @@ function showTokenManager() {
         localStorage.setItem("cc-token-label-" + keyVal, labelInput.value);
       }
     }
-    const body = { cc_api_key: JSON.stringify(tokens) };
-    try {
-      const resp = await api("PUT", "/admin/api/config", body);
-      if (!resp.ok) throw new Error(await resp.text());
-      showToast(t("saved"), "success");
-      overlay.remove();
-      loadTokenUsageData();
-    } catch { showToast(t("saveFailed"), "error"); }
+    if (tokens.length === 0) {
+      showToast(t("tokenManagerEmpty"), "error");
+      return;
+    }
+    // Additive only: the dialog adds keys to the pool, it never rewrites the list, so
+    // keys configured in the Keys tab (or removed from it) cannot be lost here.
+    let added = 0;
+    let existing = 0;
+    let failed = 0;
+    for (const token of tokens) {
+      try {
+        const resp = await api("POST", "/admin/api/keys", { key: token });
+        if (resp.ok) added += 1;
+        else if (resp.status === 409) existing += 1;
+        else failed += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    const message = t("tokenManagerResult")
+      .replace("{added}", added)
+      .replace("{existing}", existing)
+      .replace("{failed}", failed);
+    showToast(message, failed > 0 ? "error" : "success");
+    overlay.remove();
+    loadTokenUsageData();
   };
 }
 
@@ -787,7 +840,11 @@ async function renderConfig() {
       <div class="card">
         <div class="form-group">
           <label>CC_ADAPTER_CC_API_KEY</label>
-          <input type="password" id="cfg-key" autocomplete="new-password">
+          <div class="cfg-key-status">
+            <span id="cfg-key-count">—</span>
+            <span class="cfg-key-hint">${t("keysManagedInTab")}</span>
+          </div>
+          <button type="button" class="btn btn-secondary" id="cfg-manage-keys">${t("keysManageButton")}</button>
         </div>
         <div class="form-group">
           <label>CC_ADAPTER_CC_BASE_URL</label>
@@ -823,6 +880,8 @@ async function renderConfig() {
   loadConfig();
   document.getElementById("cfg-save").onclick = saveConfig;
   document.getElementById("cfg-cancel").onclick = loadConfig;
+  // Upstream keys live in the Keys tab; the config form only reports how many are set.
+  document.getElementById("cfg-manage-keys").onclick = () => switchTab("keys");
 
   // Append reasoning-effort info card
   try {
@@ -859,10 +918,9 @@ async function loadConfig() {
   try {
     const resp = await api("GET", "/admin/api/config");
     configData = await resp.json();
-    // cc_api_key is a masked summary, never a real key: show it as placeholder and keep the input empty
-    const keyInput = document.getElementById("cfg-key");
-    keyInput.value = "";
-    keyInput.placeholder = configData.cc_api_key ? configData.cc_api_key + " — leave blank to keep" : "";
+    // Keys are managed in the Keys tab: show the count instead of an editable field.
+    const keyCount = typeof configData.cc_api_key_count === "number" ? configData.cc_api_key_count : 0;
+    document.getElementById("cfg-key-count").textContent = t("keysConfigured").replace("{n}", keyCount);
     document.getElementById("cfg-base-url").value = configData.cc_base_url;
     document.getElementById("cfg-host").value = configData.host;
     document.getElementById("cfg-port").value = configData.port;
@@ -873,9 +931,6 @@ async function loadConfig() {
 
 async function saveConfig() {
   const body = {};
-  const keyInput = document.getElementById("cfg-key");
-  const key = keyInput.value;
-  if (key) body.cc_api_key = key;
   const baseUrl = document.getElementById("cfg-base-url").value;
   if (baseUrl !== configData.cc_base_url) body.cc_base_url = baseUrl;
   const host = document.getElementById("cfg-host").value;
@@ -891,9 +946,6 @@ async function saveConfig() {
     const resp = await api("PUT", "/admin/api/config", body);
     if (!resp.ok) throw new Error(await resp.text());
     configData = await resp.json();
-    // Never echo the refreshed masked summary back into the input
-    keyInput.value = "";
-    keyInput.placeholder = configData.cc_api_key ? configData.cc_api_key + " — leave blank to keep" : "";
     showToast(t("saved"), "success");
   } catch { showToast(t("saveFailed"), "error"); }
 }
@@ -1404,9 +1456,9 @@ function formatKeyReason(reason) {
   return String(reason);
 }
 
-async function readErrorDetail(resp) {
+async function readErrorDetail(resp, fallback) {
   const data = await resp.json().catch(() => ({}));
-  return data.detail || `Error ${resp.status}`;
+  return data.detail || fallback || `Error ${resp.status}`;
 }
 
 async function renderKeys() {
@@ -1417,10 +1469,24 @@ async function renderKeys() {
       <h2>${t("keys")}</h2>
       <button class="btn btn-secondary" id="keys-refresh-btn">${t("keysRefresh")}</button>
     </div>
+    <div class="card keys-add">
+      <div class="keys-add-title">${t("keysAddTitle")}</div>
+      <div class="keys-add-row">
+        <input type="text" id="keys-add-input" class="keys-add-input" placeholder="${t("keysAddPlaceholder")}" aria-label="${t("keysAddTitle")}" autocomplete="off" spellcheck="false">
+        <button class="btn btn-primary" id="keys-add-btn">${t("keysAddButton")}</button>
+      </div>
+      <div class="keys-add-hint">${t("keysAddHint")}</div>
+    </div>
     <div id="keys-list">
       <div class="keys-empty">${t("keysLoading")}</div>
     </div>`;
   document.getElementById("keys-refresh-btn").onclick = loadKeys;
+  document.getElementById("keys-add-btn").onclick = addKey;
+  document.getElementById("keys-add-input").onkeydown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    addKey();
+  };
   await loadKeys();
 }
 
@@ -1441,6 +1507,32 @@ async function loadKeys() {
     for (const item of keysData) container.appendChild(buildKeyRow(item));
   } catch (e) {
     container.innerHTML = `<div class="keys-empty">${escapeHtml(t("keysLoadFailed"))}: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function addKey() {
+  const input = document.getElementById("keys-add-input");
+  const btn = document.getElementById("keys-add-btn");
+  if (!input || !btn || btn.disabled) return; // in-flight guard
+  const value = input.value.trim();
+  if (!value) {
+    showToast(t("keysAddEmpty"), "error");
+    return; // never send an empty key
+  }
+  btn.disabled = true;
+  try {
+    const resp = await api("POST", "/admin/api/keys", { key: value });
+    if (!resp.ok) throw new Error(await readErrorDetail(resp, t("keysAddFailed")));
+    const data = await resp.json();
+    input.value = ""; // the full key never stays in the DOM
+    showToast(t("keysAddToast").replace("{key}", data.key || "****"), "success");
+    // Reload from the server: adding may have flipped the pool from a single
+    // (unmanaged) key to a managed pool, which changes what every row shows.
+    await loadKeys();
+  } catch (e) {
+    showToast(e.message, "error");
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -1488,7 +1580,10 @@ function buildKeyRow(item) {
       </div>
       ${unmanaged ? `<div class="key-hint">${t("keyUnmanagedHint")}</div>` : ""}
     </div>
-    <button type="button" class="switch" role="switch" aria-checked="${on ? "true" : "false"}"></button>`;
+    <div class="key-row-actions">
+      <button type="button" class="btn btn-danger btn-sm key-delete">${t("keysDelete")}</button>
+      <button type="button" class="switch" role="switch" aria-checked="${on ? "true" : "false"}"></button>
+    </div>`;
 
   const btn = row.querySelector(".switch");
   btn.setAttribute("aria-label", `${t("keysSwitchLabel")} ${item.key || ""}`);
@@ -1508,6 +1603,14 @@ function buildKeyRow(item) {
       toggle();
     };
   }
+
+  // Removal stays available for an unmanaged row: with a single configured key
+  // the on/off switch has no scheduler to talk to, but the delete button is the
+  // only way to take that key out of the config.
+  const del = row.querySelector(".key-delete");
+  del.title = t("keysDelete");
+  del.setAttribute("aria-label", `${t("keysDelete")} ${item.key || ""}`);
+  del.onclick = () => deleteKey(row.dataset.suffix, item.key || "", row);
   return row;
 }
 
@@ -1534,6 +1637,27 @@ async function toggleKey(suffix, turnOn, row) {
     if (current) row.replaceWith(buildKeyRow(current));
     else btn.disabled = false;
     showToast(e.message, "error");
+  }
+}
+
+async function deleteKey(suffix, label, row) {
+  const btn = row.querySelector(".key-delete");
+  if (!btn || btn.disabled) return;
+  const name = label || suffix;
+  if (!window.confirm(t("keysDeleteConfirm").replace("{key}", name))) return;
+  btn.disabled = true; // in-flight guard
+  try {
+    const resp = await api("DELETE", `/admin/api/keys/${encodeURIComponent(suffix)}`);
+    if (!resp.ok) throw new Error(await readErrorDetail(resp, t("keysRemoveFailed")));
+    const data = await resp.json();
+    showToast(t("keysDeleteToast").replace("{key}", data.key || name), "success");
+  } catch (e) {
+    showToast(e.message, "error");
+  } finally {
+    // Reload either way: a removal flips the pool size (managed ⇄ single key)
+    // and a rejection (unknown suffix / no scheduler) must not leave the row
+    // showing scheduler state the server no longer agrees with.
+    await loadKeys();
   }
 }
 
