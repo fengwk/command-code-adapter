@@ -44,7 +44,7 @@ def test_basic_message_translation(translator):
     assert body["params"]["messages"][0]["content"] == [{"type": "text", "text": "hello"}]
     assert body["params"]["stream"] is False
     assert "env" not in body["config"]
-    assert body["config"]["additionalDirectories"] == []
+    assert "additionalDirectories" not in body["config"]
 
 
 def test_system_prompt_extraction(translator):

@@ -14,11 +14,17 @@ def make_cc_headers(api_key: str | None = None) -> dict[str, str]:
 
     headers = {
         "Content-Type": "application/json",
+        "User-Agent": "cli",
         "x-command-code-version": get_version_checker().get_version(),
         "x-cli-environment": "production",
-        "x-co-flag": "false",
         "x-taste-learning": "false",
         "traceparent": _make_traceparent(),
+        # undici (Node) defaults sent by the real cmd CLI. Setting
+        # accept-encoding explicitly stops httpx from sending its own
+        # "gzip, deflate, br, zstd" value.
+        "accept-language": "*",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate",
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

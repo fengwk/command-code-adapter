@@ -9,10 +9,20 @@ class TestMakeCcHeaders:
         assert headers["Content-Type"] == "application/json"
         assert headers["x-command-code-version"] == "1.6.0"
         assert headers["x-cli-environment"] == "production"
-        assert headers["x-co-flag"] == "false"
         assert headers["x-taste-learning"] == "false"
+        # cmd CLI never sends x-co-flag
+        assert "x-co-flag" not in headers
+        # injected per request by client.py, not by make_cc_headers()
         assert "x-project-slug" not in headers
         assert "Authorization" not in headers
+
+    def test_undici_default_headers(self):
+        """Headers Node/undici adds on top of the cmd CLI harness headers."""
+        headers = make_cc_headers()
+        assert headers["User-Agent"] == "cli"
+        assert headers["accept-language"] == "*"
+        assert headers["sec-fetch-mode"] == "cors"
+        assert headers["accept-encoding"] == "gzip, deflate"
 
     def test_with_api_key(self):
         headers = make_cc_headers("sk-test")
