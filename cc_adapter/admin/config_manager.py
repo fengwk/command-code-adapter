@@ -12,7 +12,6 @@ from cc_adapter.core.constants import normalize_distribution
 from cc_adapter.core.utils import normalize_api_keys
 from cc_adapter.command_code.client import CommandCodeClient
 
-
 _CONFIG_CLIENT_FIELDS = {"cc_api_key", "cc_base_url"}
 
 FIELD_MAP = {
@@ -29,6 +28,24 @@ FIELD_MAP = {
 
 logger = structlog.get_logger(__name__)
 
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def _normalize_bool(value: Any) -> bool:
+    """Normalize one panel-managed boolean or reject it before memory and disk diverge."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
 
 def _apply_config_fields(cfg: AppConfig, updates: dict[str, Any]) -> bool:
     changed_client = False
@@ -39,6 +56,8 @@ def _apply_config_fields(cfg: AppConfig, updates: dict[str, Any]) -> bool:
             # Store the canonical mode, so a later client rebuild and the panel's GET
             # report the same value the live scheduler already runs.
             value = normalize_distribution(value)
+        elif field == "zdr":
+            value = _normalize_bool(value)
         setattr(cfg, field, value)
         if field in _CONFIG_CLIENT_FIELDS:
             changed_client = True
@@ -65,17 +84,14 @@ def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
 
     old = get_client()
     new = create_client(cfg)
-    # The rebuilt client gets a fresh scheduler, so carry the operator's manual off-switch and the
-    # session -> key bindings over: a panel save (adding a key, editing the base URL) must neither
-    # re-enable a key turned off on purpose nor drag every running conversation to another account.
+    # The rebuilt client gets a fresh scheduler, so carry runtime scheduler state over:
+    # manual off-switch, session affinity, health states, cooldowns, credits, etc.
+    # A panel save must neither re-enable a disabled/cooling key nor drag running conversations
+    # to another account. Removed keys leave no state or binding.
     new_scheduler = getattr(new, "scheduler", None)
     old_scheduler = getattr(old, "scheduler", None)
     if new_scheduler is not None and old_scheduler is not None:
-        for key in old_scheduler.manual_disabled_keys():
-            if key in cfg.cc_api_key:
-                new_scheduler.disable(key)
-        # Bindings of a key that is gone from the new list are dropped inside the import.
-        new_scheduler.import_affinity(old_scheduler.export_affinity())
+        new_scheduler.import_state(old_scheduler.export_state())
     state_init(cfg, new)
     return old
 
@@ -91,6 +107,9 @@ def _env_line(field: str, value: Any) -> str:
         return f"{FIELD_MAP[field]}={json.dumps(normalize_api_keys(value))}\n"
     if field == "distribution":
         return f"{FIELD_MAP[field]}={normalize_distribution(value)}\n"
+    if field == "zdr":
+        canonical = "true" if _normalize_bool(value) else "false"
+        return f"{FIELD_MAP[field]}={canonical}\n"
     return f"{FIELD_MAP[field]}={value}\n"
 
 

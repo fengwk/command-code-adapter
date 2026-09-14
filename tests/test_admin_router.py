@@ -7,6 +7,7 @@ from cc_adapter.core.auth import set_password
 from cc_adapter.admin.router import router as admin_router
 from cc_adapter.core.runtime import init as admin_state_init
 from cc_adapter.core.config import AppConfig
+from cc_adapter.core.utils import api_key_id
 from cc_adapter.command_code.client import CommandCodeClient
 
 app.include_router(admin_router)
@@ -378,6 +379,7 @@ async def test_list_keys_without_scheduler_reports_unmanaged():
     assert resp.status_code == 200
     keys = resp.json()["keys"]
     assert len(keys) == 1
+    assert keys[0]["id"] == api_key_id("singlekey1234")
     assert keys[0]["key"] == "****1234"
     assert keys[0]["state"] == "unmanaged"
     # The manual-switch fields are always present so the panel renders one shape.
@@ -399,6 +401,7 @@ async def test_list_keys_reports_scheduler_state_and_masks_keys():
 
     assert resp.status_code == 200
     keys = resp.json()["keys"]
+    assert [entry["id"] for entry in keys] == [api_key_id("key1111"), api_key_id("key2222")]
     assert [entry["key"] for entry in keys] == ["****1111", "****2222"]
     assert [entry["state"] for entry in keys] == ["disabled", "ok"]
     assert [entry["credits"] for entry in keys] == [100, 100]
@@ -439,6 +442,7 @@ async def test_enable_key_endpoint_clears_manual_off_and_health(monkeypatch):
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body["id"] == api_key_id("key1111")
     assert body["key"] == "****1111"
     assert body["state"] == "ok"
     assert body["enabled"] is True
@@ -467,6 +471,7 @@ async def test_disable_key_endpoint_unbinds_sessions_and_is_idempotent():
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body["id"] == api_key_id("key1111")
     assert body["key"] == "****1111"
     assert body["unbound_sessions"] == 2
     assert body["enabled"] is False
@@ -497,7 +502,7 @@ async def test_key_switch_endpoints_reject_unresolvable_suffixes(keys, suffix):
                 f"/admin/api/keys/{suffix}/{verb}", headers={"Authorization": f"Bearer {my_token}"}
             )
             assert resp.status_code == 404
-            assert resp.json()["detail"] == "Unknown or ambiguous key suffix"
+            assert resp.json()["detail"] == "Unknown or ambiguous key identifier"
 
 
 @pytest.mark.asyncio
@@ -545,7 +550,7 @@ async def test_add_key_appends_persists_and_applies_to_the_running_client(panel_
         )
 
     assert resp.status_code == 200
-    assert resp.json() == {"key": "****5678", "count": 2}
+    assert resp.json() == {"id": api_key_id("key5678"), "key": "****5678", "count": 2}
     assert get_config().cc_api_key == ["key1111", "key5678"]
     rebuilt = get_client()
     assert rebuilt is not client_before  # rebuilt, so the new key is selectable right away
@@ -553,7 +558,7 @@ async def test_add_key_appends_persists_and_applies_to_the_running_client(panel_
     assert 'CC_ADAPTER_CC_API_KEY=["key1111", "key5678"]' in panel_env.read_text()
     added = [r for r in caplog.records if "admin.key.added" in str(r.message)]
     assert len(added) == 1
-    assert "5678" in str(added[0].message) and "count" in str(added[0].message)
+    assert api_key_id("key5678") in str(added[0].message) and "count" in str(added[0].message)
 
 
 @pytest.mark.asyncio
@@ -662,7 +667,7 @@ async def test_remove_key_drops_it_from_pool_client_and_config_file(panel_env, c
         resp = await client.delete("/admin/api/keys/2222", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"key": "****2222", "count": 1}
+    assert resp.json() == {"id": api_key_id("key2222"), "key": "****2222", "count": 1}
     assert get_config().cc_api_key == ["key1111"]
     env_content = panel_env.read_text()
     assert 'CC_ADAPTER_CC_API_KEY=["key1111"]' in env_content
@@ -673,7 +678,7 @@ async def test_remove_key_drops_it_from_pool_client_and_config_file(panel_env, c
     assert rebuilt.api_key == "key1111"
     removed = [r for r in caplog.records if "admin.key.removed" in str(r.message)]
     assert len(removed) == 1
-    assert "2222" in str(removed[0].message) and "count" in str(removed[0].message)
+    assert api_key_id("key2222") in str(removed[0].message) and "count" in str(removed[0].message)
 
 
 @pytest.mark.asyncio
@@ -690,7 +695,7 @@ async def test_remove_key_resolves_a_single_key_pool_without_a_scheduler(panel_e
         resp = await client.delete("/admin/api/keys/1234", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"key": "****1234", "count": 0}
+    assert resp.json() == {"id": api_key_id("only1234"), "key": "****1234", "count": 0}
     assert get_config().cc_api_key == []
 
 
@@ -708,7 +713,7 @@ async def test_removing_the_last_key_leaves_a_supported_empty_pool(panel_env):
         again = await client.delete("/admin/api/keys/1234", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"key": "****1234", "count": 0}
+    assert resp.json() == {"id": api_key_id("only1234"), "key": "****1234", "count": 0}
     assert get_config().cc_api_key == []
     assert "CC_ADAPTER_CC_API_KEY=[]" in panel_env.read_text()
     empty_client = get_client()
@@ -717,7 +722,7 @@ async def test_removing_the_last_key_leaves_a_supported_empty_pool(panel_env):
     # Requests still fail with the client's own "not configured" error.
     assert "CC_ADAPTER_CC_API_KEY is not configured" in str(empty_client._no_key_error())
     assert again.status_code == 404
-    assert again.json()["detail"] == "Unknown or ambiguous key suffix"
+    assert again.json()["detail"] == "Unknown or ambiguous key identifier"
 
 
 @pytest.mark.parametrize(
@@ -740,7 +745,7 @@ async def test_remove_key_rejects_unresolvable_suffixes(panel_env, keys, suffix)
         resp = await client.delete(f"/admin/api/keys/{suffix}", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "Unknown or ambiguous key suffix"
+    assert resp.json()["detail"] == "Unknown or ambiguous key identifier"
     assert get_config().cc_api_key == keys
     assert get_client() is client_before
     assert not panel_env.exists()
@@ -774,3 +779,211 @@ async def test_manual_off_survives_the_client_rebuild(panel_env):
     scheduler._credits = {key: 100 for key in ["key1111", "key2222", "key3333"]}
     scheduler._last_fetch = time.monotonic()
     assert await scheduler.select(None, explicit=False) == "key2222"
+
+
+@pytest.mark.asyncio
+async def test_short_key_never_appears_verbatim_in_admin_responses_or_logs(panel_env, caplog):
+    """A configured key 'abc' appears only as '****' plus non-reversible ID; literal 'abc' is absent."""
+    caplog.set_level(logging.INFO)
+    from cc_adapter.core.auth import generate_token
+
+    _init_pool_client(["key1111"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Add short key "abc"
+        resp_add = await client.post(
+            "/admin/api/keys", json={"key": "abc"}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+        assert resp_add.status_code == 200
+        add_data = resp_add.json()
+        assert add_data["key"] == "****"
+        abc_id = api_key_id("abc")
+        assert add_data["id"] == abc_id
+        assert "abc" not in resp_add.text
+
+        # Verify log did not leak "abc"
+        add_logs = [r for r in caplog.records if "admin.key.added" in str(r.message)]
+        assert any(abc_id in str(r.message) for r in add_logs)
+        assert not any("key_last4=abc" in str(r.message) or "key=abc" in str(r.message) for r in add_logs)
+
+        # 2. GET /admin/api/keys
+        resp_list = await client.get("/admin/api/keys", headers={"Authorization": f"Bearer {my_token}"})
+        assert resp_list.status_code == 200
+        list_data = resp_list.json()
+        abc_entry = [k for k in list_data["keys"] if k["id"] == abc_id][0]
+        assert abc_entry["key"] == "****"
+        assert "abc" not in resp_list.text
+
+        # 3. Disable short key by ID
+        resp_dis = await client.post(
+            f"/admin/api/keys/{abc_id}/disable", headers={"Authorization": f"Bearer {my_token}"}
+        )
+        assert resp_dis.status_code == 200
+        assert resp_dis.json()["key"] == "****"
+        assert resp_dis.json()["id"] == abc_id
+        assert "abc" not in resp_dis.text
+
+        # 4. Enable short key by ID
+        resp_en = await client.post(f"/admin/api/keys/{abc_id}/enable", headers={"Authorization": f"Bearer {my_token}"})
+        assert resp_en.status_code == 200
+        assert resp_en.json()["key"] == "****"
+        assert resp_en.json()["id"] == abc_id
+        assert "abc" not in resp_en.text
+
+        # 5. Remove short key by ID
+        resp_del = await client.delete(f"/admin/api/keys/{abc_id}", headers={"Authorization": f"Bearer {my_token}"})
+        assert resp_del.status_code == 200
+        assert resp_del.json()["key"] == "****"
+        assert resp_del.json()["id"] == abc_id
+        assert "abc" not in resp_del.text
+
+
+@pytest.mark.asyncio
+async def test_two_keys_with_same_suffix_can_be_operated_by_id_while_suffix_is_ambiguous(panel_env):
+    """Two keys sharing the same last 4 chars can each be operated by ID; legacy suffix is 404."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_config
+
+    k1, k2 = "alpha-1111", "beta-1111"
+    _init_pool_client([k1, k2])
+    my_token = generate_token()
+    id1 = api_key_id(k1)
+    id2 = api_key_id(k2)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Legacy suffix 1111 is ambiguous for both actions -> 404
+        r_en_ambig = await client.post("/admin/api/keys/1111/enable", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_en_ambig.status_code == 404
+        assert r_en_ambig.json()["detail"] == "Unknown or ambiguous key identifier"
+
+        r_dis_ambig = await client.post("/admin/api/keys/1111/disable", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_dis_ambig.status_code == 404
+        assert r_dis_ambig.json()["detail"] == "Unknown or ambiguous key identifier"
+
+        r_del_ambig = await client.delete("/admin/api/keys/1111", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_del_ambig.status_code == 404
+        assert r_del_ambig.json()["detail"] == "Unknown or ambiguous key identifier"
+
+        # Safe ID operates on each key independently
+        r_dis1 = await client.post(f"/admin/api/keys/{id1}/disable", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_dis1.status_code == 200
+        assert r_dis1.json()["id"] == id1
+        assert r_dis1.json()["enabled"] is False
+
+        r_en1 = await client.post(f"/admin/api/keys/{id1}/enable", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_en1.status_code == 200
+        assert r_en1.json()["id"] == id1
+        assert r_en1.json()["enabled"] is True
+
+        # Delete key1 by ID leaves key2
+        r_del1 = await client.delete(f"/admin/api/keys/{id1}", headers={"Authorization": f"Bearer {my_token}"})
+        assert r_del1.status_code == 200
+        assert r_del1.json()["id"] == id1
+        assert get_config().cc_api_key == [k2]
+
+
+@pytest.mark.asyncio
+async def test_long_key_display_follows_mask_api_key_contract():
+    """Existing long key displays follow mask_api_key() (first10…last6)."""
+    from cc_adapter.core.auth import generate_token
+
+    long_k = "sk-123456789012345678901"  # 23 chars
+    _init_pool_client([long_k, "key2222"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/admin/api/keys", headers={"Authorization": f"Bearer {my_token}"})
+    assert resp.status_code == 200
+    entries = resp.json()["keys"]
+    long_entry = [e for e in entries if e["id"] == api_key_id(long_k)][0]
+    assert long_entry["key"] == "sk-1234567…678901"
+
+
+@pytest.mark.asyncio
+async def test_update_config_zdr_live_headers_persists_and_preserves_client(panel_env):
+    """PUT false changes live headers (no x-cmd-zdr) and persists lowercase, PUT true restores."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config, init as state_init
+    from cc_adapter.command_code.headers import make_cc_headers
+
+    prev_cfg, prev_client = get_config(), get_client()
+    cfg = AppConfig(cc_api_key="sk-test-key", zdr=True)
+    client_inst = CommandCodeClient(base_url="https://api.example.com", api_key="sk-test-key")
+    state_init(cfg, client_inst)
+    my_token = generate_token()
+
+    try:
+        # Default is zdr=True
+        headers = make_cc_headers(api_key="sk-test-key")
+        assert headers.get("x-cmd-zdr") == "1"
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # 1. GET /config returns effective zdr=True
+            get_resp = await client.get("/admin/api/config", headers={"Authorization": f"Bearer {my_token}"})
+            assert get_resp.status_code == 200
+            assert get_resp.json()["zdr"] is True
+
+            # 2. PUT /config with zdr=False
+            put_resp = await client.put(
+                "/admin/api/config", json={"zdr": False}, headers={"Authorization": f"Bearer {my_token}"}
+            )
+            assert put_resp.status_code == 200
+            assert put_resp.json()["zdr"] is False
+
+            # Client identity unchanged (no rebuild)
+            assert get_client() is client_inst
+            # Live headers immediately reflect disabled ZDR
+            headers_disabled = make_cc_headers(api_key="sk-test-key")
+            assert "x-cmd-zdr" not in headers_disabled
+
+            # Persisted in lowercase
+            env_content = panel_env.read_text()
+            assert "CC_ADAPTER_ZDR=false" in env_content
+
+            # Reloaded AppConfig respects it
+            reloaded_cfg = AppConfig(_env_file=str(panel_env))
+            assert reloaded_cfg.zdr is False
+
+            # 3. PUT /config with zdr=True restores header and lowercase persistence
+            put_resp2 = await client.put(
+                "/admin/api/config", json={"zdr": True}, headers={"Authorization": f"Bearer {my_token}"}
+            )
+            assert put_resp2.status_code == 200
+            assert put_resp2.json()["zdr"] is True
+
+            assert get_client() is client_inst
+            headers_restored = make_cc_headers(api_key="sk-test-key")
+            assert headers_restored.get("x-cmd-zdr") == "1"
+            assert "CC_ADAPTER_ZDR=true" in panel_env.read_text()
+    finally:
+        state_init(prev_cfg, prev_client)
+        await client_inst.aclose()
+
+
+def test_admin_js_config_form_exposes_the_zdr_select():
+    """Static guard: ZDR toggle is offered on config form and wired through load/save."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    assert '<select id="cfg-zdr">' in src
+    assert '<option value="true">${t("zdrEnabled")}</option>' in src
+    assert '<option value="false">${t("zdrDisabled")}</option>' in src
+    assert 'document.getElementById("cfg-zdr").value = (zdr !== false) ? "true" : "false";' in src
+    assert 'const zdrVal = document.getElementById("cfg-zdr").value === "true";' in src
+    assert "if (zdrVal !== curZdr) body.zdr = zdrVal;" in src
+    for key in ("zdrLabel", "zdrEnabled", "zdrDisabled", "zdrHint"):
+        assert src.count(f"{key}:") == 2
+
+
+def test_admin_js_keys_tab_uses_safe_id_with_suffix_fallback():
+    """Static guard: Keys tab uses item.id for actions and dataset, with suffix fallback only for older servers."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    assert "function keyIdentifier(item)" in src
+    assert "if (item && item.id) return item.id;" in src
+    assert "row.dataset.id = id;" in src
+    assert "toggleKey(id, !on, row)" in src
+    assert 'deleteKey(id, item.key || "", row)' in src
+    assert "keyIdentifier(k) === id" in src

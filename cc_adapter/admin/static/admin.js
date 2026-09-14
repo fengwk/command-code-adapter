@@ -91,6 +91,11 @@ const i18n = {
     distributionRoundRobin: "轮询",
     distributionFillFirst: "主号优先",
     distributionHint: "新会话的落点：轮询沿配置顺序依次分配，主号优先始终使用第一个可用 Key；已绑定会话不受切换影响，额度与冷却规则也不变。",
+    // 零数据保留
+    zdrLabel: "零数据保留 (ZDR)",
+    zdrEnabled: "开启",
+    zdrDisabled: "关闭",
+    zdrHint: "发送 x-cmd-zdr: 1 请求头以启用零数据保留；关闭后将不再发送该请求头（部分上游服务或模型可能需要关闭）。",
     tokenManagerEmpty: "请先添加至少一个 Key",
     tokenManagerResult: "新增 {added} 个，已存在 {existing} 个，失败 {failed} 个",
     tokenManagerHint: "此处只新增 Key（不会覆盖已有列表）；删除与启停在「Keys」页。",
@@ -219,6 +224,11 @@ const i18n = {
     distributionRoundRobin: "Round-robin",
     distributionFillFirst: "Fill-first",
     distributionHint: "Where a new session starts: round-robin walks the configured key order, fill-first always uses the first usable key. Switching never moves a bound session, and credits/cooldown rules stay unchanged.",
+    // Zero data retention
+    zdrLabel: "Zero Data Retention (ZDR)",
+    zdrEnabled: "Enabled",
+    zdrDisabled: "Disabled",
+    zdrHint: "Sends x-cmd-zdr: 1 header for zero data retention; disable to omit the header (useful for models or upstreams without ZDR support).",
     tokenManagerEmpty: "Add at least one key first",
     tokenManagerResult: "added {added}, already configured {existing}, failed {failed}",
     tokenManagerHint: "This dialog only adds keys (it never rewrites the pool); removal and the on/off switch live in the Keys tab.",
@@ -949,6 +959,14 @@ async function renderConfig() {
           </select>
           <span class="cfg-key-hint">${t("distributionHint")}</span>
         </div>
+        <div class="form-group">
+          <label>CC_ADAPTER_ZDR — ${t("zdrLabel")}</label>
+          <select id="cfg-zdr">
+            <option value="true">${t("zdrEnabled")}</option>
+            <option value="false">${t("zdrDisabled")}</option>
+          </select>
+          <span class="cfg-key-hint">${t("zdrHint")}</span>
+        </div>
         <div class="form-actions">
           <button class="btn btn-primary" id="cfg-save">${t("save")}</button>
           <button class="btn btn-secondary" id="cfg-cancel">${t("cancel")}</button>
@@ -1010,6 +1028,8 @@ async function loadConfig() {
     if (distribution === "round-robin" || distribution === "fill-first") {
       document.getElementById("cfg-distribution").value = distribution;
     }
+    const zdr = configData.zdr;
+    document.getElementById("cfg-zdr").value = (zdr !== false) ? "true" : "false";
   } catch { showToast(t("saveFailed"), "error"); }
 }
 
@@ -1027,6 +1047,9 @@ async function saveConfig() {
   if (defaultModelVal !== configData.default_model) body.default_model = defaultModelVal;
   const distribution = document.getElementById("cfg-distribution").value;
   if (distribution !== configData.distribution) body.distribution = distribution;
+  const zdrVal = document.getElementById("cfg-zdr").value === "true";
+  const curZdr = configData.zdr !== false;
+  if (zdrVal !== curZdr) body.zdr = zdrVal;
   if (Object.keys(body).length === 0) { showToast("No changes", "success"); return; }
   try {
     const resp = await api("PUT", "/admin/api/config", body);
@@ -1527,10 +1550,11 @@ function renderLogEntries(entries, totalInBuffer) {
 // Keys (per-key auth switches)
 let keysData = [];
 
-// Server-state field `until` is a monotonic clock value, so remaining time always
-// comes from `cooldown_seconds`.
-function keySuffix(label) {
-  return String(label || "").replace(/^\*+/, "");
+// Safe opaque identifier helper: use item.id when available, suffix fallback only for older servers
+function keyIdentifier(item) {
+  if (item && item.id) return item.id;
+  const key = item ? (item.key || "") : "";
+  return key.replace(/^\*+/, "");
 }
 
 function formatCooldown(seconds) {
@@ -1655,9 +1679,10 @@ function buildKeyRow(item) {
   const credits = item.credits === null || item.credits === undefined ? t("keyUnknown") : item.credits;
   const reason = item.reason ? formatKeyReason(item.reason) : "";
 
+  const id = keyIdentifier(item);
   const row = document.createElement("div");
   row.className = "card key-row";
-  row.dataset.suffix = keySuffix(item.key);
+  row.dataset.id = id;
   row.innerHTML = `
     <div class="key-row-info">
       <div class="key-row-head">
@@ -1684,7 +1709,7 @@ function buildKeyRow(item) {
     btn.title = t("keyUnmanagedHint");
   } else {
     btn.title = on ? t("keysSwitchOff") : t("keysSwitchOn");
-    const toggle = () => toggleKey(row.dataset.suffix, !on, row);
+    const toggle = () => toggleKey(id, !on, row);
     btn.onclick = toggle;
     // Explicit Enter/Space support; preventDefault keeps the native button
     // activation from firing a second toggle, and toggleKey() ignores clicks
@@ -1702,44 +1727,44 @@ function buildKeyRow(item) {
   const del = row.querySelector(".key-delete");
   del.title = t("keysDelete");
   del.setAttribute("aria-label", `${t("keysDelete")} ${item.key || ""}`);
-  del.onclick = () => deleteKey(row.dataset.suffix, item.key || "", row);
+  del.onclick = () => deleteKey(id, item.key || "", row);
   return row;
 }
 
-async function toggleKey(suffix, turnOn, row) {
+async function toggleKey(id, turnOn, row) {
   const btn = row.querySelector(".switch");
   if (!btn || btn.disabled) return;
   btn.disabled = true; // in-flight guard
   try {
     const action = turnOn ? "enable" : "disable";
-    const resp = await api("POST", `/admin/api/keys/${encodeURIComponent(suffix)}/${action}`);
+    const resp = await api("POST", `/admin/api/keys/${encodeURIComponent(id)}/${action}`);
     if (!resp.ok) throw new Error(await readErrorDetail(resp));
     const data = await resp.json();
-    const index = keysData.findIndex(k => keySuffix(k.key) === suffix);
+    const index = keysData.findIndex(k => keyIdentifier(k) === id);
     const merged = Object.assign({}, index >= 0 ? keysData[index] : {}, data);
     if (data.enabled === true) merged.manual = false; // an enabled key is never manually off
     if (index >= 0) keysData[index] = merged;
     else keysData.push(merged);
     row.replaceWith(buildKeyRow(merged)); // refresh just this row from the new state
     const toast = turnOn ? t("keysEnabledToast") : t("keysDisabledToast");
-    showToast(toast.replace("{key}", merged.key || suffix), "success");
+    showToast(toast.replace("{key}", merged.key || id), "success");
   } catch (e) {
     // Rebuild from the last known server state so the switch cannot stay out of sync.
-    const current = keysData.find(k => keySuffix(k.key) === suffix);
+    const current = keysData.find(k => keyIdentifier(k) === id);
     if (current) row.replaceWith(buildKeyRow(current));
     else btn.disabled = false;
     showToast(e.message, "error");
   }
 }
 
-async function deleteKey(suffix, label, row) {
+async function deleteKey(id, label, row) {
   const btn = row.querySelector(".key-delete");
   if (!btn || btn.disabled) return;
-  const name = label || suffix;
+  const name = label || id;
   if (!window.confirm(t("keysDeleteConfirm").replace("{key}", name))) return;
   btn.disabled = true; // in-flight guard
   try {
-    const resp = await api("DELETE", `/admin/api/keys/${encodeURIComponent(suffix)}`);
+    const resp = await api("DELETE", `/admin/api/keys/${encodeURIComponent(id)}`);
     if (!resp.ok) throw new Error(await readErrorDetail(resp, t("keysRemoveFailed")));
     const data = await resp.json();
     showToast(t("keysDeleteToast").replace("{key}", data.key || name), "success");

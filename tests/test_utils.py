@@ -1,5 +1,5 @@
 import pytest
-from cc_adapter.core.utils import generate_id, normalize_api_keys, scrub_pii
+from cc_adapter.core.utils import api_key_id, generate_id, mask_api_key, normalize_api_keys, scrub_pii
 
 
 class TestNormalizeApiKeys:
@@ -52,6 +52,43 @@ class TestGenerateId:
     def test_unique_values(self):
         results = {generate_id() for _ in range(100)}
         assert len(results) == 100  # all unique
+
+
+class TestApiKeyId:
+    def test_format_and_length(self):
+        # 16 hex chars prefix 'key_' => 20 chars total (64 bits of digest)
+        res = api_key_id("secret-key")
+        assert res.startswith("key_")
+        assert len(res) == 20
+        assert all(c in "0123456789abcdef" for c in res[4:])
+
+    def test_deterministic(self):
+        assert api_key_id("key-1234") == api_key_id("key-1234")
+        assert api_key_id("key-1234") != api_key_id("key-5678")
+
+    def test_short_key_reveals_no_substring(self):
+        res = api_key_id("abc")
+        assert "abc" not in res
+        assert res == "key_ba7816bf8f01cfea"
+
+
+class TestMaskApiKey:
+    def test_short_keys_masked_fully(self):
+        assert mask_api_key("a") == "****"
+        assert mask_api_key("ab") == "****"
+        assert mask_api_key("abc") == "****"
+
+    def test_medium_keys_keep_last4(self):
+        assert mask_api_key("abcd") == "****abcd"
+        assert mask_api_key("key-alpha-1111") == "****1111"
+        assert mask_api_key("12345678901234567890") == "****7890"  # 20 chars
+
+    def test_long_keys_keep_first10_and_last6(self):
+        long_key = "sk-123456789012345678901"  # 23 chars
+        assert mask_api_key(long_key) == "sk-1234567…678901"
+        assert mask_api_key(long_key).startswith("sk-1234567")
+        assert mask_api_key(long_key).endswith("678901")
+        assert "…" in mask_api_key(long_key)
 
 
 def test_scrub_pii_keeps_normal_model_response_text_unchanged():

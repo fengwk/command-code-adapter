@@ -8,13 +8,13 @@ from typing import AsyncGenerator, Any
 import httpx
 
 from cc_adapter.core.constants import (
-    CLIENT_CLOSE_GRACE_SECONDS,
     DEFAULT_DISTRIBUTION,
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
     KEY_CREDIT_COOLDOWN,
 )
 from cc_adapter.core.errors import AdapterError, map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
+from cc_adapter.core.utils import api_key_id
 from cc_adapter.command_code.body import bind_workspace
 from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.providers.shared.session_extractor import SessionSignal, get_session_extractor
@@ -140,6 +140,7 @@ class CommandCodeClient:
         self._key_inflight: dict[str, int] = {}
         self._idle = asyncio.Event()
         self._close_tasks: set[asyncio.Task[None]] = set()
+        self._retiring = False
 
         if api_keys and len(api_keys) > 1:
             from cc_adapter.core.key_scheduler import KeyScheduler
@@ -180,11 +181,14 @@ class CommandCodeClient:
         return pool
 
     async def aclose(self) -> None:
-        """Close every pool this client owns.
+        """Close every pool this client owns and cancel scheduler background tasks.
 
         Pools are created per key and are always owned; a caller-supplied
         ``http_client`` is shared by every key and stays open for its owner.
         """
+        self._retiring = True
+        if self.scheduler is not None:
+            await self.scheduler.aclose()
         if not self._owns_http_client:
             return
         pools = list(self._pools.values())
@@ -216,25 +220,29 @@ class CommandCodeClient:
         else:
             self._key_inflight.pop(key, None)
 
-    def schedule_close_when_idle(self, *, timeout: float = CLIENT_CLOSE_GRACE_SECONDS) -> asyncio.Task[None]:
-        """Close the pool once every in-flight stream finished, or after ``timeout`` seconds.
+    def schedule_close_when_idle(self) -> asyncio.Task[None]:
+        """Close pools once every in-flight stream finishes.
 
         The admin panel rebuilds the client on every save (key add/remove, base URL change),
         and a stream that is being read at that moment still holds this client: closing the
         pool underneath it surfaces as a ReadError mid-response. Retire it in the background
-        instead. The returned task is awaited by tests; the set keeps it alive until it ends.
+        instead. Streams that captured this client continue until completion, after which all
+        owned pools are closed. Background scheduler refresh work is cancelled immediately.
+        The returned task is awaited by tests; the set keeps it alive until it ends.
         """
-        task = asyncio.get_running_loop().create_task(self._close_when_idle(timeout))
+        self._retiring = True
+        if self.scheduler is not None:
+            self.scheduler.cancel()
+        task = asyncio.get_running_loop().create_task(self._close_when_idle())
         self._close_tasks.add(task)
         task.add_done_callback(self._close_tasks.discard)
         return task
 
-    async def _close_when_idle(self, timeout: float) -> None:
-        if self._inflight:
-            try:
-                await asyncio.wait_for(self._idle.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning("client.close_timeout", timeout=timeout, inflight=self._inflight)
+    async def _close_when_idle(self) -> None:
+        if self.scheduler is not None:
+            await self.scheduler.aclose()
+        while self._inflight > 0:
+            await self._idle.wait()
         await self.aclose()
 
     async def generate(
@@ -246,19 +254,25 @@ class CommandCodeClient:
         """Yield the parsed CC SSE events of one request.
 
         Counting the stream as in-flight keeps a retiring client usable for it: the panel
-        closes the old pool via `schedule_close_when_idle()` after a client rebuild.
+        retires the old client via `schedule_close_when_idle()` after a client rebuild.
         """
         self._inflight += 1
         self._idle.clear()
-        stream = self._stream(body, extra_headers, session)
+        stream = None
         try:
+            stream = self._stream(body, extra_headers, session)
             async for event in stream:
                 yield event
         finally:
-            self._inflight -= 1
-            if not self._inflight:
-                self._idle.set()
-            await stream.aclose()
+            try:
+                if stream is not None:
+                    await stream.aclose()
+            finally:
+                self._inflight -= 1
+                if not self._inflight:
+                    self._idle.set()
+                if self._retiring and not self._inflight:
+                    await self.aclose()
 
     async def _stream(
         self,
@@ -331,7 +345,7 @@ class CommandCodeClient:
                         if _is_zdr_error(response.status_code, text) and not zdr_downgraded:
                             zdr_downgraded = True
                             tried_keys.discard(key)
-                            logger.info("zdr.downgrade", key_last4=key[-4:])
+                            logger.info("zdr.downgrade", key_id=api_key_id(key))
                             continue
 
                         raise mapped

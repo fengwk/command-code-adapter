@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -25,6 +26,12 @@ def scrub_pii(value: str) -> str:
 
 def generate_id(prefix: str = "", length: int = 12) -> str:
     return f"{prefix}{uuid.uuid4().hex[:length]}"
+
+
+def api_key_id(key: str) -> str:
+    """Opaque, deterministic identifier for an upstream API key."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return f"key_{digest}"
 
 
 def mask_api_key(key: str) -> str:

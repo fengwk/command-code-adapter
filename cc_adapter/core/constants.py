@@ -77,9 +77,6 @@ SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 PROJECT_SLUGS_PER_ACCOUNT_MIN: int = 4
 PROJECT_SLUGS_PER_ACCOUNT_MAX: int = 8
 
-# How long a rebuilt client may keep serving in-flight streams before its pool is closed anyway.
-CLIENT_CLOSE_GRACE_SECONDS: float = 120.0
-
 
 def _load_version() -> str:
     _pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"

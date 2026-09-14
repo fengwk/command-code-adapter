@@ -8,6 +8,7 @@ the whole HTTP path (httpx pool included) is exercised without network access.
 """
 
 import asyncio
+import time
 
 import httpx
 import pytest
@@ -19,7 +20,6 @@ from cc_adapter.command_code.client import CommandCodeClient
 from cc_adapter.core import runtime
 from cc_adapter.core.config import AppConfig
 from cc_adapter.core.errors import AdapterError
-
 
 FRAME_COUNT = 6
 
@@ -209,8 +209,8 @@ async def test_scheduled_close_closes_every_key_pool(upstream):
 
 
 @pytest.mark.asyncio
-async def test_close_after_timeout_while_stream_still_running(upstream):
-    # Intent: a stream outliving the grace window loses its pool, yet still releases its slot when closed.
+async def test_stream_remains_open_indefinitely_while_active_and_closes_on_completion(upstream):
+    # Intent: a retiring client must never force-close an active stream; the pool remains open until completion.
     client = _client(upstream)
     gen = client.generate(_body())
     try:
@@ -219,14 +219,24 @@ async def test_close_after_timeout_while_stream_still_running(upstream):
         assert client.inflight == 1
         pool = _single_pool(client)
 
-        task = client.schedule_close_when_idle(timeout=0.2)
-        await asyncio.wait_for(task, timeout=5)  # the grace window expires; the pool is closed anyway
+        task = client.schedule_close_when_idle()
+        # Even after a delay, the retirement task must not close the pool while the stream is running.
+        await asyncio.sleep(0.1)
+        assert task.done() is False
+        assert pool.is_closed is False
         assert client.inflight == 1
-        assert pool.is_closed is True
 
-        # Cleaning up may surface AdapterError from the broken connection; the slot must still be released.
-        await _aclose_quietly(gen)
+        # The stream continues to consume frames normally through the open pool.
+        received += await _read_frames(upstream, gen, 1, FRAME_COUNT)
+        assert [event["text"] for event in received] == [f"f{index}" for index in range(FRAME_COUNT)]
+        assert pool.is_closed is False
+
+        await _end_stream(upstream, gen)
         assert client.inflight == 0
+
+        # Now that the stream is finished, the pool closes promptly.
+        await asyncio.wait_for(task, timeout=5)
+        assert pool.is_closed is True
     finally:
         await _aclose_quietly(gen)
         await asyncio.gather(*client._close_tasks, return_exceptions=True)
@@ -298,4 +308,173 @@ async def test_immediate_aclose_mid_stream_truncates(upstream):
     # Whatever the failure mode, the stream cannot complete: an error surfaced or frames were lost.
     assert [event["text"] for event in received] == [f"f{index}" for index in range(len(received))]
     assert error is not None or len(received) < FRAME_COUNT
+    assert client.inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_start_race_completes_and_closes_pool(upstream):
+    # Intent: a request capturing the client right before retirement but only iterating afterward
+    # must still complete, and any pool it creates must close when its final stream finishes.
+    client = _client(upstream)
+    # The client is retired while idle (inflight == 0).
+    close_task = client.schedule_close_when_idle()
+    await asyncio.wait_for(close_task, timeout=5)
+    assert client._retiring is True
+    assert client.inflight == 0
+
+    # Captured request starts iterating after the client was already marked retiring.
+    gen = client.generate(_body())
+    try:
+        received = await _read_frames(upstream, gen, 0, FRAME_COUNT)
+        assert [event["text"] for event in received] == [f"f{index}" for index in range(FRAME_COUNT)]
+        assert client.inflight == 1
+
+        pool = _single_pool(client)
+        assert pool.is_closed is False
+
+        await _end_stream(upstream, gen)
+        assert client.inflight == 0
+        # When inflight drops to 0 on a retired client, the created pool must be closed.
+        assert pool.is_closed is True
+        assert client._pools == {}
+    finally:
+        await _aclose_quietly(gen)
+        await asyncio.gather(*client._close_tasks, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retiring_client_cancels_scheduler_background_refresh_immediately(upstream, monkeypatch):
+    # Intent: retiring a client immediately cancels background refresh tasks and avoids delayed billing probes,
+    # while active generate streams remain unaffected and complete normally.
+    keys = ["key-alpha-1111", "key-beta-2222"]
+    client = CommandCodeClient(
+        base_url=f"http://127.0.0.1:{upstream.port}",
+        api_key=keys[0],
+        api_keys=keys,
+    )
+    assert client.scheduler is not None
+
+    probed_keys: list[str] = []
+
+    async def delayed_probe(api_key: str, *, stagger: bool = False) -> int | None:
+        if api_key == keys[1]:
+            await asyncio.sleep(60.0)  # simulate long staggered delay
+        probed_keys.append(api_key)
+        return 100
+
+    monkeypatch.setattr(client.scheduler, "_probe", delayed_probe)
+    client.scheduler._last_fetch = time.monotonic() - 3600.0  # stale
+    client.scheduler._trigger_refresh(stagger=True)
+    assert client.scheduler._fetch_task is not None
+    assert not client.scheduler._fetch_task.done()
+
+    # Start an active stream
+    gen = client.generate(_body())
+    try:
+        received = await _read_frames(upstream, gen, 0, 1)
+        assert received[0]["text"] == "f0"
+        assert client.inflight == 1
+        pool = client._client(keys[0])
+        assert pool.is_closed is False
+
+        # Retire the client while stream is active
+        close_task = client.schedule_close_when_idle()
+        # Scheduler's background refresh must be cancelled immediately
+        assert client.scheduler.is_closed is True
+        await asyncio.sleep(0.02)
+        assert client.scheduler._fetch_task.done() is True
+        assert keys[1] not in probed_keys  # delayed probe never fired
+
+        # The active stream is NOT closed and can continue
+        assert pool.is_closed is False
+        received += await _read_frames(upstream, gen, 1, FRAME_COUNT)
+        assert [event["text"] for event in received] == [f"f{index}" for index in range(FRAME_COUNT)]
+
+        # Finish stream
+        await _end_stream(upstream, gen)
+        assert client.inflight == 0
+
+        # Pool is closed after completion
+        await asyncio.wait_for(close_task, timeout=5)
+        assert pool.is_closed is True
+    finally:
+        await _aclose_quietly(gen)
+        await asyncio.gather(*client._close_tasks, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_outer_generator_early_close_finishes_inner_cleanup_before_pool_closes(monkeypatch):
+    client = CommandCodeClient(base_url="http://127.0.0.1:9999", api_key="key-test")
+    pool = client._client("key-test")
+
+    events: list[str] = []
+
+    orig_pool_aclose = pool.aclose
+
+    async def instrumented_pool_aclose():
+        events.append("pool_close")
+        await orig_pool_aclose()
+
+    pool.aclose = instrumented_pool_aclose
+
+    async def instrumented_stream(body, extra_headers=None, session=None):
+        try:
+            events.append("inner_yield")
+            yield {"type": "text-delta", "text": "f0"}
+            yield {"type": "text-delta", "text": "f1"}
+        finally:
+            events.append("inner_cleanup_start")
+            await asyncio.sleep(0.05)  # Simulate non-trivial cleanup in inner stream
+            events.append("inner_cleanup_done")
+
+    monkeypatch.setattr(client, "_stream", instrumented_stream)
+
+    gen = client.generate({"prompt": "hello"})
+    first = await anext(gen)
+    assert first["text"] == "f0"
+    assert client.inflight == 1
+
+    # Retire client while stream is active
+    close_task = client.schedule_close_when_idle()
+    assert client._retiring is True
+
+    # Early close outer generator
+    await gen.aclose()
+    await asyncio.wait_for(close_task, timeout=2.0)
+
+    assert client.inflight == 0
+    assert pool.is_closed is True
+    assert events == [
+        "inner_yield",
+        "inner_cleanup_start",
+        "inner_cleanup_done",
+        "pool_close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_outer_generator_counter_cleanup_unconditional_on_stream_aclose_error(monkeypatch):
+    client = CommandCodeClient(base_url="http://127.0.0.1:9999", api_key="key-test")
+
+    async def failing_stream(body, extra_headers=None, session=None):
+        try:
+            yield {"type": "text-delta", "text": "f0"}
+        finally:
+            raise RuntimeError("inner stream aclose error")
+
+    monkeypatch.setattr(client, "_stream", failing_stream)
+
+    gen = client.generate({"prompt": "hello"})
+    first = await anext(gen)
+    assert first["text"] == "f0"
+    assert client.inflight == 1
+
+    close_task = client.schedule_close_when_idle()
+
+    with pytest.raises(RuntimeError, match="inner stream aclose error"):
+        await gen.aclose()
+
+    await asyncio.wait_for(close_task, timeout=2.0)
     assert client.inflight == 0

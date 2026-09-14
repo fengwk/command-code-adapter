@@ -31,6 +31,7 @@ from cc_adapter.core.constants import (
     SESSION_AFFINITY_TTL,
 )
 from cc_adapter.core.key_scheduler import KeyScheduler, SessionAffinityCache
+from cc_adapter.core.utils import api_key_id
 from cc_adapter.providers.shared.session_extractor import process_identity
 
 BASE_URL = "https://api.example.com"
@@ -1048,6 +1049,190 @@ class TestCreditsPlumbing:
         assert await sched.select(None, explicit=False) == K2
         assert calls == [K1, K2]
 
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_selects_coalesce_single_fetch_wave(self, monkeypatch):
+        """8 concurrent selects on a cold scheduler must coalesce into exactly 2 fetch calls."""
+        calls: list[str] = []
+
+        async def slow_fetch(api_key: str) -> int:
+            calls.append(api_key)
+            await asyncio.sleep(0.05)
+            return 100
+
+        sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        monkeypatch.setattr(sched, "_fetch_credits", slow_fetch)
+
+        results = await asyncio.gather(*(sched.select(f"session_{i}", explicit=True) for i in range(8)))
+
+        assert len(calls) == 2  # exactly 1 fetch per key, not 16
+        assert set(calls) == {K1, K2}
+        assert all(r in (K1, K2) for r in results)
+        assert sched.last_fetch_time is not None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cold_selects_share_failure(self, monkeypatch):
+        """Concurrent cold selects share the failure cleanly without spawning redundant waves."""
+        calls: list[str] = []
+
+        async def failing_fetch(api_key: str) -> int:
+            calls.append(api_key)
+            await asyncio.sleep(0.05)
+            raise RuntimeError("upstream down")
+
+        sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        monkeypatch.setattr(sched, "_fetch_credits", failing_fetch)
+
+        results = await asyncio.gather(*(sched.select(f"session_{i}", explicit=True) for i in range(8)))
+
+        assert len(calls) == 2
+        assert all(r in (K1, K2) for r in results)
+        assert sched.last_error == "All credit fetches failed"
+
+    @pytest.mark.asyncio
+    async def test_stale_background_task_deduplication(self, monkeypatch):
+        """Concurrent selects against a stale snapshot return immediately and trigger exactly 1 task."""
+        refresh_count = 0
+
+        async def fake_refresh(self, *, stagger: bool = False):
+            nonlocal refresh_count
+            refresh_count += 1
+            await asyncio.sleep(0.05)
+
+        monkeypatch.setattr(KeyScheduler, "_refresh", fake_refresh)
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 50})
+        sched._last_fetch = time.monotonic() - (KEY_CREDITS_CACHE_TTL + 10)
+
+        results = await asyncio.gather(*(sched.select(f"session_{i}", explicit=True) for i in range(8)))
+
+        assert all(r in (K1, K2) for r in results)
+        assert sched._fetch_task is not None
+        await sched._fetch_task
+        assert refresh_count == 1
+
+
+class TestSchedulerLifecycle:
+    @pytest.mark.asyncio
+    async def test_aclose_cancels_and_awaits_background_tasks(self, monkeypatch):
+        sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        probed: list[str] = []
+
+        async def slow_probe(api_key: str, *, stagger: bool = False) -> int | None:
+            if api_key == K2:
+                await asyncio.sleep(60.0)
+            probed.append(api_key)
+            return 100
+
+        monkeypatch.setattr(sched, "_probe", slow_probe)
+        sched._last_fetch = time.monotonic() - 3600.0
+        sched._trigger_refresh(stagger=True)
+        assert sched._fetch_task is not None
+        assert not sched._fetch_task.done()
+
+        await sched.aclose()
+        assert sched.is_closed is True
+        assert sched._fetch_task.done() is True
+        assert K2 not in probed
+
+        # Subsequent trigger does not create fresh background tasks
+        sched._trigger_refresh(stagger=True)
+        assert sched.is_closed is True
+
+        # In-flight streams can still report
+        sched.report(K1, ok=True)
+        assert sched.key_state(K1)["state"] == "ok"
+
+
+class TestSchedulerStateExportImport:
+    def test_export_and_import_state_filters_removed_keys(self):
+        sched = KeyScheduler(keys=[K1, K2, K3], base_url=BASE_URL)
+        sched.report(K1, ok=False, status=401)
+        sched.report(K2, ok=False, status=429, reason="rate_limited")
+        sched._credits[K2] = 0
+        sched._credits[K3] = 75
+        sched.disable(K3)
+        sched._affinity.set("sess:k2", K2)
+        sched._last_fetch = 12345.6
+        sched._last_error = "partial fail"
+        sched._last_failure = {"key": K2, "status": 429, "reason": "rate_limited"}
+
+        snapshot = sched.export_state()
+        assert snapshot["state"][K1] == "disabled"
+        assert snapshot["state"][K2] == "cooling"
+        assert snapshot["failures"][K2] == 1
+        assert snapshot["credits"][K2] == 0
+        assert snapshot["credits"][K3] == 75
+        assert K3 in snapshot["manual_off"]
+        assert snapshot["last_fetch"] == 12345.6
+
+        # Import into 2-key scheduler (K3 dropped)
+        new_sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        new_sched.import_state(snapshot)
+
+        assert new_sched.key_state(K1)["state"] == "disabled"
+        assert new_sched.key_state(K1)["reason"] == "http_401"
+        assert new_sched.key_state(K2)["state"] == "cooling"
+        assert new_sched.key_state(K2)["failures"] == 1
+        assert new_sched.key_state(K2)["credits"] == 0
+        assert new_sched._affinity.get_and_refresh("sess:k2") == K2
+        assert new_sched.last_fetch_time == 12345.6
+        assert new_sched.last_error == "partial fail"
+        assert new_sched.last_failure()["key"] == K2
+
+        # K3 was not imported
+        assert K3 not in new_sched._keys
+        assert K3 not in new_sched._state
+        assert K3 not in new_sched._credits
+        assert K3 not in new_sched._manual_off
+
+    @pytest.mark.asyncio
+    async def test_import_state_on_key_addition_forces_coalesced_cold_fetch(self, monkeypatch):
+        old_sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        old_sched.report(K1, ok=False, status=429, reason="rate_limited")
+        old_sched.disable(K2)
+        old_sched._affinity.set("sess:k1", K1)
+        old_sched._last_fetch = time.monotonic()
+        old_sched._last_error = None
+        old_sched._credits[K1] = 100
+        old_sched._credits[K2] = 50
+
+        snapshot = old_sched.export_state()
+
+        # Import into 3-key scheduler (K3 added)
+        new_sched = KeyScheduler(keys=[K1, K2, K3], base_url=BASE_URL)
+
+        fetched_keys: list[str] = []
+
+        async def fake_probe(api_key: str, *, stagger: bool = False) -> int | None:
+            await asyncio.sleep(0.02)
+            fetched_keys.append(api_key)
+            return 200
+
+        monkeypatch.setattr(new_sched, "_probe", fake_probe)
+
+        new_sched.import_state(snapshot)
+
+        # 1. On key addition, last_fetch_time must NOT be imported, staying None
+        assert new_sched.last_fetch_time is None
+
+        # 2. Migrated health, manual switch, and affinity must remain intact
+        assert new_sched.key_state(K1)["state"] == "cooling"
+        assert new_sched.key_state(K1)["reason"] == "rate_limited"
+        assert new_sched.key_state(K2)["manual"] is True
+        assert new_sched.key_state(K2)["enabled"] is False
+        assert K2 in new_sched.manual_disabled_keys()
+        assert new_sched._affinity.get_and_refresh("sess:k1") == K1
+
+        # 3. Concurrent selects must trigger one coalesced cold fetch of all 3 keys exactly once
+        results = await asyncio.gather(*[new_sched.select(None, explicit=False) for _ in range(6)])
+
+        assert len(fetched_keys) == 3
+        assert sorted(fetched_keys) == sorted([K1, K2, K3])
+        assert new_sched.last_fetch_time is not None
+        assert all(res == K3 for res in results)
+
+        await new_sched.aclose()
+        await old_sched.aclose()
+
 
 class TestKeyStates:
     def test_states_follow_configuration_order_and_report_fields(self):
@@ -1080,7 +1265,7 @@ class _RecordingLogger:
 class TestLogging:
     @pytest.mark.asyncio
     async def test_logs_never_leak_full_session_or_key_values(self, monkeypatch):
-        """Privacy: only the session prefix and the key suffix may be logged."""
+        """Privacy: only the session prefix and an opaque key ID may be logged."""
         recorder = _RecordingLogger()
         monkeypatch.setattr(ks, "logger", recorder)
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
@@ -1092,8 +1277,11 @@ class TestLogging:
 
         events = recorder.events
         assert [event for event, _ in events] == ["key.bind", "key.cooldown", "key.disabled", "key.select"]
-        assert events[0][1] == {"session": flag[:8], "key": K1[-4:], "explicit": True}
-        assert events[3][1] == {"key": K2[-4:], "reason": "no-session"}  # K1 is disabled, so K2 is the only usable key
+        assert events[0][1] == {"session": flag[:8], "key": api_key_id(K1), "explicit": True}
+        assert events[3][1] == {
+            "key": api_key_id(K2),
+            "reason": "no-session",
+        }  # K1 is disabled, so K2 is the only usable key
         for _, kwargs in events:
             assert flag not in str(kwargs)
             assert K1 not in str(kwargs)
@@ -1105,7 +1293,7 @@ class TestLogging:
         sched.set_distribution("FillFirst")  # normalized before it is logged
         assert recorder.events == [("key.distribution", {"distribution": DISTRIBUTION_FILL_FIRST})]
 
-    def test_logs_the_admin_switch_with_the_key_suffix_and_unbound_count(self, monkeypatch):
+    def test_logs_the_admin_switch_with_the_key_id_and_unbound_count(self, monkeypatch):
         recorder = _RecordingLogger()
         monkeypatch.setattr(ks, "logger", recorder)
         sched = make_scheduler([K1], {K1: 100})
@@ -1113,7 +1301,58 @@ class TestLogging:
         assert sched.disable(K1) == 1
         sched.enable(K1)
         assert [event for event, _ in recorder.events] == ["key.admin_disabled", "key.admin_enabled"]
-        assert recorder.events[0][1] == {"key": K1[-4:], "sessions": 1}
-        assert recorder.events[1][1] == {"key": K1[-4:]}
+        assert recorder.events[0][1] == {"key": api_key_id(K1), "sessions": 1}
+        assert recorder.events[1][1] == {"key": api_key_id(K1)}
         for _, kwargs in recorder.events:
-            assert K1 not in str(kwargs)  # only the masked suffix is logged
+            assert K1 not in str(kwargs)
+
+
+class TestSafeKeyIdentifiersAndMasking:
+    def test_key_by_id_and_key_by_identifier(self):
+        k1, k2 = "alpha-1111", "beta-1111"
+        sched = KeyScheduler(keys=[k1, k2], base_url=BASE_URL)
+
+        # ID lookup resolves uniquely even when suffixes match
+        id1 = api_key_id(k1)
+        id2 = api_key_id(k2)
+        assert sched.key_by_id(id1) == k1
+        assert sched.key_by_id(id2) == k2
+        assert sched.key_by_identifier(id1) == k1
+        assert sched.key_by_identifier(id2) == k2
+
+        # Suffix lookup is ambiguous and returns None
+        assert sched.key_by_suffix("1111") is None
+        assert sched.key_by_identifier("1111") is None
+
+        # Unique suffix resolves properly via identifier
+        sched_unique = KeyScheduler(keys=["alpha-1111", "beta-2222"], base_url=BASE_URL)
+        assert sched_unique.key_by_identifier("1111") == "alpha-1111"
+        assert sched_unique.key_by_identifier("2222") == "beta-2222"
+        assert sched_unique.key_by_identifier("9999") is None
+
+    def test_short_key_never_leaks_in_summary_or_logs(self, monkeypatch):
+        recorder = _RecordingLogger()
+        monkeypatch.setattr(ks, "logger", recorder)
+
+        sched = make_scheduler(["abc", "xyz"], {"abc": 0, "xyz": 0})
+        sched.disable("abc")
+
+        # Disable log event uses an opaque identifier.
+        assert recorder.events[-1] == ("key.admin_disabled", {"key": api_key_id("abc"), "sessions": 0})
+        assert "abc" not in str(recorder.events[-1])
+
+        # Enable log event uses the same opaque identifier.
+        sched.enable("abc")
+        assert recorder.events[-1] == ("key.admin_enabled", {"key": api_key_id("abc")})
+        assert "abc" not in str(recorder.events[-1])
+
+        # Unavailable summary never contains "abc" or "xyz" verbatim
+        sched.disable("abc")
+        summary = sched.unavailable_summary()
+        assert "abc" not in summary
+        assert "xyz" not in summary
+        assert "**** disabled by admin" in summary
+        assert "**** ok (out of credits)" in summary
+
+        # Key labels mask short keys fully
+        assert sched.key_labels() == ["****", "****"]

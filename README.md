@@ -60,7 +60,8 @@ docker compose up -d
 | `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | 限流（429）冷却起始秒数，每次失败翻倍 |
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | 限流冷却上限（秒） |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | 额度用尽的 Key 冷却时长（秒，固定值） |
-| `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存） |
+| `CC_ADAPTER_DISTRIBUTION` | `round-robin` | 新会话分发：`round-robin`（轮询）或 `fill-first`（主号优先），可在面板实时切换 |
+| `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存），可在面板实时切换 |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | 可选的 OSS 提供商名称，作为 `x-oss-primary-provider` 请求头发送 |
 | `CC_ADAPTER_ENV_FILE` | `.env` | 配置文件路径（管理面板读写此文件，见下） |
 
@@ -79,19 +80,20 @@ volumes:
 
 **每 Key 隔离**：每个上游 Key 使用**独立的 HTTP 连接池**（keep-alive 连接不会先后承载两个 Key 的 Authorization），并且上游可见的身份（`x-session-id`、`x-project-slug`、`workingDir` 的 `home` 段与项目目录）都按 Key（或「会话 + Key」）派生：同一对话换 Key 时会整体更换身份，同一 Key 的所有会话则共用同一个伪造家目录。余额探测也会按 Key 错开时间发出，避免所有账号在同一时刻从同一 IP 探活。
 
-**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。面板相关接口（`GET /admin/api/keys`、`POST /admin/api/usage/query` 等）返回的 Key 一律是掩码（长 Key 前 10 位 + 后 6 位，短 Key 只留末尾 4 位），完整值不会离开服务端。
+**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。重建会迁移保留 Key 的健康状态、额度缓存和会话绑定，并让旧客户端继续服务已有流直到自然结束。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。面板相关接口（`GET /admin/api/keys`、`POST /admin/api/usage/query` 等）返回的 Key 一律使用统一掩码：超过 20 位显示前 10 位和后 6 位，4～20 位只显示后 4 位，不足 4 位则完全隐藏。Key 管理接口另返回不透明 `id` 用于操作，完整值不会离开服务端。
 
 ### 多 Key 路由
 
-配置多个 Key（`CC_ADAPTER_CC_API_KEY=["k1","k2"]`）时，适配器按"会话粘性 + 首可用优先"分配上游 Key：
+配置多个 Key（`CC_ADAPTER_CC_API_KEY=["k1","k2"]`）时，适配器按“会话粘性 + 可配置的新会话分发”分配上游 Key：
 
-- 客户端带会话标识时（Claude Code 的 `x-claude-code-session-id` / `metadata.user_id`、Codex 的 `session-id`、`x-session-id`、`prompt_cache_key` 等），同一会话固定使用同一个 Key；新会话按配置顺序轮询分配 —— 目的是最大化上游 prompt cache 命中率。
-- 识别不到会话标识的请求（按内容锚定）首次仍取第一个可用 Key（fill-first），但其会话绑定会被记住：即使该 Key 进入冷却后恢复，这段对话也不会被搬回去，避免同一段内容反复出现在两个账号上。
-- Key 故障自动切换：401/403 直接禁用该 Key；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
+- 无论会话标识来自客户端（Claude Code 的 `x-claude-code-session-id` / `metadata.user_id`、Codex 的 `session-id`、`x-session-id`、`prompt_cache_key` 等）还是内容锚点，同一会话都会固定使用一个 Key，以最大化 prompt cache 命中率并避免对话跨账号。已绑定会话即使达到单 Key 并发上限也不会迁移，只有 Key 确实不可用时才故障转移。
+- 新会话默认按 `round-robin` 沿配置顺序轮询；也可通过 `CC_ADAPTER_DISTRIBUTION=fill-first` 让新会话始终从第一个可用 Key 开始。配置页可实时切换，已有绑定不受影响。
+- 新会话会避开已承载 4 个在途流的 Key；如果全部可用 Key 都已饱和，则选择负载最低者继续服务而不是拒绝请求。
+- Key 故障自动切换：401 或显式 `invalid_key` 永久禁用该 Key；普通 403 冷却 2 小时；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
 - 所有 Key 都不可用时**不再消耗上游调用**，直接返回最后一个 Key 的失败信息（附各 Key 状态摘要）。
 - 手动开关：面板可单独把某个 Key 关掉/打开。关掉后该 Key **永不被选中**（无视其额度与健康状态），其绑定的会话立即解绑并在下次请求切到其他 Key；打开后**立即可用**（清除手动标记与冷却/禁用状态、丢弃已缓存的余额并后台刷新），充值后用它恢复即可。自动冷却逻辑与手动开关互不影响。
 - **每 Key 隔离**：每个 Key 独占一个 httpx 连接池（`CC_ADAPTER_HTTP_MAX_CONNECTIONS` / `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` / `CC_ADAPTER_HTTP2` 按池生效，h2 默认关闭），keep-alive 连接不会承载另一个 Key 的 `Authorization`，上游无法通过 TCP/TLS 连接复用把多个 Key 关联起来；同时每个 Key 有自己的伪造机器身份：`workingDir` 为 `/home/<login>/proj/<slug>`，其中 login 由 Key 派生（同一 Key 的所有会话共用同一个 login，不同 Key 的 login 不同）。因此同一会话换到另一个 Key 时会**更换会话身份**（session id + slug），这是有意为之——每个 Key 代表一个独立的上游账号。
-- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数（含 `enabled`/`manual`/`cooldown_seconds`），`POST /admin/api/keys` 新增一个 Key，`DELETE /admin/api/keys/{后四位}` 删除一个 Key，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/disable` 关闭某个 Key，`POST /admin/api/keys/{后四位}/enable` 打开（解除冷却/禁用并清除余额缓存）。
+- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数（含不透明 `id`、`enabled`/`manual`/`cooldown_seconds`），`POST /admin/api/keys` 新增一个 Key，`DELETE /admin/api/keys/{id}` 删除一个 Key，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{id}/disable` 关闭某个 Key，`POST /admin/api/keys/{id}/enable` 打开（解除冷却/禁用并清除余额缓存）。为兼容旧调用，唯一且无歧义的末尾字符仍可代替 `id`。
 
 ### 日志
 
@@ -293,7 +295,8 @@ Keys and configuration saved in the panel live in the file behind `CC_ADAPTER_EN
 | `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | Rate-limit (429) cooldown start in seconds, doubles per failure |
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap in seconds |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat cooldown for an out-of-credits key, in seconds |
-| `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` header (zero data retention) |
+| `CC_ADAPTER_DISTRIBUTION` | `round-robin` | New-session routing: `round-robin` or `fill-first`, switchable live in the admin panel |
+| `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` (zero data retention), switchable live in the admin panel |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Config file path (the admin panel reads and rewrites this file) |
 
@@ -312,21 +315,20 @@ Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel'
 
 **Per-key isolation**: every upstream key gets its **own HTTP connection pool** (a keep-alive connection never carries two keys' `Authorization` header), and the upstream-visible identity (`x-session-id`, `x-project-slug`, the `home` segment of `workingDir` and the project directory) is derived per key (or per session + key): moving one conversation to another key changes the whole identity, while all sessions of one key share the same forged home directory. Balance probes are staggered per key as well, so the accounts never poll the upstream from one IP in the same instant.
 
-**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool). Keys returned by the admin APIs (`GET /admin/api/keys`, `POST /admin/api/usage/query`, ...) are always masked (first 10 + last 6 characters, short keys only their last 4), so the full value never leaves the server.
+**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Rebuilds migrate health, cached credits and bindings for retained keys, while the retired client keeps serving existing streams until they finish naturally. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool). Admin APIs (`GET /admin/api/keys`, `POST /admin/api/usage/query`, ...) use one masking rule: keys longer than 20 characters retain the first 10 and last 6, keys 4–20 characters retain only the last 4, and shorter keys are fully hidden. Key-management responses also carry an opaque `id` for operations; the full value never leaves the server.
 
 ### Multi-key routing
 
-With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adapter assigns upstream keys by session stickiness plus first-usable fallback:
+With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`), the adapter combines session stickiness with configurable new-session distribution:
 
-- Requests carrying a session identity (Claude Code `x-claude-code-session-id` / `metadata.user_id`, Codex `session-id`, `x-session-id`, `prompt_cache_key`, …) stick to one key per conversation; new sessions are bound round-robin in configured order — this maximizes upstream prompt-cache hits.
-- A request the adapter can only identify by its content anchor still starts on the first usable key (fill-first), but that
-  conversation is bound from then on: once its key cools down and recovers, the conversation is not dragged back, so one
-  conversation never keeps reappearing under two accounts.
-- Failures fail over automatically: 401/403 disables a key, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
+- Whether its identity comes directly from the client (Claude Code `x-claude-code-session-id` / `metadata.user_id`, Codex `session-id`, `x-session-id`, `prompt_cache_key`, …) or from a content anchor, a conversation sticks to one key. A bound session stays there even at the per-key concurrency cap and moves only when its key is genuinely unusable.
+- New sessions use `round-robin` by default. Set `CC_ADAPTER_DISTRIBUTION=fill-first` to always start them on the first usable key. The Configuration tab switches the mode live without moving existing bindings.
+- New sessions skip a key already serving four in-flight streams. If every usable key is saturated, the least-loaded key keeps serving instead of rejecting the request.
+- Failures fail over automatically: a 401 or explicit `invalid_key` permanently disables a key, a plain 403 parks it for two hours, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
 - When every key is unusable the adapter makes **no further upstream call** and returns the last key's failure together with a per-key state summary.
 - Manual switch: the panel can turn an individual key off/on. Off means the key is **never selected** (regardless of its credits or health) and its bound sessions are unbound immediately, so the next turn moves to another key; on makes it **immediately selectable** (manual mark plus cooling/disabled state cleared, cached balance dropped and refreshed in the background), which is the way to restore a key right after a top-up. Automatic cooldowns keep working independently of the switch.
 - **Per-key isolation**: every key owns its httpx connection pool (`CC_ADAPTER_HTTP_MAX_CONNECTIONS` / `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` / `CC_ADAPTER_HTTP2` apply per pool, h2 off by default), so a keep-alive connection never carries another key's `Authorization` and the upstream cannot link keys through TCP/TLS reuse. Each key also has its own forged machine identity: `workingDir` is `/home/<login>/proj/<slug>`, with the login derived from the key (all sessions of one key share one login, different keys do not). A conversation that moves to another key therefore switches its session identity (session id + slug) — deliberately, since each key is a separate upstream account.
-- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key, plus `enabled`/`manual`/`cooldown_seconds`), `POST /admin/api/keys` (add a key), `DELETE /admin/api/keys/{last4}` (remove a key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/disable` (take a key out of rotation), `POST /admin/api/keys/{last4}/enable` (clear manual off + cooling/disabled + cached balance).
+- Ops endpoints (admin auth required): `GET /admin/api/keys` (opaque `id`, state, credits and bound sessions per key, plus `enabled`/`manual`/`cooldown_seconds`), `POST /admin/api/keys` (add), `DELETE /admin/api/keys/{id}` (remove), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{id}/disable` (take out of rotation), and `POST /admin/api/keys/{id}/enable` (clear manual off + cooling/disabled + cached balance). A unique, unambiguous suffix remains accepted for backward compatibility.
 
 ### Logging
 

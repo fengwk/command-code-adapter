@@ -13,8 +13,8 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
   TTL), so every turn of one conversation stays on the same upstream account -
   including conversations the adapter only knows by their content anchor, which
   would otherwise be dragged to another account whenever the head key changes.
-  ``export_affinity()`` / ``import_affinity()`` carry those bindings across the
-  client rebuild the admin panel performs on every save;
+  ``export_state()`` / ``import_state()`` carry bindings, health and balance
+  state across a client rebuild;
 * a configurable first-sight distribution (``DISTRIBUTION_ROUND_ROBIN`` - the
   default - or ``DISTRIBUTION_FILL_FIRST``): a new conversation either walks the
   configured ring or always starts at the first usable key. The mode is switchable
@@ -63,6 +63,7 @@ from cc_adapter.core.constants import (
     normalize_distribution,
 )
 from cc_adapter.providers.shared.session_extractor import process_identity
+from cc_adapter.core.utils import api_key_id, mask_api_key
 
 logger = structlog.get_logger(__name__)
 
@@ -85,6 +86,11 @@ def _format_remaining(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds / 60:.0f}m"
     return f"{seconds / 3600:.1f}h"
+
+
+def _safe_log_key(key: str) -> str:
+    """Opaque key reference for logs; unlike a suffix it never exposes a short key."""
+    return api_key_id(key)
 
 
 class SessionAffinityCache:
@@ -171,7 +177,9 @@ class KeyScheduler:
         self._last_error: str | None = None
         self._last_failure: dict[str, Any] | None = None
         self._fetch_task: asyncio.Task[None] | None = None
+        self._cold_fetch_task: asyncio.Task[None] | None = None
         self._fetch_lock = asyncio.Lock()
+        self._closed: bool = False
 
         self._state: dict[str, str] = {}
         self._until: dict[str, float] = {}
@@ -231,7 +239,7 @@ class KeyScheduler:
         if session_flag:
             bound = self._affinity.get_and_refresh(session_flag)
             if bound is not None and bound in usable:
-                logger.info("key.select", session=session_flag[:8], key=bound[-4:], reason="sticky")
+                logger.info("key.select", session=session_flag[:8], key=_safe_log_key(bound), reason="sticky")
                 return bound
             # First sight of a conversation, or a key that went unusable. Prefer a key
             # with room; when every key is saturated the least loaded one wins, because
@@ -242,12 +250,12 @@ class KeyScheduler:
             candidates, saturated = self._spread(usable, load)
             chosen = self._deal_new_stream(candidates, saturated)
             self._affinity.set(session_flag, chosen)
-            logger.info("key.bind", session=session_flag[:8], key=chosen[-4:], explicit=explicit)
+            logger.info("key.bind", session=session_flag[:8], key=_safe_log_key(chosen), explicit=explicit)
             return chosen
 
         candidates, saturated = self._spread(usable, load)
         chosen = self._deal_new_stream(candidates, saturated)
-        logger.info("key.select", key=chosen[-4:], reason="no-session")
+        logger.info("key.select", key=_safe_log_key(chosen), reason="no-session")
         return chosen
 
     def _deal_new_stream(self, candidates: list[str], saturated: bool) -> str:
@@ -339,7 +347,9 @@ class KeyScheduler:
             self._until.pop(key, None)
             self._reason[key] = _reason_text(reason, status)
             unbound = self._affinity.delete_by_key(key)
-            logger.info("key.disabled", key=key[-4:], status=status, reason=self._reason[key], sessions=unbound)
+            logger.info(
+                "key.disabled", key=_safe_log_key(key), status=status, reason=self._reason[key], sessions=unbound
+            )
             return
 
         if status == 403:
@@ -353,7 +363,7 @@ class KeyScheduler:
             unbound = self._affinity.compare_and_delete(session_flag, key)
             logger.info(
                 "key.cooldown",
-                key=key[-4:],
+                key=_safe_log_key(key),
                 status=status,
                 reason=self._reason[key],
                 cooldown=KEY_FORBIDDEN_COOLDOWN,
@@ -379,7 +389,7 @@ class KeyScheduler:
             unbound = self._affinity.compare_and_delete(session_flag, key)
             logger.info(
                 "key.cooldown",
-                key=key[-4:],
+                key=_safe_log_key(key),
                 status=status,
                 reason=self._reason[key],
                 failures=failures,
@@ -435,9 +445,13 @@ class KeyScheduler:
     def states(self) -> list[dict]:
         return [self.key_state(key) for key in self._keys]
 
+    @property
+    def keys(self) -> list[str]:
+        return list(self._keys)
+
     def key_labels(self) -> list[str]:
-        """Masked key suffixes in configured order (admin display)."""
-        return [f"****{key[-4:]}" for key in self._keys]
+        """Masked keys in configured order (admin display)."""
+        return [mask_api_key(key) for key in self._keys]
 
     def last_failure(self) -> dict[str, Any] | None:
         """Most recent key-level upstream failure, for error reporting."""
@@ -449,8 +463,9 @@ class KeyScheduler:
         parts: list[str] = []
         for key in self._keys:
             state = self.key_state(key)
+            masked = mask_api_key(key)
             if state["manual"]:
-                parts.append(f"****{key[-4:]} disabled by admin")
+                parts.append(f"{masked} disabled by admin")
                 continue
             detail = state["state"]
             if state["state"] == STATE_COOLING and state["until"] is not None:
@@ -459,14 +474,26 @@ class KeyScheduler:
                 detail += f" ({state['reason']})"
             elif state["credits"] == 0:
                 detail += " (out of credits)"
-            parts.append(f"****{key[-4:]} {detail}")
+            parts.append(f"{masked} {detail}")
         return f"no usable CC key: {len(self._keys)} configured [{'; '.join(parts)}]"
+
+    def key_by_id(self, identifier: str) -> str | None:
+        """Resolve a configured key by its safe ID, defensively rejecting a collision."""
+        matches = [key for key in self._keys if api_key_id(key) == identifier]
+        return matches[0] if len(matches) == 1 else None
 
     def key_by_suffix(self, suffix: str) -> str | None:
         """Resolve a configured key from its last characters, None when ambiguous."""
         suffix = suffix.lstrip("*")
         matches = [key for key in self._keys if key.endswith(suffix)]
         return matches[0] if len(matches) == 1 else None
+
+    def key_by_identifier(self, identifier: str) -> str | None:
+        """Resolve a configured key by its safe ID or unique suffix."""
+        by_id = self.key_by_id(identifier)
+        if by_id is not None:
+            return by_id
+        return self.key_by_suffix(identifier)
 
     def clear_sessions(self) -> int:
         return self._affinity.clear()
@@ -481,14 +508,14 @@ class KeyScheduler:
         """
         self._manual_off.add(key)
         unbound = self._affinity.delete_by_key(key)
-        logger.info("key.admin_disabled", key=key[-4:], sessions=unbound)
+        logger.info("key.admin_disabled", key=_safe_log_key(key), sessions=unbound)
         return unbound
 
     def enable(self, key: str) -> None:
         """Clear the manual off mark and the automatic health/credit marks."""
         self._manual_off.discard(key)
         self.reset_key(key)
-        logger.info("key.admin_enabled", key=key[-4:])
+        logger.info("key.admin_enabled", key=_safe_log_key(key))
 
     def manual_disabled_keys(self) -> set[str]:
         """Keys the operator switched off (a copy), for carrying the switch across a rebuild."""
@@ -517,6 +544,85 @@ class KeyScheduler:
             logger.info("key.affinity_imported", sessions=imported)
         return imported
 
+    def export_state(self) -> dict[str, Any]:
+        """Export runtime scheduler state for migration across client rebuilds."""
+        for key in self._keys:
+            self._health(key)
+        return {
+            "keys": list(self._keys),
+            "state": dict(self._state),
+            "until": dict(self._until),
+            "reason": dict(self._reason),
+            "failures": dict(self._failures),
+            "credits": dict(self._credits),
+            "manual_off": set(self._manual_off),
+            "affinity": self._affinity.entries(),
+            "cursor_key": self._cursor_key,
+            "last_fetch": self._last_fetch,
+            "last_error": self._last_error,
+            "last_failure": dict(self._last_failure) if self._last_failure else None,
+        }
+
+    def import_state(self, state: dict[str, Any]) -> None:
+        """Import runtime state from a previous scheduler, filtered to current keys."""
+        allowed = set(self._keys)
+
+        # Per-key automatic health & cooldowns
+        for key, st in state.get("state", {}).items():
+            if key in allowed and st in (STATE_OK, STATE_COOLING, STATE_DISABLED):
+                self._state[key] = st
+        for key, until in state.get("until", {}).items():
+            if key in allowed and isinstance(until, (int, float)):
+                self._until[key] = float(until)
+        for key, reason in state.get("reason", {}).items():
+            if key in allowed:
+                self._reason[key] = reason
+        for key, fails in state.get("failures", {}).items():
+            if key in allowed and isinstance(fails, int):
+                self._failures[key] = fails
+        for key, creds in state.get("credits", {}).items():
+            if key in allowed and isinstance(creds, int):
+                self._credits[key] = creds
+
+        # Manual-off keys
+        for key in state.get("manual_off", ()):
+            if key in allowed:
+                self._manual_off.add(key)
+
+        # Session affinity (import_affinity already filters against self._keys)
+        if "affinity" in state:
+            self.import_affinity(state["affinity"])
+
+        # Unbind sessions pointing to disabled or manual-off keys
+        for key in self._manual_off:
+            self._affinity.delete_by_key(key)
+        for key, st in self._state.items():
+            if st == STATE_DISABLED:
+                self._affinity.delete_by_key(key)
+
+        # Scheduler-level cursor: preserve where valid (same key ring)
+        cursor = state.get("cursor_key")
+        if cursor in allowed and state.get("keys") == self._keys:
+            self._cursor_key = cursor
+
+        # Scheduler-level last fetch and error:
+        # Only preserve when every current key was present in the exported key ring (no additions; removals are fine).
+        # On key addition, newly added keys lack credits entries, so leaving _last_fetch=None ensures
+        # the first selection performs one coalesced full snapshot.
+        exported_keys = set(state.get("keys", ()))
+        if set(self._keys).issubset(exported_keys):
+            if state.get("last_fetch") is not None:
+                self._last_fetch = state["last_fetch"]
+            if state.get("last_error") is not None:
+                self._last_error = state["last_error"]
+
+        # Scheduler-level last failure: preserve only if the failed key is still configured
+        last_failure = state.get("last_failure")
+        if isinstance(last_failure, dict):
+            failed_key = last_failure.get("key")
+            if failed_key in allowed or failed_key is None:
+                self._last_failure = dict(last_failure)
+
     def reset_key(self, key: str) -> None:
         """Clear cooling/disabled health and the cached zero-credit mark.
 
@@ -535,17 +641,37 @@ class KeyScheduler:
 
     async def _ensure_credits(self) -> None:
         """Block on the first fetch only; afterwards refresh in the background."""
-        if not self._keys or not self._is_stale():
+        if not self._keys or self._closed:
             return
         if self._last_fetch is None:
+            task = self._cold_fetch_task
+            if task is None or task.done():
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self._do_cold_fetch())
+                self._cold_fetch_task = task
             try:
-                await self.refresh()
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cur = asyncio.current_task()
+                cancelling = cur.cancelling() if (cur and hasattr(cur, "cancelling")) else False
+                if task.cancelled() and not cancelling:
+                    pass
+                else:
+                    raise
             except Exception:
-                logger.warning("initial_credits_fetch_failed", exc_info=True)
-        else:
-            # Background refresh: the probes of the single keys are staggered so
-            # they do not all leave one IP in the same instant.
+                pass
+            return
+
+        if self._is_stale():
             self._trigger_refresh(stagger=True)
+
+    async def _do_cold_fetch(self) -> None:
+        try:
+            await self.refresh(stagger=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("initial_credits_fetch_failed", exc_info=True)
 
     def _is_stale(self) -> bool:
         if self._last_fetch is None:
@@ -554,6 +680,8 @@ class KeyScheduler:
         return time.monotonic() - self._last_fetch > ttl
 
     def _trigger_refresh(self, *, stagger: bool = False) -> None:
+        if self._closed:
+            return
         try:
             loop = asyncio.get_running_loop()
             if not self._fetch_task or self._fetch_task.done():
@@ -579,13 +707,15 @@ class KeyScheduler:
             success_count = 0
             for key, result in zip(self._keys, results):
                 if isinstance(result, Exception):
-                    logger.warning("credits_fetch_failed", key=key[-4:], error=str(result))
+                    logger.warning("credits_fetch_failed", key=_safe_log_key(key), error=str(result))
                 elif isinstance(result, int):
                     self._credits[key] = result
                     success_count += 1
             if success_count == 0 and self._keys:
                 self._last_error = "All credit fetches failed"
             self._last_fetch = time.monotonic()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self._last_error = str(e)
             self._last_fetch = time.monotonic()
@@ -595,6 +725,8 @@ class KeyScheduler:
         """Fetch one balance, optionally after this key's share of the probe window."""
         if stagger:
             await self._stagger_probe(api_key)
+        if self._closed:
+            return None
         return await self._fetch_credits(api_key)
 
     def _probe_offset(self, api_key: str) -> float:
@@ -619,6 +751,24 @@ class KeyScheduler:
                 c = data["credits"]
                 return c.get("monthlyCredits", 0) + c.get("purchasedCredits", 0) + c.get("freeCredits", 0)
             return 0
+
+    def cancel(self) -> None:
+        """Mark closed and cancel background tasks immediately."""
+        self._closed = True
+        for t in (self._fetch_task, self._cold_fetch_task):
+            if t is not None and not t.done():
+                t.cancel()
+
+    async def aclose(self) -> None:
+        """Cancel and await background credits refresh tasks."""
+        self.cancel()
+        tasks = [t for t in (self._fetch_task, self._cold_fetch_task) if t is not None and not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
 
     @property
     def last_fetch_time(self) -> float | None:

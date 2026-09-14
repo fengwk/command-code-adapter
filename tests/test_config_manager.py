@@ -38,6 +38,26 @@ class TestApplyConfigFields:
         _apply_config_fields(cfg, {"distribution": "sideways"})
         assert cfg.distribution == DISTRIBUTION_ROUND_ROBIN
 
+    def test_zdr_update_keeps_the_client_and_handles_types(self):
+        cfg = AppConfig(zdr=True)
+        # 1. Setting bool False
+        changed = _apply_config_fields(cfg, {"zdr": False})
+        assert cfg.zdr is False
+        assert not changed  # zdr is not a client field
+
+        # 2. String "false" must not evaluate truthy (as bool("false") would)
+        _apply_config_fields(cfg, {"zdr": "false"})
+        assert cfg.zdr is False
+
+        # 3. String "true"
+        _apply_config_fields(cfg, {"zdr": "true"})
+        assert cfg.zdr is True
+
+        # 4. Unknown strings are rejected instead of making memory and dotenv disagree.
+        with pytest.raises(ValueError, match="invalid boolean value"):
+            _apply_config_fields(cfg, {"zdr": "invalid"})
+        assert cfg.zdr is True
+
     def test_api_key_normalization_single_string(self):
         cfg = AppConfig(cc_api_key="single-key")
         changed = _apply_config_fields(cfg, {"cc_api_key": "single-key"})
@@ -94,6 +114,31 @@ class TestUpdateEnvFile:
             content = env_path.read_text()
             assert f"CC_ADAPTER_DISTRIBUTION={DISTRIBUTION_ROUND_ROBIN}\n" in content
             assert "sideways" not in content
+
+    def test_update_zdr_writes_canonical_lowercase_bool(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("CC_ADAPTER_ZDR=true\n")
+            ConfigManager.update_env_file({"zdr": False}, env_path)
+            assert env_path.read_text() == "CC_ADAPTER_ZDR=false\n"
+            ConfigManager.update_env_file({"zdr": True}, env_path)
+            assert env_path.read_text() == "CC_ADAPTER_ZDR=true\n"
+
+    def test_add_zdr_writes_canonical_lowercase_bool(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("CC_ADAPTER_PORT=8080\n")
+            ConfigManager.update_env_file({"zdr": False}, env_path)
+            assert "CC_ADAPTER_ZDR=false\n" in env_path.read_text()
+
+    def test_invalid_zdr_does_not_rewrite_the_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            original = "CC_ADAPTER_ZDR=true\n"
+            env_path.write_text(original)
+            with pytest.raises(ValueError, match="invalid boolean value"):
+                ConfigManager.update_env_file({"zdr": "invalid"}, env_path)
+            assert env_path.read_text() == original
 
     def test_update_api_key_json_list_to_list(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -210,6 +255,122 @@ class TestRecreateClient:
             assert await new.scheduler.select(moved, explicit=True) == keys[1]
         finally:
             state_init(*previous)
+
+    @pytest.mark.asyncio
+    async def test_disabled_key_remains_disabled_across_rebuild_when_adding_key(self):
+        """Reproduction: disabled -> add another key -> disabled (previously became ok)."""
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        keys = ["cc-key-alpha-1111", "cc-key-beta-2222"]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=keys[0], api_keys=keys)
+        old.scheduler._credits = {key: 100 for key in keys}
+        old.scheduler._last_fetch = time.monotonic()
+        # Mark alpha as 401 disabled
+        old.scheduler.report(keys[0], ok=False, status=401)
+        assert old.scheduler.key_state(keys[0])["state"] == "disabled"
+        assert old.scheduler._usable(keys[0]) is False
+
+        previous = (get_config(), get_client())
+        state_init(cfg, old)
+        new = None
+        try:
+            # Operator adds a third key in the panel
+            new_keys = ["cc-key-alpha-1111", "cc-key-beta-2222", "cc-key-gamma-3333"]
+            cfg.cc_api_key = new_keys
+            _recreate_client(cfg)
+            new = get_client()
+            assert new is not old
+            assert new.scheduler is not None
+
+            # Alpha must remain disabled, not restored to ok
+            assert new.scheduler.key_state(keys[0])["state"] == "disabled"
+            assert new.scheduler.key_state(keys[0])["reason"] == "http_401"
+            assert new.scheduler._usable(keys[0]) is False
+
+            # Beta remains usable
+            assert new.scheduler.key_state(keys[1])["state"] == "ok"
+            assert new.scheduler._usable(keys[1]) is True
+
+            # Newly added key causes last_fetch_time to be None (forcing fresh snapshot on next select)
+            assert new.scheduler.last_fetch_time is None
+        finally:
+            state_init(*previous)
+            await old.aclose()
+            if new is not None:
+                await new.aclose()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_state_survives_2_to_3_and_3_to_2_rebuild(self):
+        """Automatic health, cooling deadline, failures, zero-credits and affinity survive rebuild."""
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        k1, k2, k3 = "key-alpha-1111", "key-beta-2222", "key-gamma-3333"
+        keys = [k1, k2, k3]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=k1, api_keys=keys)
+        sched = old.scheduler
+        assert sched is not None
+
+        # k1: 401 disabled
+        sched.report(k1, ok=False, status=401)
+        # k2: 429 cooling with failure count = 2
+        sched.report(k2, ok=False, status=429, reason="rate_limited")
+        sched.report(k2, ok=False, status=429, reason="rate_limited")
+        k2_until = sched._until[k2]
+        sched._credits[k2] = 0  # zero-credit mark
+        # k3: manual off + sticky session
+        sched.disable(k3)
+        sched._affinity.set("sess:surviving", k2)
+        sched._affinity.set("sess:on-dropped", k3)
+
+        previous = (get_config(), get_client())
+        state_init(cfg, old)
+        new = None
+        try:
+            # 3 -> 2 keys rebuild: drop k3
+            cfg.cc_api_key = [k1, k2]
+            _recreate_client(cfg)
+            new = get_client()
+            new_sched = new.scheduler
+            assert new_sched is not None
+
+            # k1 survived as disabled
+            assert new_sched.key_state(k1)["state"] == "disabled"
+            assert new_sched.key_state(k1)["reason"] == "http_401"
+
+            # k2 survived with cooling deadline, failure count and zero credits
+            assert new_sched.key_state(k2)["state"] == "cooling"
+            assert new_sched.key_state(k2)["failures"] == 2
+            assert new_sched.key_state(k2)["reason"] == "rate_limited"
+            assert new_sched.key_state(k2)["credits"] == 0
+            assert new_sched._until.get(k2) == k2_until
+
+            # k3 (dropped) has no state in new scheduler
+            assert k3 not in new_sched._keys
+            assert k3 not in new_sched._state
+            assert k3 not in new_sched._until
+            assert k3 not in new_sched._failures
+            assert k3 not in new_sched._manual_off
+
+            # Affinity: binding on k2 survived, binding on dropped k3 was discarded
+            assert new_sched._affinity.get_and_refresh("sess:surviving") == k2
+            assert new_sched._affinity.get_and_refresh("sess:on-dropped") is None
+
+            # Objects are deep copies, not shared
+            assert new_sched._state is not sched._state
+            assert new_sched._until is not sched._until
+            assert new_sched._failures is not sched._failures
+            assert new_sched._credits is not sched._credits
+        finally:
+            state_init(*previous)
+            await old.aclose()
+            if new is not None:
+                await new.aclose()
 
 
 class TestDistributionUpdate:

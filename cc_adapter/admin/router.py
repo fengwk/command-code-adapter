@@ -22,7 +22,7 @@ from cc_adapter.core.constants import DEFAULT_DISTRIBUTION, VERSION
 from cc_adapter.command_code.body import make_cc_body, make_config
 from cc_adapter.admin.config_manager import ConfigManager
 from cc_adapter.admin.usage_client import query_all_tokens, query_daily_usage
-from cc_adapter.core.utils import normalize_api_keys
+from cc_adapter.core.utils import api_key_id, mask_api_key, normalize_api_keys
 from cc_adapter.core import log_buffer
 
 router = APIRouter(prefix="/admin/api")
@@ -47,6 +47,7 @@ class ConfigUpdate(BaseModel):
     log_format: str | None = None
     default_model: str | None = None
     distribution: str | None = None
+    zdr: bool | None = None
 
 
 async def verify_auth(authorization: str | None = Header(None)):
@@ -107,6 +108,7 @@ async def get_config_endpoint(_=Depends(verify_auth)):
         "admin_password_configured": bool(cfg and cfg.admin_password),
         "default_model": cfg.default_model if cfg else DEFAULT_MODEL,
         "distribution": _effective_distribution(cfg),
+        "zdr": cfg.zdr if cfg is not None else True,
     }
 
 
@@ -205,10 +207,6 @@ def _key_scheduler():
     return getattr(get_client(), "scheduler", None)
 
 
-def _mask_key(key: str) -> str:
-    return f"****{key[-4:]}" if len(key) >= 4 else "****"
-
-
 @router.get("/keys")
 async def list_keys(_=Depends(verify_auth)):
     """Per-key scheduler state (credits, health, manual switch, bound sessions) for ops."""
@@ -219,7 +217,8 @@ async def list_keys(_=Depends(verify_auth)):
         return {
             "keys": [
                 {
-                    "key": _mask_key(key),
+                    "id": api_key_id(key),
+                    "key": mask_api_key(key),
                     "state": "unmanaged",
                     "until": None,
                     "cooldown_seconds": None,
@@ -233,7 +232,16 @@ async def list_keys(_=Depends(verify_auth)):
                 for key in keys
             ]
         }
-    return {"keys": [{"key": label, **state} for label, state in zip(scheduler.key_labels(), scheduler.states())]}
+    return {
+        "keys": [
+            {
+                "id": api_key_id(key),
+                "key": mask_api_key(key),
+                **scheduler.key_state(key),
+            }
+            for key in scheduler.keys
+        ]
+    }
 
 
 @router.delete("/sessions")
@@ -245,32 +253,35 @@ async def clear_sessions(_=Depends(verify_auth)):
     return {"cleared": cleared}
 
 
-def _scheduler_and_key(suffix: str):
-    """Resolve the active scheduler and one of its keys by suffix (404 otherwise)."""
+def _scheduler_and_key(identifier: str):
+    """Resolve the active scheduler and one of its keys by ID or unique suffix (404 otherwise)."""
     scheduler = _key_scheduler()
     if scheduler is None:
         raise HTTPException(status_code=404, detail="No key scheduler is active")
-    key = scheduler.key_by_suffix(suffix)
+    key = scheduler.key_by_identifier(identifier)
     if key is None:
-        raise HTTPException(status_code=404, detail="Unknown or ambiguous key suffix")
+        raise HTTPException(status_code=404, detail="Unknown or ambiguous key identifier")
     return scheduler, key
 
 
-def _resolve_key_suffix(suffix: str) -> str:
-    """Resolve one configured key from its suffix (404 when unknown or ambiguous).
+def _resolve_key_identifier(identifier: str) -> str:
+    """Resolve one configured key from its ID or unique suffix (404 when unknown or ambiguous).
 
-    The scheduler owns suffix resolution whenever it exists; a pool of a single key
+    The scheduler owns identifier resolution whenever it exists; a pool of a single key
     has no scheduler, so the live config list is used as the fallback there.
     """
     scheduler = _key_scheduler()
     if scheduler is not None:
-        return _scheduler_and_key(suffix)[1]
+        return _scheduler_and_key(identifier)[1]
     cfg = get_config()
     keys = normalize_api_keys(cfg.cc_api_key) if cfg else []
-    suffix = suffix.lstrip("*")
+    for key in keys:
+        if api_key_id(key) == identifier:
+            return key
+    suffix = identifier.lstrip("*")
     matches = [key for key in keys if key.endswith(suffix)]
     if len(matches) != 1:
-        raise HTTPException(status_code=404, detail="Unknown or ambiguous key suffix")
+        raise HTTPException(status_code=404, detail="Unknown or ambiguous key identifier")
     return matches[0]
 
 
@@ -280,22 +291,24 @@ async def _update_key_pool(keys: list[str]) -> None:
     await ConfigManager.apply_config_update({"cc_api_key": keys})
 
 
-@router.post("/keys/{suffix}/enable")
-async def enable_key(suffix: str, _=Depends(verify_auth)):
+@router.post("/keys/{identifier}/enable")
+async def enable_key(identifier: str, _=Depends(verify_auth)):
     """Make one key selectable again: manual off + cooling/disabled + cached balance cleared."""
-    scheduler, key = _scheduler_and_key(suffix)
+    scheduler, key = _scheduler_and_key(identifier)
     scheduler.enable(key)
-    logger.info("admin.key.enabled", key_last4=key[-4:])
-    return {"key": _mask_key(key), **scheduler.key_state(key)}
+    key_id = api_key_id(key)
+    logger.info("admin.key.enabled", key_id=key_id)
+    return {"id": key_id, "key": mask_api_key(key), **scheduler.key_state(key)}
 
 
-@router.post("/keys/{suffix}/disable")
-async def disable_key(suffix: str, _=Depends(verify_auth)):
+@router.post("/keys/{identifier}/disable")
+async def disable_key(identifier: str, _=Depends(verify_auth)):
     """Take one key out of rotation until it is enabled again."""
-    scheduler, key = _scheduler_and_key(suffix)
+    scheduler, key = _scheduler_and_key(identifier)
     unbound = scheduler.disable(key)
-    logger.info("admin.key.disabled", key_last4=key[-4:], unbound_sessions=unbound)
-    return {"key": _mask_key(key), "unbound_sessions": unbound, **scheduler.key_state(key)}
+    key_id = api_key_id(key)
+    logger.info("admin.key.disabled", key_id=key_id, unbound_sessions=unbound)
+    return {"id": key_id, "key": mask_api_key(key), "unbound_sessions": unbound, **scheduler.key_state(key)}
 
 
 class KeyAddRequest(BaseModel):
@@ -324,21 +337,23 @@ async def add_key(req: KeyAddRequest, _=Depends(verify_auth)):
         raise HTTPException(status_code=409, detail="Key already configured")
     keys.append(key)
     await _update_key_pool(keys)
-    logger.info("admin.key.added", key_last4=key[-4:], count=len(keys))
-    return {"key": _mask_key(key), "count": len(keys)}
+    key_id = api_key_id(key)
+    logger.info("admin.key.added", key_id=key_id, count=len(keys))
+    return {"id": key_id, "key": mask_api_key(key), "count": len(keys)}
 
 
-@router.delete("/keys/{suffix}")
-async def remove_key(suffix: str, _=Depends(verify_auth)):
+@router.delete("/keys/{identifier}")
+async def remove_key(identifier: str, _=Depends(verify_auth)):
     """Remove one upstream key: its session bindings go away with it. The last key may go too."""
     cfg = get_config()
     if cfg is None:
         raise HTTPException(status_code=503, detail="Configuration is not available")
-    key = _resolve_key_suffix(suffix)
+    key = _resolve_key_identifier(identifier)
     keys = [existing for existing in normalize_api_keys(cfg.cc_api_key) if existing != key]
     await _update_key_pool(keys)
-    logger.info("admin.key.removed", key_last4=key[-4:], count=len(keys))
-    return {"key": _mask_key(key), "count": len(keys)}
+    key_id = api_key_id(key)
+    logger.info("admin.key.removed", key_id=key_id, count=len(keys))
+    return {"id": key_id, "key": mask_api_key(key), "count": len(keys)}
 
 
 @router.post("/verify-key")
@@ -369,7 +384,11 @@ async def verify_key(_=Depends(verify_auth)):
             break
         result = {"valid": True, "message": "API Key is valid"}
     except Exception as e:
-        result = {"valid": False, "message": str(e)}
+        msg = str(e)
+        for k in keys:
+            if k and k in msg:
+                msg = msg.replace(k, mask_api_key(k))
+        result = {"valid": False, "message": msg}
     finally:
         await test_client.aclose()
     logger.info("admin.verify_key", valid=result["valid"])
