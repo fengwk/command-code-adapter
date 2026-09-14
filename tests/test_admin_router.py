@@ -215,3 +215,107 @@ def test_admin_js_token_manager_saves_full_keys():
     assert "const keyVal = row.dataset.key;" in src
     assert 'codeEl.textContent.replace("...", "")' not in src
     assert 'querySelector("code")' not in src
+
+
+def _init_multi_key_client(keys: list[str]):
+    """Install a client with an active KeyScheduler and pre-filled credits (no HTTP)."""
+    import time
+
+    cfg = AppConfig()
+    cfg.admin_password = "admin123"
+    client = CommandCodeClient(base_url="https://api.example.com", api_key=keys[0], api_keys=keys)
+    client.scheduler._credits = {key: 100 for key in keys}
+    client.scheduler._last_fetch = time.monotonic()
+    admin_state_init(cfg, client)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_list_keys_requires_auth():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/admin/api/keys")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_list_keys_without_scheduler_reports_unmanaged():
+    from cc_adapter.core.auth import generate_token
+
+    cfg = AppConfig()
+    cfg.admin_password = "admin123"
+    cfg.cc_api_key = ["singlekey1234"]
+    admin_state_init(cfg, CommandCodeClient(base_url="https://api.example.com", api_key="singlekey1234"))
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/admin/api/keys", headers={"Authorization": f"Bearer {my_token}"})
+    assert resp.status_code == 200
+    keys = resp.json()["keys"]
+    assert len(keys) == 1
+    assert keys[0]["key"] == "****1234"
+    assert keys[0]["state"] == "unmanaged"
+
+
+@pytest.mark.asyncio
+async def test_list_keys_reports_scheduler_state_and_masks_keys():
+    from cc_adapter.core.auth import generate_token
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl.scheduler.report("key1111", ok=False, status=401)
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/admin/api/keys", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    keys = resp.json()["keys"]
+    assert [entry["key"] for entry in keys] == ["****1111", "****2222"]
+    assert [entry["state"] for entry in keys] == ["disabled", "ok"]
+    assert [entry["credits"] for entry in keys] == [100, 100]
+
+
+@pytest.mark.asyncio
+async def test_clear_sessions_endpoint_drops_bindings():
+    from cc_adapter.core.auth import generate_token
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    await client_impl.scheduler.select("claude:s1", explicit=True)
+    await client_impl.scheduler.select("claude:s2", explicit=True)
+    assert client_impl.scheduler._affinity.stats()["entries"] == 2
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/admin/api/sessions", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"cleared": 2}
+    assert client_impl.scheduler._affinity.stats()["entries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_key_endpoint_clears_health():
+    from cc_adapter.core.auth import generate_token
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl.scheduler.report("key1111", ok=False, status=429)
+    assert client_impl.scheduler.key_state("key1111")["state"] == "cooling"
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/admin/api/keys/1111/reset", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "ok"
+    assert client_impl.scheduler.key_state("key1111")["state"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_reset_key_endpoint_rejects_unknown_suffix():
+    from cc_adapter.core.auth import generate_token
+
+    _init_multi_key_client(["key1111", "key2222"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/admin/api/keys/9999/reset", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 404

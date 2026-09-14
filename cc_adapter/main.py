@@ -39,6 +39,11 @@ async def lifespan(app: FastAPI):
     logger.info("app.start", base=cfg.cc_base_url, port=cfg.port)
     if not cfg.cc_api_key:
         logger.warning("app.start", message="CC_ADAPTER_CC_API_KEY is not set")
+    if not cfg.admin_password:
+        logger.warning(
+            "app.start",
+            message="CC_ADAPTER_ADMIN_PASSWORD is not set — the admin API is unauthenticated",
+        )
 
     # Warm up version check in background (non-blocking)
     from cc_adapter.core.runtime import get_version_checker

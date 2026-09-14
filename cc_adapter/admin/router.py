@@ -52,8 +52,9 @@ class ConfigUpdate(BaseModel):
 async def verify_auth(authorization: str | None = Header(None)):
     cfg = get_config()
     if not cfg or not cfg.admin_password:
-        logger.warning("auth.failed", reason="admin_password_not_configured")
-        raise HTTPException(status_code=503, detail="Admin password is not configured")
+        # No admin password configured: the panel runs unauthenticated
+        # (intranet-only deployments). Matches README "leave blank for no auth".
+        return True
     if not authorization or not authorization.startswith("Bearer "):
         logger.warning("auth.failed", reason="missing_or_malformed_auth_header")
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -177,6 +178,64 @@ async def update_config(update: ConfigUpdate, _=Depends(verify_auth)):
     ConfigManager.update_env_file(update_dict)
     await ConfigManager.apply_config_update(update_dict)
     return await get_config_endpoint()
+
+
+def _key_scheduler():
+    """Scheduler of the active client, or None when fewer than two keys are configured."""
+    from cc_adapter.core.runtime import get_client
+
+    return getattr(get_client(), "scheduler", None)
+
+
+def _mask_key(key: str) -> str:
+    return f"****{key[-4:]}" if len(key) >= 4 else "****"
+
+
+@router.get("/keys")
+async def list_keys(_=Depends(verify_auth)):
+    """Per-key scheduler state (credits, health, bound sessions) for ops."""
+    scheduler = _key_scheduler()
+    if scheduler is None:
+        cfg = get_config()
+        keys = normalize_api_keys(cfg.cc_api_key) if cfg else []
+        return {
+            "keys": [
+                {
+                    "key": _mask_key(key),
+                    "state": "unmanaged",
+                    "until": None,
+                    "reason": None,
+                    "credits": None,
+                    "failures": 0,
+                    "sessions": 0,
+                }
+                for key in keys
+            ]
+        }
+    return {"keys": [{"key": label, **state} for label, state in zip(scheduler.key_labels(), scheduler.states())]}
+
+
+@router.delete("/sessions")
+async def clear_sessions(_=Depends(verify_auth)):
+    """Drop every session-to-key binding (forces fresh routing)."""
+    scheduler = _key_scheduler()
+    cleared = scheduler.clear_sessions() if scheduler is not None else 0
+    logger.info("admin.sessions.cleared", cleared=cleared)
+    return {"cleared": cleared}
+
+
+@router.post("/keys/{suffix}/reset")
+async def reset_key(suffix: str, _=Depends(verify_auth)):
+    """Clear the cooling/disabled state of one key (identified by its suffix)."""
+    scheduler = _key_scheduler()
+    if scheduler is None:
+        raise HTTPException(status_code=404, detail="No key scheduler is active")
+    key = scheduler.key_by_suffix(suffix)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Unknown key suffix")
+    scheduler.reset_key(key)
+    logger.info("admin.key.reset", key_last4=suffix)
+    return {"key": _mask_key(key), **scheduler.key_state(key)}
 
 
 @router.post("/verify-key")
