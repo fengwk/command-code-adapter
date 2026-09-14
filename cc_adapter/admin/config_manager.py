@@ -123,5 +123,8 @@ class ConfigManager:
         if changed_client:
             old = _recreate_client(cfg)
             if old is not None:
-                await old.aclose()
+                # The old client may still be serving streams the routers captured per request;
+                # close its pool only once they finish so a panel save cannot cut a response short.
+                old.schedule_close_when_idle()
+                logger.info("admin.config.client_rebuilt", inflight=old.inflight)
         logger.info("admin.config.updated", fields=list(updates.keys()))

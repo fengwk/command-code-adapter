@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import structlog
 from typing import AsyncGenerator, Any
 
 import httpx
 
-from cc_adapter.core.constants import KEY_COOLDOWN_BASE, KEY_COOLDOWN_MAX, KEY_CREDIT_COOLDOWN
+from cc_adapter.core.constants import (
+    CLIENT_CLOSE_GRACE_SECONDS,
+    KEY_COOLDOWN_BASE,
+    KEY_COOLDOWN_MAX,
+    KEY_CREDIT_COOLDOWN,
+)
 from cc_adapter.core.errors import AdapterError, map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
 from cc_adapter.command_code.body import bind_workspace
 from cc_adapter.command_code.headers import make_cc_headers
@@ -110,6 +116,10 @@ class CommandCodeClient:
         self._max_connections = max_connections
         self._max_keepalive_connections = max_keepalive_connections
         self._http2 = _make_http2_safe(http2)
+        # Streams currently being consumed: a retiring client keeps its pool open for them.
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._close_tasks: set[asyncio.Task[None]] = set()
 
         if api_keys and len(api_keys) > 1:
             from cc_adapter.core.key_scheduler import KeyScheduler
@@ -141,7 +151,56 @@ class CommandCodeClient:
         if self._http_client is not None and self._owns_http_client:
             await self._http_client.aclose()
 
+    @property
+    def inflight(self) -> int:
+        """Number of `generate()` streams currently being consumed."""
+        return self._inflight
+
+    def schedule_close_when_idle(self, *, timeout: float = CLIENT_CLOSE_GRACE_SECONDS) -> asyncio.Task[None]:
+        """Close the pool once every in-flight stream finished, or after ``timeout`` seconds.
+
+        The admin panel rebuilds the client on every save (key add/remove, base URL change),
+        and a stream that is being read at that moment still holds this client: closing the
+        pool underneath it surfaces as a ReadError mid-response. Retire it in the background
+        instead. The returned task is awaited by tests; the set keeps it alive until it ends.
+        """
+        task = asyncio.get_running_loop().create_task(self._close_when_idle(timeout))
+        self._close_tasks.add(task)
+        task.add_done_callback(self._close_tasks.discard)
+        return task
+
+    async def _close_when_idle(self, timeout: float) -> None:
+        if self._inflight:
+            try:
+                await asyncio.wait_for(self._idle.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("client.close_timeout", timeout=timeout, inflight=self._inflight)
+        await self.aclose()
+
     async def generate(
+        self,
+        body: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+        session: SessionSignal | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield the parsed CC SSE events of one request.
+
+        Counting the stream as in-flight keeps a retiring client usable for it: the panel
+        closes the old pool via `schedule_close_when_idle()` after a client rebuild.
+        """
+        self._inflight += 1
+        self._idle.clear()
+        stream = self._stream(body, extra_headers, session)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            self._inflight -= 1
+            if not self._inflight:
+                self._idle.set()
+            await stream.aclose()
+
+    async def _stream(
         self,
         body: dict[str, Any],
         extra_headers: dict[str, str] | None = None,
@@ -190,8 +249,6 @@ class CommandCodeClient:
             headers["x-project-slug"] = project_slug
 
             url = f"{self.base_url}/alpha/generate"
-            # ponytail: debug log — remove after confirming correct model forwarding
-            logger.info("cc.forward", url=url, model=body.get("params", {}).get("model", "MISSING"))
 
             client = self._client()
             try:

@@ -24,6 +24,9 @@ KEY_CREDIT_COOLDOWN: float = 1800.0
 SESSION_AFFINITY_TTL: float = 3600.0
 SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 
+# How long a rebuilt client may keep serving in-flight streams before its pool is closed anyway.
+CLIENT_CLOSE_GRACE_SECONDS: float = 120.0
+
 
 def _load_version() -> str:
     _pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
