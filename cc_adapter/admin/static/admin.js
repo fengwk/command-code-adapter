@@ -812,7 +812,10 @@ async function loadConfig() {
   try {
     const resp = await api("GET", "/admin/api/config");
     configData = await resp.json();
-    document.getElementById("cfg-key").value = configData.cc_api_key;
+    // cc_api_key is a masked summary, never a real key: show it as placeholder and keep the input empty
+    const keyInput = document.getElementById("cfg-key");
+    keyInput.value = "";
+    keyInput.placeholder = configData.cc_api_key ? configData.cc_api_key + " — leave blank to keep" : "";
     document.getElementById("cfg-base-url").value = configData.cc_base_url;
     document.getElementById("cfg-host").value = configData.host;
     document.getElementById("cfg-port").value = configData.port;
@@ -823,7 +826,8 @@ async function loadConfig() {
 
 async function saveConfig() {
   const body = {};
-  const key = document.getElementById("cfg-key").value;
+  const keyInput = document.getElementById("cfg-key");
+  const key = keyInput.value;
   if (key) body.cc_api_key = key;
   const baseUrl = document.getElementById("cfg-base-url").value;
   if (baseUrl !== configData.cc_base_url) body.cc_base_url = baseUrl;
@@ -840,6 +844,9 @@ async function saveConfig() {
     const resp = await api("PUT", "/admin/api/config", body);
     if (!resp.ok) throw new Error(await resp.text());
     configData = await resp.json();
+    // Never echo the refreshed masked summary back into the input
+    keyInput.value = "";
+    keyInput.placeholder = configData.cc_api_key ? configData.cc_api_key + " — leave blank to keep" : "";
     showToast(t("saved"), "success");
   } catch { showToast(t("saveFailed"), "error"); }
 }
