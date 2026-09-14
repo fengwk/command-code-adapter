@@ -132,6 +132,10 @@ class CommandCodeClient:
         self._http2 = _make_http2_safe(http2)
         # Streams currently being consumed: a retiring client keeps its pool open for them.
         self._inflight = 0
+        # The same count per key: the scheduler caps how many streams one upstream
+        # account serves at once (KEY_MAX_CONCURRENT_STREAMS), so it needs to know
+        # which key is currently busy and how busy it is.
+        self._key_inflight: dict[str, int] = {}
         self._idle = asyncio.Event()
         self._close_tasks: set[asyncio.Task[None]] = set()
 
@@ -189,6 +193,25 @@ class CommandCodeClient:
     def inflight(self) -> int:
         """Number of `generate()` streams currently being consumed."""
         return self._inflight
+
+    def key_load(self, key: str) -> int:
+        """Streams this key is serving right now (the scheduler's load source).
+
+        Only the upstream attempt counts: a stream that has not selected a key yet
+        is not charged to one, and the counter is released as soon as the attempt
+        ends (including when a retry moves the stream to another key).
+        """
+        return self._key_inflight.get(key, 0)
+
+    def _acquire_key(self, key: str) -> None:
+        self._key_inflight[key] = self._key_inflight.get(key, 0) + 1
+
+    def _release_key(self, key: str) -> None:
+        remaining = self._key_inflight.get(key, 0) - 1
+        if remaining > 0:
+            self._key_inflight[key] = remaining
+        else:
+            self._key_inflight.pop(key, None)
 
     def schedule_close_when_idle(self, *, timeout: float = CLIENT_CLOSE_GRACE_SECONDS) -> asyncio.Task[None]:
         """Close the pool once every in-flight stream finished, or after ``timeout`` seconds.
@@ -253,8 +276,11 @@ class CommandCodeClient:
         while True:
             if self.scheduler is not None:
                 # Explicit client session identities stick to their key (round robin
-                # for new ones); requests without one go to the first usable key.
-                key = await self.scheduler.select(signal.flag, explicit=signal.explicit, exclude=tried_keys)
+                # for new ones); requests without one go to the first usable key. The
+                # per-key load keeps one account from looking like an unbounded relay.
+                key = await self.scheduler.select(
+                    signal.flag, explicit=signal.explicit, exclude=tried_keys, load=self.key_load
+                )
             else:
                 key = self.api_key
 
@@ -276,16 +302,16 @@ class CommandCodeClient:
             if isinstance(config, dict):
                 bind_workspace(config, identity.project_slug, identity.home_login)
 
-            headers = make_cc_headers(key)
+            headers = make_cc_headers(key, identity=identity, base_url=self.base_url)
             if zdr_downgraded:
                 headers.pop("x-cmd-zdr", None)
-            headers["x-session-id"] = identity.session_id
-            headers["x-project-slug"] = identity.project_slug
 
             url = f"{self.base_url}/alpha/generate"
 
-            # Each attempt uses the pool of the key that serves it.
+            # Each attempt uses the pool of the key that serves it, and is charged to
+            # that key's load until it ends - a retry only occupies the key it moved to.
             client = self._client(key)
+            self._acquire_key(key)
             try:
                 async with client.stream("POST", url, json=body, headers=headers) as response:
                     if response.is_error:
@@ -321,6 +347,8 @@ class CommandCodeClient:
             except httpx.RequestError as e:
                 logger.warning("upstream.error", error_type=e.__class__.__name__, url=url)
                 raise UpstreamError(f"Command Code API request failed: {e.__class__.__name__}")
+            finally:
+                self._release_key(key)
 
     def _report_key_failure(self, key: str, status_code: int, body_text: str, signal: SessionSignal) -> None:
         """Feed a key-level upstream failure back to the scheduler."""

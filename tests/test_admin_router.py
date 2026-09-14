@@ -64,7 +64,8 @@ async def test_get_config_returns_fields():
 
 @pytest.mark.asyncio
 async def test_update_config_uses_first_configured_key_for_client(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    # Pin the panel config file into the temp dir (runtime data lives next to it).
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
@@ -83,7 +84,8 @@ async def test_update_config_uses_first_configured_key_for_client(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_update_config_persists_prefixed_env_keys(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    # Pin the panel config file into the temp dir (runtime data lives next to it).
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
     from cc_adapter.core.auth import generate_token
 
     my_token = generate_token()
@@ -120,7 +122,8 @@ async def test_usage_query_returns_empty_when_no_keys():
 @pytest.mark.asyncio
 async def test_update_config_rejects_masked_key_summary(tmp_path, monkeypatch, caplog):
     """The masked summary returned by GET /admin/api/config must never be persisted as a key."""
-    monkeypatch.chdir(tmp_path)
+    # Pin the panel config file into the temp dir (runtime data lives next to it).
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
     caplog.set_level(logging.WARNING)
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_config
@@ -149,7 +152,8 @@ async def test_update_config_rejects_masked_key_summary(tmp_path, monkeypatch, c
 @pytest.mark.asyncio
 async def test_update_config_accepts_real_key_and_normalizes_pool(tmp_path, monkeypatch):
     """Guard must stay narrow: a genuine key still saves and is normalized into the pool."""
-    monkeypatch.chdir(tmp_path)
+    # Pin the panel config file into the temp dir (runtime data lives next to it).
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_config
 
@@ -171,7 +175,8 @@ async def test_update_config_accepts_real_key_and_normalizes_pool(tmp_path, monk
 @pytest.mark.asyncio
 async def test_update_config_without_key_keeps_existing_pool(tmp_path, monkeypatch):
     """A blank key input is omitted by the frontend, so saving other fields must keep the pool."""
-    monkeypatch.chdir(tmp_path)
+    # Pin the panel config file into the temp dir (runtime data lives next to it).
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(tmp_path / ".env"))
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_config
 

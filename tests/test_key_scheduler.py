@@ -11,6 +11,7 @@ which keeps the tests deterministic and free of arbitrary sleeps.
 import asyncio
 import time
 
+import httpx
 import pytest
 
 from cc_adapter.core import key_scheduler as ks
@@ -21,9 +22,12 @@ from cc_adapter.core.constants import (
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
     KEY_CREDITS_PROBE_SPREAD,
+    KEY_FORBIDDEN_COOLDOWN,
+    KEY_MAX_CONCURRENT_STREAMS,
     SESSION_AFFINITY_TTL,
 )
 from cc_adapter.core.key_scheduler import KeyScheduler, SessionAffinityCache
+from cc_adapter.providers.shared.session_extractor import process_identity
 
 BASE_URL = "https://api.example.com"
 K1, K2, K3 = "cc-key-alpha-1111", "cc-key-beta-2222", "cc-key-gamma-3333"
@@ -61,6 +65,19 @@ def age_affinity(sched: KeyScheduler, sid: str, seconds: float) -> None:
 def expire_cooldown(sched: KeyScheduler, key: str) -> None:
     """Move a cooling window's deadline into the past."""
     sched._until[key] = time.monotonic() - 0.001
+
+
+class _FakeClock:
+    """Stand-in for the `time` module: only `monotonic()` is used by the scheduler."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class TestSessionAffinityCache:
@@ -205,6 +222,155 @@ class TestRoundRobinBindings:
         assert picked == [K1, K3, K1]
 
 
+class TestConcurrencyCap:
+    """`KEY_MAX_CONCURRENT_STREAMS` spreads load over the keys; it never fails a request."""
+
+    @pytest.mark.asyncio
+    async def test_saturated_keys_are_skipped_while_another_key_has_room(self):
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        load = {K1: KEY_MAX_CONCURRENT_STREAMS, K2: 0, K3: 0}
+        assert await sched.select(None, explicit=False, load=load.get) == K2
+        load[K2] = KEY_MAX_CONCURRENT_STREAMS
+        assert await sched.select(None, explicit=False, load=load.get) == K3
+
+    @pytest.mark.asyncio
+    async def test_saturated_keys_are_skipped_for_an_explicit_session_too(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        load = {K1: KEY_MAX_CONCURRENT_STREAMS, K2: 1}
+        assert await sched.select("header:s1", explicit=True, load=load.get) == K2
+
+    @pytest.mark.asyncio
+    async def test_all_keys_saturated_picks_the_least_loaded(self):
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        load = {K1: 9, K2: 5, K3: 7}
+        assert await sched.select(None, explicit=False, load=load.get) == K2
+        assert await sched.select("header:s1", explicit=True, load=load.get) == K2
+
+    @pytest.mark.asyncio
+    async def test_all_saturated_ties_keep_configuration_order(self):
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+
+        def load(key: str) -> int:
+            return KEY_MAX_CONCURRENT_STREAMS
+
+        assert await sched.select(None, explicit=False, load=load) == K1
+        assert await sched.select("header:s1", explicit=True, load=load) == K1
+
+    @pytest.mark.asyncio
+    async def test_a_single_saturated_key_is_still_used(self):
+        """The cap can never turn into "no key": the last resort is the loaded key itself."""
+        sched = make_scheduler([K1], {K1: 100})
+        assert await sched.select(None, explicit=False, load=lambda _: 99) == K1
+
+    @pytest.mark.asyncio
+    async def test_unusable_keys_are_filtered_before_the_load_is_considered(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.report(K1, ok=False, status=401)  # disabled: not a candidate, loaded or not
+        assert await sched.select(None, explicit=False, load=lambda _: KEY_MAX_CONCURRENT_STREAMS) == K2
+
+    @pytest.mark.asyncio
+    async def test_without_a_load_source_the_cap_is_not_applied(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        assert await sched.select(None, explicit=False) == K1
+        assert await sched.select("header:s1", explicit=True) == K1
+
+    @pytest.mark.asyncio
+    async def test_bound_session_stays_on_its_key_while_it_has_room(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "header:busy-session"
+        assert await sched.select(flag, explicit=True) == K1
+        load = {K1: KEY_MAX_CONCURRENT_STREAMS - 1, K2: 0}
+        assert await sched.select(flag, explicit=True, load=load.get) == K1
+        assert sched._affinity.get_and_refresh(flag) == K1
+
+    @pytest.mark.asyncio
+    async def test_saturated_bound_key_is_handled_like_an_unusable_one(self):
+        """The session is rebound, and stays there for its next turn."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "header:blocked-session"
+        assert await sched.select(flag, explicit=True) == K1
+        load = {K1: KEY_MAX_CONCURRENT_STREAMS, K2: 0}
+        assert await sched.select(flag, explicit=True, load=load.get) == K2
+        assert sched._affinity.get_and_refresh(flag) == K2
+        load[K1] = 0
+        assert await sched.select(flag, explicit=True, load=load.get) == K2  # rebind is sticky
+
+
+class TestAffinityCarryOver:
+    """The panel rebuilds the client on every save; running conversations must not move."""
+
+    def test_export_returns_the_bindings_in_lru_order(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched._affinity.set("header:s1", K1)
+        sched._affinity.set("header:s2", K2)
+        assert sched.export_affinity() == [("header:s1", K1), ("header:s2", K2)]
+
+    def test_import_rebinds_sessions_to_configured_keys(self):
+        source = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        source._affinity.set("header:s1", K2)
+        target = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        assert target.import_affinity(source.export_affinity()) == 1
+        assert target._affinity.stats() == {"entries": 1, "bound_by_key": {K2: 1}}
+
+    def test_import_drops_bindings_of_keys_that_are_gone(self):
+        source = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        source._affinity.set("header:kept", K1)
+        source._affinity.set("header:dropped", K2)
+        target = make_scheduler([K1], {K1: 100})
+        assert target.import_affinity(source.export_affinity()) == 1
+        assert target._affinity.get_and_refresh("header:kept") == K1
+        assert target._affinity.get_and_refresh("header:dropped") is None
+
+    def test_imported_bindings_keep_the_sliding_ttl(self):
+        source = make_scheduler([K1], {K1: 100})
+        source._affinity.set("header:s1", K1)
+        target = make_scheduler([K1], {K1: 100})
+        target.import_affinity(source.export_affinity())
+        age_affinity(target, "header:s1", SESSION_AFFINITY_TTL + 1)
+        assert target._affinity.get_and_refresh("header:s1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_session_stays_on_its_key_across_a_rebuild(self):
+        """Assignment survives: without the carry-over the session would move to the head key."""
+        source = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "header:running-conversation"
+        assert await source.select(flag, explicit=True) == K1
+        assert await source.select("header:other", explicit=True) == K2
+        assert source._affinity.get_and_refresh(flag) == K1
+        source.disable(K2)  # panel switched a key off: its session is unbound
+
+        target = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        target.import_affinity(source.export_affinity())
+
+        assert await target.select(flag, explicit=True) == K1  # sticky, not round-robin
+        target.clear_sessions()
+        assert await target.select(flag, explicit=True) == K1  # cold: the head key again
+
+
+class TestCreditsRequestHeaders:
+    """Billing calls are signed like generate calls: process identity + the CLI header set."""
+
+    @pytest.mark.asyncio
+    async def test_credits_call_carries_the_process_identity(self, respx_mock):
+        route = respx_mock.get(f"{BASE_URL}/alpha/billing/credits").mock(
+            return_value=httpx.Response(
+                200, json={"credits": {"monthlyCredits": 5, "purchasedCredits": 2, "freeCredits": 0}}
+            )
+        )
+        sched = KeyScheduler(keys=[K1], base_url=BASE_URL)
+        assert await sched._fetch_credits(K1) == 7
+
+        headers = route.calls.last.request.headers
+        identity = process_identity(K1)
+        assert headers["x-session-id"] == identity.session_id
+        assert headers["x-project-slug"] == identity.project_slug
+        assert headers["Authorization"] == f"Bearer {K1}"
+        # the header set replaces httpx's defaults instead of stacking on top of them
+        assert headers["user-agent"] == "cli"
+        assert headers["accept-encoding"] == "gzip, deflate"
+        assert headers["host"] == "api.example.com"
+
+
 class TestSessionAffinity:
     @pytest.mark.asyncio
     async def test_bound_session_keeps_its_key_when_a_priority_key_recovers(self):
@@ -322,18 +488,69 @@ class TestReport:
         assert state["credits"] is None
         assert state["until"] is None
 
-    @pytest.mark.parametrize("status", [401, 403])
-    def test_auth_status_disables_key_and_unbinds_sessions(self, status):
+    def test_401_disables_key_and_unbinds_sessions(self):
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
         sched._affinity.set("header:s1", K1)
         sched._affinity.set("header:s2", K1)
         sched._affinity.set("header:s3", K2)
-        sched.report(K1, ok=False, status=status)
+        sched.report(K1, ok=False, status=401)
         state = sched.key_state(K1)
         assert state["state"] == "disabled"
-        assert state["reason"] == f"http_{status}"
+        assert state["reason"] == "http_401"
         assert state["until"] is None
         assert sched._affinity.stats() == {"entries": 1, "bound_by_key": {K2: 1}}
+
+    def test_bare_403_cools_the_key_down_for_two_hours(self):
+        """A policy denial is not a revoked key: park it instead of disabling it forever."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched._affinity.set("header:s1", K1)
+        sched._affinity.set("header:s2", K2)
+        sched.report(K1, ok=False, status=403, session_flag="header:s1")
+
+        state = sched.key_state(K1)
+        assert state["state"] == "cooling"
+        assert state["reason"] == "http_403"
+        assert state["cooldown_seconds"] == pytest.approx(KEY_FORBIDDEN_COOLDOWN, abs=1.0)
+        # the session that hit the denial is unbound (like every other cooldown path),
+        # sessions on other keys stay untouched
+        assert sched._affinity.get_and_refresh("header:s1") is None
+        assert sched._affinity.get_and_refresh("header:s2") == K2
+        # next request moves to the healthy key ...
+        assert asyncio.run(sched.select(None, explicit=False)) == K2
+        # ... and comes back to the cooled key once the window is over
+        expire_cooldown(sched, K1)
+        assert asyncio.run(sched.select(None, explicit=False)) == K1
+
+    def test_bare_403_cooldown_expires_with_the_clock(self, monkeypatch):
+        """Same as above, driven by a fake clock instead of rewriting the deadline."""
+        clock = _FakeClock(time.monotonic())
+        monkeypatch.setattr(ks, "time", clock)
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.report(K1, ok=False, status=403)
+        assert asyncio.run(sched.select(None, explicit=False)) == K2
+        clock.advance(KEY_FORBIDDEN_COOLDOWN - 1)
+        assert asyncio.run(sched.select(None, explicit=False)) == K2  # still cooling
+        clock.advance(2)
+        assert asyncio.run(sched.select(None, explicit=False)) == K1  # window passed
+
+    def test_403_with_invalid_key_reason_still_disables(self):
+        """Only an explicit invalid-key report is permanent for a 403."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched._affinity.set("header:s1", K1)
+        sched.report(K1, ok=False, status=403, reason="invalid_key")
+        state = sched.key_state(K1)
+        assert state["state"] == "disabled"
+        assert state["reason"] == "invalid_key"
+        assert state["until"] is None
+        assert sched._affinity.get_and_refresh("header:s1") is None
+
+    def test_forbidden_cooldown_does_not_touch_the_failure_counter(self):
+        """The 403 window is flat: it neither escalates nor resets a rate-limit counter."""
+        sched = make_scheduler([K1], {K1: 100})
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
+        sched.report(K1, ok=False, status=403)
+        assert sched.key_state(K1)["failures"] == 1
+        assert sched.key_state(K1)["cooldown_seconds"] == pytest.approx(KEY_FORBIDDEN_COOLDOWN, abs=1.0)
 
     def test_invalid_key_reason_disables_key(self):
         sched = make_scheduler([K1], {K1: 100})
@@ -478,7 +695,7 @@ class TestSelectExcludeAndFailFast:
     async def test_returns_none_when_every_key_is_disabled(self):
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
         sched.report(K1, ok=False, status=401)
-        sched.report(K2, ok=False, status=403)
+        sched.report(K2, ok=False, status=403, reason="invalid_key")
         assert await sched.select(None, explicit=False) is None
         assert await sched.select("header:s1", explicit=True) is None
 

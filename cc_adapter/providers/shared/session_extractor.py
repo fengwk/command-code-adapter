@@ -37,6 +37,16 @@ per key, and a shared name also shares the forged commit list (the commits deriv
 from the slug), which is exactly what two people on similarly named repositories
 look like.
 
+Non-generate calls
+------------------
+The real CLI signs *every* authed call with the identity it derived at startup, so
+its billing/credits/whoami/usage requests carry `x-session-id` and `x-project-slug`
+as well. Those calls have no conversation to anchor on, so the adapter feeds a
+per-process random generation value through the same `derive()`:
+`process_identity(cmd_key)` returns a `sess_<16hex>` id plus a slug from that key's
+palette, stable for the lifetime of the server process and different after a
+restart - which mirrors "one CLI process, one session id".
+
 Session identity extraction (CLIProxyAPI-style priority chain)
 -------------------------------------------------------------
 `SessionExtractor.extract()` walks the inbound request from the most explicit
@@ -87,6 +97,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Any
 
@@ -260,6 +271,23 @@ _USER_ID_SESSION_PATTERN = re.compile(r"session_([0-9a-fA-F][0-9a-fA-F-]{7,})")
 
 _MAX_VALUE_LENGTH = 200
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+_PROCESS_GENERATION: str = secrets.token_hex(8)
+
+
+def process_identity(cmd_key: str) -> SessionIdentity:
+    """Forged identity of one key's *process*, for the calls that carry no conversation.
+
+    The real CLI signs every authed call with the session id it derived once at
+    startup, so billing/credits/whoami/usage requests carry ``x-session-id`` and
+    ``x-project-slug`` just like ``/alpha/generate`` does. A long-running server has
+    no such startup, so the per-process value is drawn once per process (stable while
+    the process lives, different after a restart) and fed through the same
+    ``derive()`` as the conversation identities: a ``sess_<16hex>`` id plus a slug
+    from that key's own palette, nothing new to keep in sync.
+    """
+    return get_session_extractor().derive(f"process:{_PROCESS_GENERATION}", cmd_key)
 
 
 def is_valid_cmd_session_id(value: str) -> bool:

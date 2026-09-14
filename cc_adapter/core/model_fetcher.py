@@ -15,7 +15,7 @@ import httpx
 import structlog
 
 from cc_adapter.core.config import data_dir
-from cc_adapter.core.constants import NPM_URL, NPM_CACHE_TTL, NPM_ERROR_BACKOFF
+from cc_adapter.core.constants import NPM_URL, NPM_CACHE_TTL, NPM_ERROR_BACKOFF, NPM_FETCH_HEADERS
 
 logger = structlog.get_logger(__name__)
 
@@ -161,7 +161,8 @@ class ModelFetcher:
     async def _fetch_and_update(self, force: bool = False) -> None:
         self._last_error = None
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            # NPM_FETCH_HEADERS replaces httpx's own defaults (a "python-httpx/..." user agent).
+            async with httpx.AsyncClient(timeout=15.0, headers=NPM_FETCH_HEADERS) as client:
                 resp = await client.get(NPM_URL)
                 resp.raise_for_status()
                 npm_data = resp.json()
@@ -180,7 +181,7 @@ class ModelFetcher:
             if not tarball_url:
                 raise ValueError("no tarball URL in npm response")
 
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, headers=NPM_FETCH_HEADERS) as client:
                 tarball_resp = await client.get(tarball_url)
                 tarball_resp.raise_for_status()
 

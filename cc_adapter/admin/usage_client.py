@@ -9,6 +9,7 @@ import httpx
 
 from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.core.utils import mask_api_key
+from cc_adapter.providers.shared.session_extractor import process_identity
 
 logger = structlog.get_logger(__name__)
 
@@ -24,7 +25,9 @@ PLAN_NAMES = {
 
 
 async def query_token_usage(base_url: str, api_key: str, timeout: float = 15.0) -> dict:
-    headers = make_cc_headers(api_key)
+    # The real CLI signs whoami/usage/billing with the same per-process session id as
+    # its generate calls, so these carry x-session-id and x-project-slug too.
+    headers = make_cc_headers(api_key, identity=process_identity(api_key), base_url=base_url)
 
     result: dict = {"token": mask_api_key(api_key), "label": "", "ok": False, "error": None}
 
@@ -184,7 +187,7 @@ def _sub_models(a: list[dict], b: list[dict]) -> list[dict]:
 async def query_daily_usage(
     base_url: str, api_key: str, start_date: date_type, end_date: date_type, timeout: float = 30.0
 ) -> list[dict[str, Any]]:
-    headers = make_cc_headers(api_key)
+    headers = make_cc_headers(api_key, identity=process_identity(api_key), base_url=base_url)
     boundaries: list[date_type] = []
     current = start_date
     while current <= end_date:

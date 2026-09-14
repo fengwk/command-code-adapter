@@ -27,6 +27,14 @@ KEY_COOLDOWN_MAX: float = 1800.0
 # Flat cooldown for a key the upstream reported as out of credits: the balance
 # cannot recover by itself, so short retries only waste upstream calls.
 KEY_CREDIT_COOLDOWN: float = 1800.0
+# Flat cooldown for a bare 403 (policy/region/abuse denial). Such a denial is not a
+# revoked key, so it must not disable the key forever - but retrying it right away
+# is just as wrong, hence one long window instead.
+KEY_FORBIDDEN_COOLDOWN: float = 7200.0
+# Upper bound of concurrent streams one upstream account may serve. One account that
+# answers an unbounded number of simultaneous requests looks like a relay, not like a
+# developer's CLI; the scheduler spreads the excess over the other usable keys.
+KEY_MAX_CONCURRENT_STREAMS: int = 4
 SESSION_AFFINITY_TTL: float = 3600.0
 SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 
@@ -52,3 +60,14 @@ def _load_version() -> str:
 
 
 VERSION: str = _load_version()
+
+# The npm registry fetches are not the disguised upstream, but the registry should
+# still not see httpx's own defaults (a "python-httpx/..." user agent): these four
+# keys replace exactly the headers httpx would otherwise prepend to a request that
+# carries no CC header set.
+NPM_FETCH_HEADERS: dict[str, str] = {
+    "accept": "*/*",
+    "accept-encoding": "gzip, deflate",
+    "connection": "keep-alive",
+    "user-agent": f"cc-adapter/{VERSION}",
+}

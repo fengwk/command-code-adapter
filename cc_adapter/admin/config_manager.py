@@ -44,14 +44,17 @@ def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
 
     old = get_client()
     new = create_client(cfg)
-    # The rebuilt client gets a fresh scheduler, so carry the operator's manual off-switch over:
-    # a panel save (adding a key, editing the base URL) must not re-enable a key turned off on purpose.
+    # The rebuilt client gets a fresh scheduler, so carry the operator's manual off-switch and the
+    # session -> key bindings over: a panel save (adding a key, editing the base URL) must neither
+    # re-enable a key turned off on purpose nor drag every running conversation to another account.
     new_scheduler = getattr(new, "scheduler", None)
     old_scheduler = getattr(old, "scheduler", None)
     if new_scheduler is not None and old_scheduler is not None:
         for key in old_scheduler.manual_disabled_keys():
             if key in cfg.cc_api_key:
                 new_scheduler.disable(key)
+        # Bindings of a key that is gone from the new list are dropped inside the import.
+        new_scheduler.import_affinity(old_scheduler.export_affinity())
     state_init(cfg, new)
     return old
 

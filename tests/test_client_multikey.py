@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import httpx
@@ -5,6 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from cc_adapter.command_code.client import CommandCodeClient
+from cc_adapter.core.constants import KEY_MAX_CONCURRENT_STREAMS
 from cc_adapter.core.errors import AdapterError, AuthenticationError, UpstreamError
 
 
@@ -594,3 +596,174 @@ class TestSessionAffinityRouting:
         sent_body, sent_headers = captured[0]
         assert sent_headers["x-project-slug"] == sent_body["config"]["workingDir"].rsplit("/", 1)[-1]
         assert sent_body["config"]["recentCommits"]
+
+
+def _blocking_stream(gate: asyncio.Event, started: asyncio.Event | None = None, *, on_start=None):
+    """`httpx.AsyncClient.stream` stand-in that holds the response open until `gate` is set."""
+
+    class BlockingResponse:
+        is_error = False
+        status_code = None
+
+        async def aiter_lines(self):
+            if started is not None:
+                started.set()
+            if on_start is not None:
+                on_start()
+            await gate.wait()
+            yield '{"type":"finish","finishReason":"end_turn"}'
+
+        async def aread(self):
+            return b""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    def _stream(method, url, json, headers, **kwargs):
+        return BlockingResponse()
+
+    return _stream
+
+
+async def _drain(client, body: dict, headers: dict | None = None) -> None:
+    async for _ in client.generate(body, headers):
+        pass
+
+
+class TestPerKeyConcurrency:
+    """In-flight streams are counted per key, and the scheduler caps one account's load."""
+
+    def _client(self, keys: list[str] | None = None):
+        keys = keys or ["key1", "key2"]
+        client = CommandCodeClient(base_url="https://api.example.com", api_key=keys[0], api_keys=keys)
+        client.scheduler._credits = {key: 100 for key in keys}
+        client.scheduler._last_fetch = time.monotonic()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_key_load_counts_the_stream_that_is_being_consumed(self):
+        client = self._client()
+        gate, started = asyncio.Event(), asyncio.Event()
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=_blocking_stream(gate, started)):
+            task = asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert client.key_load("key1") == 1
+            assert client.key_load("key2") == 0
+            gate.set()
+            await asyncio.wait_for(task, timeout=5)
+
+        assert client.key_load("key1") == 0
+        assert client.inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_key_load_is_released_when_a_stream_fails_mid_way(self):
+        client = self._client()
+
+        class ExplodingResponse:
+            is_error = False
+            status_code = None
+
+            async def aiter_lines(self):
+                yield '{"type":"text-delta","text":"hi"}'
+                raise RuntimeError("stream broke")
+
+            async def aread(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=lambda *a, **kw: ExplodingResponse()):
+            with pytest.raises(RuntimeError):
+                async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                    pass
+
+        assert client.key_load("key1") == 0
+        assert client.inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_retry_charges_only_the_key_it_moved_to(self, error_response_402):
+        client = self._client()
+        gate, started = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        def mock_stream(method, url, json, headers, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return error_response_402
+            return _blocking_stream(gate, started)(method, url, json, headers, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            task = asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert client.key_load("key1") == 0  # the failed attempt released its key
+            assert client.key_load("key2") == 1
+            gate.set()
+            await asyncio.wait_for(task, timeout=5)
+
+        assert client.key_load("key2") == 0
+
+    @pytest.mark.asyncio
+    async def test_a_key_at_the_cap_hands_new_streams_to_another_key(self):
+        """KEY_MAX_CONCURRENT_STREAMS in action: the 5th stream leaves a 4-stream key."""
+        client = self._client()
+        gate = asyncio.Event()
+        all_busy = asyncio.Event()
+        overflow_routed = asyncio.Event()
+        started = 0
+        used_keys: list[str] = []
+
+        def on_start():
+            nonlocal started
+            started += 1
+            if started == KEY_MAX_CONCURRENT_STREAMS:
+                all_busy.set()
+
+        def mock_stream(method, url, json, headers, **kwargs):
+            used_keys.append(headers["Authorization"].split()[1])
+            if len(used_keys) > KEY_MAX_CONCURRENT_STREAMS:
+                overflow_routed.set()
+            return _blocking_stream(gate, on_start=on_start)(method, url, json, headers, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            tasks = [
+                asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+                for _ in range(KEY_MAX_CONCURRENT_STREAMS)
+            ]
+            await asyncio.wait_for(all_busy.wait(), timeout=5)
+            assert client.key_load("key1") == KEY_MAX_CONCURRENT_STREAMS
+            # the saturated key is skipped: the next stream goes to the other account
+            overflow = asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+            await asyncio.wait_for(overflow_routed.wait(), timeout=5)
+            assert used_keys == ["key1"] * KEY_MAX_CONCURRENT_STREAMS + ["key2"]
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(*tasks, overflow), timeout=5)
+
+        assert client.key_load("key1") == 0
+        assert client.key_load("key2") == 0
+
+    @pytest.mark.asyncio
+    async def test_every_key_saturated_still_serves_the_request(self):
+        """The cap must never turn into a failure: the least loaded key takes one more."""
+        client = self._client(keys=["key1", "key2"])
+        # Both keys are above the cap already (as if four long streams each were running).
+        client._key_inflight = {"key1": KEY_MAX_CONCURRENT_STREAMS + 3, "key2": KEY_MAX_CONCURRENT_STREAMS}
+        used_keys: list[str] = []
+
+        def mock_stream(method, url, json, headers, **kwargs):
+            used_keys.append(headers["Authorization"].split()[1])
+            return _sse_ok()
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                pass
+
+        assert used_keys == ["key2"]  # least loaded, even though both are at the cap

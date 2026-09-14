@@ -10,6 +10,7 @@ from cc_adapter.admin.usage_client import (
     query_all_tokens,
     query_daily_usage,
 )
+from cc_adapter.providers.shared.session_extractor import process_identity
 
 
 @pytest.fixture
@@ -192,6 +193,67 @@ class TestQueryTokenUsage:
 
         assert result["ok"] is True
         assert "usage" not in result
+
+
+class TestProcessIdentityHeaders:
+    """Every authed call is signed like the real CLI signs it: same session id, same project."""
+
+    @pytest.mark.asyncio
+    async def test_whoami_usage_and_billing_carry_the_process_identity(self, base_url, api_key):
+        identity = process_identity(api_key)
+        with respx.mock(base_url=base_url) as mock:
+            whoami = mock.get("/alpha/whoami").mock(
+                return_value=httpx.Response(200, json={"name": "U", "email": "u@e.com", "org": {"id": "o1"}})
+            )
+            usage = mock.get("/alpha/usage/summary", params={"since": "1970-01-01T00:00:00Z"}).mock(
+                return_value=httpx.Response(200, json={"totalCost": 1.0, "totalCount": 2})
+            )
+            credits = mock.get("/alpha/billing/credits", params={"orgId": "o1"}).mock(
+                return_value=httpx.Response(200, json={"credits": {"monthlyCredits": 3}})
+            )
+            subscriptions = mock.get("/alpha/billing/subscriptions", params={"orgId": "o1"}).mock(
+                return_value=httpx.Response(200, json={"success": True, "data": {"planId": "individual-go"}})
+            )
+
+            result = await query_token_usage(base_url, api_key)
+
+        assert result["ok"] is True
+        for route in (whoami, usage, credits, subscriptions):
+            assert route.called, "every authed call of the CLI sends the session headers"
+            headers = route.calls.last.request.headers
+            assert headers["x-session-id"] == identity.session_id
+            assert headers["x-project-slug"] == identity.project_slug
+            assert headers["Authorization"] == f"Bearer {api_key}"
+            # the CC header set replaces httpx's own defaults (no library fingerprint)
+            assert headers["user-agent"] == "cli"
+            assert headers["host"] == "api.commandcode.ai"
+
+    @pytest.mark.asyncio
+    async def test_every_key_gets_its_own_process_identity(self, base_url):
+        keys = ["key-one", "key-two"]
+        with respx.mock(base_url=base_url) as mock:
+            whoami = mock.get("/alpha/whoami").mock(return_value=httpx.Response(401, json={"error": "unauthorized"}))
+
+            await query_all_tokens(base_url, keys)
+
+        sent = {call.request.headers["x-session-id"] for call in whoami.calls}
+        assert sent == {process_identity("key-one").session_id, process_identity("key-two").session_id}
+        assert process_identity("key-one").session_id != process_identity("key-two").session_id
+
+    @pytest.mark.asyncio
+    async def test_daily_usage_queries_reuse_one_process_identity(self, base_url, api_key):
+        """All snapshots of one report come from the same forged process, not one per call."""
+        identity = process_identity(api_key)
+        with respx.mock(base_url=base_url) as mock:
+            route = mock.get("/alpha/usage/summary").mock(
+                return_value=httpx.Response(200, json={"totalCost": 1.0, "totalCount": 2, "models": []})
+            )
+
+            await query_daily_usage(base_url, api_key, date(2025, 1, 1), date(2025, 1, 2))
+
+        assert len(route.calls) > 1
+        assert {call.request.headers["x-session-id"] for call in route.calls} == {identity.session_id}
+        assert {call.request.headers["x-project-slug"] for call in route.calls} == {identity.project_slug}
 
 
 class TestQueryAllTokens:

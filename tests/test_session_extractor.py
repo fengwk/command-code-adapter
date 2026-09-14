@@ -11,6 +11,7 @@ from cc_adapter.core.constants import PROJECT_SLUGS_PER_ACCOUNT_MAX, PROJECT_SLU
 from cc_adapter.providers.anthropic.models import AnthropicRequest
 from cc_adapter.providers.openai.models import ChatCompletionRequest
 from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
+from cc_adapter.providers.shared import session_extractor
 from cc_adapter.providers.shared.session_extractor import (
     _HOME_LOGIN_POOL,
     _PROJECT_SLUG_POOL,
@@ -19,6 +20,7 @@ from cc_adapter.providers.shared.session_extractor import (
     SessionSignal,
     get_session_extractor,
     is_valid_cmd_session_id,
+    process_identity,
 )
 
 # Claude Code sends `user_<hash>_account_<uuid>_session_<uuid>` in metadata.
@@ -536,6 +538,54 @@ class TestIdentityPools:
         identities = [SessionExtractor().derive(flag, "key1") for flag in flags]
         assert len({identity.session_id for identity in identities}) == 64
         assert len({identity.home_login for identity in identities}) == 1
+
+
+class TestProcessIdentity:
+    """Non-generate calls (billing/usage/whoami) are signed with a per-process identity.
+
+    The real CLI keeps one `sess_<16hex>` for the lifetime of its process and attaches it
+    to every authed call, so those calls carry the same shape of identity - derived from a
+    per-process random generation value plus the key.
+    """
+
+    def test_identity_is_stable_within_one_generation(self):
+        assert process_identity("key1") == process_identity("key1")
+        assert process_identity("key1").session_id == process_identity("key1").session_id
+
+    def test_identity_has_the_cmd_session_shape(self):
+        identity = process_identity("key1")
+        assert re.fullmatch(r"sess_[0-9a-f]{16}", identity.session_id)
+        assert is_valid_cmd_session_id(identity.session_id)
+
+    def test_identity_changes_when_the_process_generation_changes(self, monkeypatch):
+        """A restart draws a new generation, so the forged process gets a new session id."""
+        monkeypatch.setattr(session_extractor, "_PROCESS_GENERATION", "generation-a")
+        first = process_identity("key1")
+        assert process_identity("key1") == first  # stable while the generation lives
+        monkeypatch.setattr(session_extractor, "_PROCESS_GENERATION", "generation-b")
+        second = process_identity("key1")
+        assert second.session_id != first.session_id
+
+    def test_identity_slug_and_login_come_from_the_keys_own_palette(self):
+        extractor = SessionExtractor()
+        palette = {extractor.derive(f"msg:flag{i}", "key1").project_slug for i in range(200)}
+        identity = process_identity("key1")
+        assert identity.project_slug in palette
+        assert identity.project_slug in _PROJECT_SLUG_POOL
+        # one upstream key is still one forged machine
+        assert identity.home_login == extractor.derive("msg:any", "key1").home_login
+        assert process_identity("key2").home_login == extractor.derive("msg:any", "key2").home_login
+
+    def test_identity_is_key_scoped(self):
+        extractor = SessionExtractor()
+        key2_palette = {extractor.derive(f"msg:flag{i}", "key2").project_slug for i in range(200)}
+        assert process_identity("key1").session_id != process_identity("key2").session_id
+        assert process_identity("key2").project_slug in key2_palette
+
+    def test_identity_is_not_a_conversation_identity(self):
+        """The process identity must not collide with the derive() namespace of a session flag."""
+        extractor = SessionExtractor()
+        assert process_identity("key1").session_id != extractor.derive("msg:", "key1").session_id
 
 
 class TestSessionExtractorSingleton:

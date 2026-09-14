@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,64 @@ class TestRecreateClient:
             assert new.scheduler.key_state(keys[0])["enabled"] is True
         finally:
             state_init(*previous)  # do not leave this fixture client in the runtime singleton
+
+    @pytest.mark.asyncio
+    async def test_session_bindings_carry_over_to_the_rebuilt_client(self):
+        """A panel save must not drag running conversations to another upstream account."""
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, init as state_init
+
+        keys = ["cc-key-alpha-1111", "cc-key-beta-2222"]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=keys[0], api_keys=keys)
+        old.scheduler._credits = {key: 100 for key in keys}
+        old.scheduler._last_fetch = time.monotonic()
+        sticky = "header:running-conversation"
+        assert await old.scheduler.select(sticky, explicit=True) == keys[0]
+        assert await old.scheduler.select("header:second", explicit=True) == keys[1]
+        state_init(cfg, old)
+        previous = (cfg, old)
+        try:
+            _recreate_client(cfg)  # same key list, fresh client
+            new = get_client()
+            assert new is not old
+            new.scheduler._credits = {key: 100 for key in keys}  # no balance fetch in this test
+            new.scheduler._last_fetch = time.monotonic()
+            # Both bindings survived, so the round-robin head does not steal them
+            assert await new.scheduler.select(sticky, explicit=True) == keys[0]
+            assert await new.scheduler.select("header:second", explicit=True) == keys[1]
+            assert new.scheduler.key_state(keys[0])["sessions"] == 1
+        finally:
+            state_init(*previous)
+
+    @pytest.mark.asyncio
+    async def test_bindings_of_a_removed_key_are_dropped(self):
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, init as state_init
+
+        keys = ["cc-key-alpha-1111", "cc-key-beta-2222", "cc-key-gamma-3333"]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=keys[0], api_keys=keys)
+        old.scheduler._credits = {key: 100 for key in keys}
+        old.scheduler._last_fetch = time.monotonic()
+        moved = "header:on-the-dropped-key"
+        assert await old.scheduler.select(moved, explicit=True) == keys[0]
+        assert await old.scheduler.select("header:stays", explicit=True) == keys[1]
+        state_init(cfg, old)
+        previous = (cfg, old)
+        try:
+            cfg.cc_api_key = [keys[1], keys[2]]  # the panel removed the key the session was bound to
+            _recreate_client(cfg)
+            new = get_client()
+            new.scheduler._credits = {key: 100 for key in cfg.cc_api_key}
+            new.scheduler._last_fetch = time.monotonic()
+            assert new.scheduler._affinity.get_and_refresh(moved) is None
+            assert new.scheduler._affinity.get_and_refresh("header:stays") == keys[1]
+            assert await new.scheduler.select(moved, explicit=True) == keys[1]
+        finally:
+            state_init(*previous)
 
 
 class TestFieldMap:

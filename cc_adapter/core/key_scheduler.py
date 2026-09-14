@@ -4,12 +4,17 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
 
 * per-key health (``ok`` / ``cooling`` / ``disabled``): rate limits escalate
   ``KEY_COOLDOWN_BASE`` → ``KEY_COOLDOWN_MAX``, an out-of-credits key is parked
-  for a flat ``KEY_CREDIT_COOLDOWN`` (30 min) with its cached balance zeroed;
+  for a flat ``KEY_CREDIT_COOLDOWN`` (30 min) with its cached balance zeroed, and a
+  bare 403 (a policy denial, not a revoked key) parks the key for
+  ``KEY_FORBIDDEN_COOLDOWN`` instead of disabling it forever. Only a 401 or an
+  explicit ``invalid_key`` reason disables a key permanently;
 * credits-aware usability (a key with known zero credits is not usable);
 * per-session bindings, sticky for as long as the session keeps talking (sliding
   TTL), so every turn of one conversation stays on the same upstream account -
   including conversations the adapter only knows by their content anchor, which
-  would otherwise be dragged to another account whenever the head key changes;
+  would otherwise be dragged to another account whenever the head key changes.
+  ``export_affinity()`` / ``import_affinity()`` carry those bindings across the
+  client rebuild the admin panel performs on every save;
 * fill-first first assignment (first usable key) for conversations without an
   explicit session identity, round-robin for the ones that carry one;
 * a manual per-key on/off switch for the admin panel (``disable()`` /
@@ -17,6 +22,11 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
   health, and turning it back on clears the automatic health/credit marks so the
   key is usable immediately. Automatic cooldowns keep running independently of
   the manual switch.
+
+``select()`` also takes an optional per-key load source (the client's in-flight
+stream counter): a key at ``KEY_MAX_CONCURRENT_STREAMS`` is skipped while any
+usable key has room, and when every usable key is saturated the least loaded one
+takes the stream - the cap spreads load, it never rejects a request.
 
 ``select()`` blocks only on the very first credits fetch; later calls use the
 currently known state and refresh the credits cache in the background.
@@ -27,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import httpx
@@ -40,9 +51,12 @@ from cc_adapter.core.constants import (
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
     KEY_CREDITS_PROBE_SPREAD,
+    KEY_FORBIDDEN_COOLDOWN,
+    KEY_MAX_CONCURRENT_STREAMS,
     SESSION_AFFINITY_MAX_ENTRIES,
     SESSION_AFFINITY_TTL,
 )
+from cc_adapter.providers.shared.session_extractor import process_identity
 
 logger = structlog.get_logger(__name__)
 
@@ -113,6 +127,10 @@ class SessionAffinityCache:
             self._entries.pop(sid, None)
         return len(sids)
 
+    def entries(self) -> list[tuple[str, str]]:
+        """``(session, key)`` snapshot in LRU order (least recently used first)."""
+        return [(sid, bound) for sid, (bound, _) in self._entries.items()]
+
     def clear(self) -> int:
         count = len(self._entries)
         self._entries.clear()
@@ -157,13 +175,32 @@ class KeyScheduler:
 
     # ------------------------------------------------------------------ select
 
-    async def select(self, session_flag: str | None, *, explicit: bool, exclude: set[str] | None = None) -> str | None:
+    async def select(
+        self,
+        session_flag: str | None,
+        *,
+        explicit: bool,
+        exclude: set[str] | None = None,
+        load: Callable[[str], int] | None = None,
+    ) -> str | None:
         """Pick the key for one request.
 
         `explicit` only decides how a conversation is *distributed on first sight*
         (round-robin for a client-provided identity, fill-first for a content
         anchor); either way the choice is remembered, so a conversation never
         bounces between accounts after its key recovers from a cooldown.
+
+        `load` is the caller's in-flight stream counter (`None` - the default -
+        disables the concurrency cap, which keeps the scheduler usable on its own):
+        a key at `KEY_MAX_CONCURRENT_STREAMS` is skipped while any usable key is
+        below the cap, and when *every* usable key is saturated the least loaded one
+        takes the stream instead of failing the request. The cap is a fairness
+        guard, never a reason to reject traffic.
+
+        Stickiness across the cap: a bound session keeps its key while that key is
+        below the cap; a saturated bound key is handled like an unusable one, so the
+        session is rebound to a key with room (or, with everything saturated, lands
+        on the least loaded key).
         """
         await self._ensure_credits()
         skip = exclude or set()
@@ -175,17 +212,31 @@ class KeyScheduler:
             # burning another upstream call on a key known to be unusable.
             return None
 
+        saturated = False
+        if load is not None:
+            below_cap = [key for key in usable if load(key) < KEY_MAX_CONCURRENT_STREAMS]
+            if below_cap:
+                usable = below_cap
+            else:
+                # Every usable key already carries the maximum number of streams:
+                # honouring the cap would have to fail the request, so the least
+                # loaded key takes one more (ties keep configuration order).
+                usable = sorted(usable, key=load)
+                saturated = True
+
         if session_flag:
             bound = self._affinity.get_and_refresh(session_flag)
-            if bound is not None and bound in usable:
+            if bound is not None and bound in usable and not saturated:
                 logger.info("key.select", session=session_flag[:8], key=bound[-4:], reason="sticky")
                 return bound
             # First sight of a conversation. A client-provided identity rotates
             # through the ring; a content-anchored one keeps the fill-first
             # behaviour, yet is bound from now on: without the binding every
             # conversation would follow the head key's cooldown and back, so one
-            # conversation would show up under two accounts over and over.
-            chosen = self._next_round_robin(usable) if explicit else usable[0]
+            # conversation would show up under two accounts over and over. While
+            # every key is saturated the least loaded key wins directly, since ring
+            # rotation would ignore the load order.
+            chosen = usable[0] if (saturated or not explicit) else self._next_round_robin(usable)
             self._affinity.set(session_flag, chosen)
             logger.info("key.bind", session=session_flag[:8], key=chosen[-4:], explicit=explicit)
             return chosen
@@ -237,12 +288,31 @@ class KeyScheduler:
             "at": time.monotonic(),
         }
 
-        if status in (401, 403) or reason == "invalid_key":
+        if status == 401 or reason == "invalid_key":
             self._state[key] = STATE_DISABLED
             self._until.pop(key, None)
             self._reason[key] = _reason_text(reason, status)
             unbound = self._affinity.delete_by_key(key)
             logger.info("key.disabled", key=key[-4:], status=status, reason=self._reason[key], sessions=unbound)
+            return
+
+        if status == 403:
+            # A bare 403 (no "invalid_key" reason) is a policy denial - region, abuse
+            # heuristic, temporarily blocked caller - not a revoked key, so it must not
+            # disable the account forever. Park it for one long window instead of
+            # hammering a call the upstream keeps refusing.
+            self._state[key] = STATE_COOLING
+            self._until[key] = time.monotonic() + KEY_FORBIDDEN_COOLDOWN
+            self._reason[key] = _reason_text(reason, status)
+            unbound = self._affinity.compare_and_delete(session_flag, key)
+            logger.info(
+                "key.cooldown",
+                key=key[-4:],
+                status=status,
+                reason=self._reason[key],
+                cooldown=KEY_FORBIDDEN_COOLDOWN,
+                unbound=unbound,
+            )
             return
 
         if status in (402, 429) or reason == "insufficient_credits":
@@ -378,6 +448,29 @@ class KeyScheduler:
         """Keys the operator switched off (a copy), for carrying the switch across a rebuild."""
         return set(self._manual_off)
 
+    def export_affinity(self) -> list[tuple[str, str]]:
+        """``(session, key)`` bindings, for carrying stickiness across a client rebuild."""
+        return self._affinity.entries()
+
+    def import_affinity(self, items: Iterable[tuple[str, str]]) -> int:
+        """Re-bind exported sessions; returns how many were imported.
+
+        A binding to a key that is not configured any more is dropped: the rebuilt
+        scheduler can never select that key, so keeping the entry would only pin the
+        session to an unusable key until its TTL expires. The TTL/eviction rules of
+        the cache are untouched - imported bindings start a fresh sliding window.
+        """
+        allowed = set(self._keys)
+        imported = 0
+        for sid, key in items:
+            if key not in allowed:
+                continue
+            self._affinity.set(sid, key)
+            imported += 1
+        if imported:
+            logger.info("key.affinity_imported", sessions=imported)
+        return imported
+
     def reset_key(self, key: str) -> None:
         """Clear cooling/disabled health and the cached zero-credit mark.
 
@@ -469,7 +562,9 @@ class KeyScheduler:
             await asyncio.sleep(self._probe_offset(api_key))
 
     async def _fetch_credits(self, api_key: str) -> int | None:
-        headers = make_cc_headers(api_key)
+        # Billing calls of the real CLI are signed with the same per-process session
+        # id as its generate calls, so they carry x-session-id and x-project-slug too.
+        headers = make_cc_headers(api_key, identity=process_identity(api_key), base_url=self._base_url)
         async with httpx.AsyncClient(timeout=10.0, base_url=self._base_url) as client:
             r = await client.get("/alpha/billing/credits", headers=headers)
             r.raise_for_status()
