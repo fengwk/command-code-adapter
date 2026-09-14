@@ -16,6 +16,11 @@ NPM_ERROR_BACKOFF: int = 60
 KEY_CREDITS_CACHE_TTL: int = 1800
 KEY_CREDITS_ERROR_BACKOFF: int = 60
 
+KEY_COOLDOWN_BASE: float = 60.0
+KEY_COOLDOWN_MAX: float = 1800.0
+SESSION_AFFINITY_TTL: float = 3600.0
+SESSION_AFFINITY_MAX_ENTRIES: int = 4096
+
 
 def _load_version() -> str:
     _pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
