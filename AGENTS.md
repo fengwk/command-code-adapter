@@ -31,6 +31,8 @@ docker compose up -d                  # docker-compose.yml + optional docker-com
 | `GET /admin/api/models` | `admin/router.py` (public listing, no auth) | none |
 | `POST /admin/api/models/refresh` | `admin/router.py` | admin auth |
 | `GET /admin/api/keys` | `admin/router.py` (per-key scheduler state + manual switch) | admin auth |
+| `POST /admin/api/keys` | `admin/router.py` (add one upstream key) | admin auth |
+| `DELETE /admin/api/keys/{suffix}` | `admin/router.py` (remove one upstream key) | admin auth |
 | `DELETE /admin/api/sessions` | `admin/router.py` (drop session→key bindings) | admin auth |
 | `POST /admin/api/keys/{suffix}/enable` | `admin/router.py` (switch key on: clears manual off + cooling/disabled + cached balance) | admin auth |
 | `POST /admin/api/keys/{suffix}/disable` | `admin/router.py` (switch key off: never selected, unbinds its sessions) | admin auth |
@@ -47,7 +49,7 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 
 | Env var | Default | Notes |
 |---|---|---|
-| `CC_ADAPTER_CC_API_KEY` | — | `str \| list[str]` — JSON array: `["k1","k2"]` |
+| `CC_ADAPTER_CC_API_KEY` | — | `str \| list[str]` — JSON array: `["k1","k2"]`. Optional: the panel's key management (`POST /admin/api/keys`, `DELETE /admin/api/keys/{suffix}`) writes the pool into `CC_ADAPTER_ENV_FILE`, and the service starts without any key (requests then fail with `AuthenticationError`). |
 | `CC_ADAPTER_ACCESS_KEY` | — | Bearer token auth (all endpoints) |
 | `CC_ADAPTER_CC_BASE_URL` | `https://api.commandcode.ai` | |
 | `CC_ADAPTER_DEFAULT_MODEL` | `deepseek/deepseek-v4-flash` | |
@@ -65,6 +67,8 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). |
+
+- **Keys are managed from the panel**: add/remove an upstream key at runtime (persisted into `CC_ADAPTER_ENV_FILE`, client rebuilt in-process, no restart) — nothing has to be injected as `CC_ADAPTER_CC_API_KEY`, and a zero-key startup is valid (requests fail with the client's own `AuthenticationError`). The Keys tab is the only key editor: the Configuration tab just reports `cc_api_key_count` and links there, and the Usage tab's token dialog adds keys through `POST /admin/api/keys` (it never rewrites the pool).
 
 ## Architecture
 

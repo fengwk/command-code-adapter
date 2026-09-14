@@ -540,6 +540,17 @@ class TestManualSwitch:
         assert f"****{K1[-4:]} disabled by admin" in summary
         assert f"****{K2[-4:]} ok (out of credits)" in summary
 
+    def test_manual_disabled_keys_reports_the_switch_read_only(self):
+        """The accessor feeds the client rebuild, so callers must not be able to mutate the switch."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        assert sched.manual_disabled_keys() == set()
+        sched.disable(K2)
+        assert sched.manual_disabled_keys() == {K2}
+        sched.manual_disabled_keys().add(K1)  # a copy: the scheduler is unaffected
+        assert sched.manual_disabled_keys() == {K2}
+        sched.enable(K2)
+        assert sched.manual_disabled_keys() == set()
+
 
 class TestCreditsPlumbing:
     @pytest.mark.asyncio

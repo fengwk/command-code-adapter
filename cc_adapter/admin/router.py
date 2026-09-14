@@ -81,7 +81,10 @@ async def login(req: LoginRequest):
 async def get_config_endpoint(_=Depends(verify_auth)):
     cfg = get_config()
     return {
+        # The key pool is managed by the Keys tab; this stays a masked summary (never a real key)
+        # and the count is exposed separately so the UI does not have to parse it.
         "cc_api_key": f"{len(cfg.cc_api_key)} key(s) configured" if cfg and cfg.cc_api_key else "",
+        "cc_api_key_count": len(cfg.cc_api_key) if cfg else 0,
         "cc_base_url": cfg.cc_base_url if cfg else "",
         "host": cfg.host if cfg else "",
         "port": cfg.port if cfg else 8080,
@@ -238,6 +241,30 @@ def _scheduler_and_key(suffix: str):
     return scheduler, key
 
 
+def _resolve_key_suffix(suffix: str) -> str:
+    """Resolve one configured key from its suffix (404 when unknown or ambiguous).
+
+    The scheduler owns suffix resolution whenever it exists; a pool of a single key
+    has no scheduler, so the live config list is used as the fallback there.
+    """
+    scheduler = _key_scheduler()
+    if scheduler is not None:
+        return _scheduler_and_key(suffix)[1]
+    cfg = get_config()
+    keys = normalize_api_keys(cfg.cc_api_key) if cfg else []
+    suffix = suffix.lstrip("*")
+    matches = [key for key in keys if key.endswith(suffix)]
+    if len(matches) != 1:
+        raise HTTPException(status_code=404, detail="Unknown or ambiguous key suffix")
+    return matches[0]
+
+
+async def _update_key_pool(keys: list[str]) -> None:
+    """Persist the pool to the panel config file, then hot-apply it to the running process."""
+    ConfigManager.update_env_file({"cc_api_key": keys})
+    await ConfigManager.apply_config_update({"cc_api_key": keys})
+
+
 @router.post("/keys/{suffix}/enable")
 async def enable_key(suffix: str, _=Depends(verify_auth)):
     """Make one key selectable again: manual off + cooling/disabled + cached balance cleared."""
@@ -254,6 +281,49 @@ async def disable_key(suffix: str, _=Depends(verify_auth)):
     unbound = scheduler.disable(key)
     logger.info("admin.key.disabled", key_last4=key[-4:], unbound_sessions=unbound)
     return {"key": _mask_key(key), "unbound_sessions": unbound, **scheduler.key_state(key)}
+
+
+class KeyAddRequest(BaseModel):
+    key: str
+
+
+@router.post("/keys")
+async def add_key(req: KeyAddRequest, _=Depends(verify_auth)):
+    """Add one upstream key: persisted to the panel config file and selectable right away.
+
+    A local key is a single token: reject pasted JSON arrays or line breaks instead of
+    storing them as a bogus pool entry; use PUT /config for bulk edits.
+    """
+    key = req.key.strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Key must not be empty")
+    if any(char.isspace() for char in key):
+        raise HTTPException(status_code=400, detail="Key must not contain whitespace")
+    if len(key) > 512:
+        raise HTTPException(status_code=400, detail="Key must not exceed 512 characters")
+    cfg = get_config()
+    if cfg is None:
+        raise HTTPException(status_code=503, detail="Configuration is not available")
+    keys = list(normalize_api_keys(cfg.cc_api_key))
+    if key in keys:
+        raise HTTPException(status_code=409, detail="Key already configured")
+    keys.append(key)
+    await _update_key_pool(keys)
+    logger.info("admin.key.added", key_last4=key[-4:], count=len(keys))
+    return {"key": _mask_key(key), "count": len(keys)}
+
+
+@router.delete("/keys/{suffix}")
+async def remove_key(suffix: str, _=Depends(verify_auth)):
+    """Remove one upstream key: its session bindings go away with it. The last key may go too."""
+    cfg = get_config()
+    if cfg is None:
+        raise HTTPException(status_code=503, detail="Configuration is not available")
+    key = _resolve_key_suffix(suffix)
+    keys = [existing for existing in normalize_api_keys(cfg.cc_api_key) if existing != key]
+    await _update_key_pool(keys)
+    logger.info("admin.key.removed", key_last4=key[-4:], count=len(keys))
+    return {"key": _mask_key(key), "count": len(keys)}
 
 
 @router.post("/verify-key")

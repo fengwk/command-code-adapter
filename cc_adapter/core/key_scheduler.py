@@ -358,6 +358,10 @@ class KeyScheduler:
         self.reset_key(key)
         logger.info("key.admin_enabled", key=key[-4:])
 
+    def manual_disabled_keys(self) -> set[str]:
+        """Keys the operator switched off (a copy), for carrying the switch across a rebuild."""
+        return set(self._manual_off)
+
     def reset_key(self, key: str) -> None:
         """Clear cooling/disabled health and the cached zero-credit mark.
 

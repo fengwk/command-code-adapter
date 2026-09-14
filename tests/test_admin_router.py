@@ -55,6 +55,7 @@ async def test_get_config_returns_fields():
     assert resp.status_code == 200
     data = resp.json()
     assert "cc_api_key" in data
+    assert "cc_api_key_count" in data
     assert "cc_base_url" in data
     assert "host" in data
     assert "port" in data
@@ -191,15 +192,29 @@ async def test_update_config_without_key_keeps_existing_pool(tmp_path, monkeypat
     assert "configured" not in env_content
 
 
-def test_admin_js_shows_key_summary_only_as_placeholder():
-    """Static guard: the masked summary is rendered as a placeholder, never as the input value."""
+def test_admin_js_config_page_defers_keys_to_keys_tab():
+    """Static guard: the config form no longer edits the key pool (the Keys tab owns it)."""
     from pathlib import Path
 
     src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
-    assert 'getElementById("cfg-key").value = configData.cc_api_key' not in src
-    assert "keyInput.placeholder = configData.cc_api_key" in src
-    # loadConfig and saveConfig both leave the input empty
-    assert src.count('keyInput.value = ""') >= 2
+    # No key input on the config form, and the save payload never carries cc_api_key
+    assert 'id="cfg-key"' not in src
+    assert "body.cc_api_key =" not in src
+    assert '"cfg-key-count"' in src
+    assert 'document.getElementById("cfg-manage-keys").onclick = () => switchTab("keys")' in src
+    # The masked summary is never rendered as a value anywhere
+    assert "cc_api_key_count" in src
+
+
+def test_admin_js_token_manager_adds_without_rewriting_the_pool():
+    """Static guard: the token dialog adds keys one by one; it must not overwrite the pool."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    assert 'api("POST", "/admin/api/keys", { key: token })' in src
+    assert "tokenManagerEmpty" in src
+    # Nothing in the panel rewrites cc_api_key through PUT /config any more
+    assert 'api("PUT", "/admin/api/config", { cc_api_key' not in src
 
 
 def test_admin_js_token_manager_saves_full_keys():
@@ -219,15 +234,27 @@ def test_admin_js_token_manager_saves_full_keys():
 
 def _init_multi_key_client(keys: list[str]):
     """Install a client with an active KeyScheduler and pre-filled credits (no HTTP)."""
+    return _init_pool_client(keys)[1]
+
+
+def _init_pool_client(keys: list[str]):
+    """Install a live config + client for any pool size, credits pre-filled (no HTTP)."""
     import time
 
     cfg = AppConfig()
     cfg.admin_password = "admin123"
-    client = CommandCodeClient(base_url="https://api.example.com", api_key=keys[0], api_keys=keys)
-    client.scheduler._credits = {key: 100 for key in keys}
-    client.scheduler._last_fetch = time.monotonic()
+    cfg.cc_api_key = list(keys)
+    cfg.cc_base_url = "https://api.example.com"
+    client = CommandCodeClient(
+        base_url=cfg.cc_base_url,
+        api_key=keys[0] if keys else "",
+        api_keys=keys if len(keys) > 1 else None,
+    )
+    if client.scheduler is not None:
+        client.scheduler._credits = {key: 100 for key in keys}
+        client.scheduler._last_fetch = time.monotonic()
     admin_state_init(cfg, client)
-    return client
+    return cfg, client
 
 
 def _stub_refresh(monkeypatch):
@@ -400,3 +427,260 @@ async def test_list_keys_reports_the_manual_switch_fields():
     assert [entry["enabled"] for entry in keys] == [True, False]
     assert [entry["manual"] for entry in keys] == [False, True]
     assert [entry["cooldown_seconds"] for entry in keys] == [None, None]
+
+
+@pytest.fixture
+def panel_env(tmp_path, monkeypatch):
+    """Panel config file inside a temp dir: key management must never touch the repo's real .env."""
+    target = tmp_path / "panel.env"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CC_ADAPTER_ENV_FILE", str(target))
+    return target
+
+
+@pytest.mark.asyncio
+async def test_add_key_appends_persists_and_applies_to_the_running_client(panel_env, caplog):
+    """POST /keys: the key lands in the live pool, in the rebuilt client and in the config file."""
+    caplog.set_level(logging.INFO)
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(["key1111"])  # one key: no scheduler yet
+    assert client_before.scheduler is None
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": "key5678"}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "****5678", "count": 2}
+    assert get_config().cc_api_key == ["key1111", "key5678"]
+    rebuilt = get_client()
+    assert rebuilt is not client_before  # rebuilt, so the new key is selectable right away
+    assert rebuilt.scheduler._keys == ["key1111", "key5678"]
+    assert 'CC_ADAPTER_CC_API_KEY=["key1111", "key5678"]' in panel_env.read_text()
+    added = [r for r in caplog.records if "admin.key.added" in str(r.message)]
+    assert len(added) == 1
+    assert "5678" in str(added[0].message) and "count" in str(added[0].message)
+
+
+@pytest.mark.asyncio
+async def test_add_key_accepts_the_512_character_boundary(panel_env):
+    """Boundary: 512 characters is still accepted (513 is rejected, see the limits test)."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_config
+
+    _init_pool_client(["key1111"])
+    longest = "k" * 512
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": longest}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 200
+    assert get_config().cc_api_key == ["key1111", longest]
+
+
+@pytest.mark.asyncio
+async def test_add_key_rejects_a_key_already_in_the_pool(panel_env):
+    """A duplicate would put the same upstream account in the rotation twice (compared stripped)."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(["key1111", "key2222"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": " key2222 "}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "Key already configured"
+    assert get_config().cc_api_key == ["key1111", "key2222"]
+    assert get_client() is client_before  # nothing rebuilt
+    assert not panel_env.exists()  # nothing persisted
+
+
+@pytest.mark.parametrize(
+    "value,detail",
+    [
+        ("   ", "Key must not be empty"),
+        ("key 1111", "Key must not contain whitespace"),
+        ('["key1", "key2"]', "Key must not contain whitespace"),  # pasted JSON array
+        ("key\n1111", "Key must not contain whitespace"),  # pasted line break
+        ("k" * 513, "Key must not exceed 512 characters"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_add_key_rejects_blank_whitespace_and_oversized_values(panel_env, value, detail):
+    """Malformed input is refused before anything is applied or persisted."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(["key1111"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": value}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert get_config().cc_api_key == ["key1111"]
+    assert get_client() is client_before
+    assert not panel_env.exists()
+
+
+@pytest.mark.asyncio
+async def test_add_key_reports_missing_config(monkeypatch):
+    """Without a live config there is nothing to update, so report it instead of half-applying."""
+    import cc_adapter.admin.router as admin_router_module
+    from cc_adapter.core.auth import generate_token
+
+    monkeypatch.setattr(admin_router_module, "get_config", lambda: None)
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": "key1111"}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Configuration is not available"
+
+
+@pytest.mark.asyncio
+async def test_remove_key_drops_it_from_pool_client_and_config_file(panel_env, caplog):
+    """DELETE /keys/{suffix}: the key leaves the pool and the config file, bindings included."""
+    caplog.set_level(logging.INFO)
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(["key1111", "key2222"])
+    await client_before.scheduler.select("claude:s1", explicit=True)  # binds key1111
+    await client_before.scheduler.select("claude:s2", explicit=True)  # binds key2222
+    assert client_before.scheduler.key_state("key2222")["sessions"] == 1
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/admin/api/keys/2222", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "****2222", "count": 1}
+    assert get_config().cc_api_key == ["key1111"]
+    env_content = panel_env.read_text()
+    assert 'CC_ADAPTER_CC_API_KEY=["key1111"]' in env_content
+    assert "key2222" not in env_content
+    rebuilt = get_client()
+    assert rebuilt is not client_before  # rebuilt without the removed key and its bindings
+    assert rebuilt.scheduler is None
+    assert rebuilt.api_key == "key1111"
+    removed = [r for r in caplog.records if "admin.key.removed" in str(r.message)]
+    assert len(removed) == 1
+    assert "2222" in str(removed[0].message) and "count" in str(removed[0].message)
+
+
+@pytest.mark.asyncio
+async def test_remove_key_resolves_a_single_key_pool_without_a_scheduler(panel_env):
+    """A one-key pool has no scheduler, so the config list is the resolution fallback."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(["only1234"])
+    assert client_before.scheduler is None
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/admin/api/keys/1234", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "****1234", "count": 0}
+    assert get_config().cc_api_key == []
+
+
+@pytest.mark.asyncio
+async def test_removing_the_last_key_leaves_a_supported_empty_pool(panel_env):
+    """Zero keys stays valid: the adapter keeps running and reports the CC error path itself."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _init_pool_client(["only1234"])
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/admin/api/keys/1234", headers={"Authorization": f"Bearer {my_token}"})
+        again = await client.delete("/admin/api/keys/1234", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "****1234", "count": 0}
+    assert get_config().cc_api_key == []
+    assert "CC_ADAPTER_CC_API_KEY=[]" in panel_env.read_text()
+    empty_client = get_client()
+    assert empty_client.api_key == ""
+    assert empty_client.scheduler is None
+    # Requests still fail with the client's own "not configured" error.
+    assert "CC_ADAPTER_CC_API_KEY is not configured" in str(empty_client._no_key_error())
+    assert again.status_code == 404
+    assert again.json()["detail"] == "Unknown or ambiguous key suffix"
+
+
+@pytest.mark.parametrize(
+    "keys,suffix",
+    [
+        (["key1111", "key2222"], "9999"),  # unknown suffix, scheduler active
+        (["aaa-7777", "bbb-7777"], "7777"),  # ambiguous suffix, scheduler active
+        (["only1234"], "9999"),  # single-key pool: no scheduler, config-list fallback
+    ],
+)
+@pytest.mark.asyncio
+async def test_remove_key_rejects_unresolvable_suffixes(panel_env, keys, suffix):
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client, get_config
+
+    _, client_before = _init_pool_client(keys)
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/admin/api/keys/{suffix}", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Unknown or ambiguous key suffix"
+    assert get_config().cc_api_key == keys
+    assert get_client() is client_before
+    assert not panel_env.exists()
+
+
+@pytest.mark.asyncio
+async def test_manual_off_survives_the_client_rebuild(panel_env):
+    """A panel save rebuilds the client; a key the operator switched off must stay off."""
+    import time
+
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import get_client
+
+    _, client_before = _init_pool_client(["key1111", "key2222"])
+    client_before.scheduler.disable("key1111")  # off, so it must not come back at the head
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/keys", json={"key": "key3333"}, headers={"Authorization": f"Bearer {my_token}"}
+        )
+
+    assert resp.status_code == 200
+    rebuilt = get_client()
+    assert rebuilt is not client_before
+    scheduler = rebuilt.scheduler
+    assert scheduler.manual_disabled_keys() == {"key1111"}
+    assert scheduler.key_state("key1111")["manual"] is True
+    assert scheduler.key_state("key1111")["enabled"] is False
+    # Seeded instead of fetched: select() must not go to the network in tests.
+    scheduler._credits = {key: 100 for key in ["key1111", "key2222", "key3333"]}
+    scheduler._last_fetch = time.monotonic()
+    assert await scheduler.select(None, explicit=False) == "key2222"

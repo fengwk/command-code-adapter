@@ -43,7 +43,16 @@ def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
     from cc_adapter.core.runtime import get_client, init as state_init, create_client
 
     old = get_client()
-    state_init(cfg, create_client(cfg))
+    new = create_client(cfg)
+    # The rebuilt client gets a fresh scheduler, so carry the operator's manual off-switch over:
+    # a panel save (adding a key, editing the base URL) must not re-enable a key turned off on purpose.
+    new_scheduler = getattr(new, "scheduler", None)
+    old_scheduler = getattr(old, "scheduler", None)
+    if new_scheduler is not None and old_scheduler is not None:
+        for key in old_scheduler.manual_disabled_keys():
+            if key in cfg.cc_api_key:
+                new_scheduler.disable(key)
+    state_init(cfg, new)
     return old
 
 

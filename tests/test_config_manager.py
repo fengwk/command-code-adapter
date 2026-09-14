@@ -95,6 +95,34 @@ class TestUpdateEnvFile:
             assert "CC_ADAPTER_LOG_LEVEL=DEBUG" in content
 
 
+class TestRecreateClient:
+    """The panel rebuilds the client on every client-field change; the manual switch is operator intent."""
+
+    def test_manual_off_carries_over_for_keys_still_configured(self):
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, init as state_init
+
+        keys = ["cc-key-alpha-1111", "cc-key-beta-2222", "cc-key-gamma-3333"]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=keys[0], api_keys=keys)
+        old.scheduler.disable(keys[1])
+        old.scheduler.disable(keys[2])
+        state_init(cfg, old)
+        previous = (cfg, old)
+        try:
+            cfg.cc_api_key = [keys[0], keys[1]]  # the panel dropped the third key
+            assert _recreate_client(cfg) is old
+            new = get_client()
+            assert new is not old
+            # Only keys still configured come back off; the dropped one is simply gone.
+            assert new.scheduler.manual_disabled_keys() == {keys[1]}
+            assert new.scheduler.key_state(keys[1])["enabled"] is False
+            assert new.scheduler.key_state(keys[0])["enabled"] is True
+        finally:
+            state_init(*previous)  # do not leave this fixture client in the runtime singleton
+
+
 class TestFieldMap:
     def test_field_map_covers_key_fields(self):
         for field in [

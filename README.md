@@ -43,7 +43,7 @@ docker compose up -d
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `CC_ADAPTER_CC_API_KEY` | — | Command Code API Key（必填） |
+| `CC_ADAPTER_CC_API_KEY` | — | Command Code API Key（可选，见下） |
 | `CC_ADAPTER_CC_BASE_URL` | `https://api.commandcode.ai` | CC API 地址 |
 | `CC_ADAPTER_HOST` | `0.0.0.0` | 监听地址 |
 | `CC_ADAPTER_PORT` | `8080` | 监听端口 |
@@ -75,6 +75,8 @@ volumes:
 
 两点注意：① 不要用单文件挂载 `/app/.env`——面板的原子写入（临时文件 + `rename`）在单文件挂载上会报 `EBUSY`；② 环境变量优先级高于该文件，想让某个字段"由面板管理"，就不要再用环境变量注入它（否则重启后被环境变量覆盖）。
 
+**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。
+
 ### 多 Key 路由
 
 配置多个 Key（`CC_ADAPTER_CC_API_KEY=["k1","k2"]`）时，适配器按"会话粘性 + 首可用优先"分配上游 Key：
@@ -84,7 +86,7 @@ volumes:
 - Key 故障自动切换：401/403 直接禁用该 Key；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
 - 所有 Key 都不可用时**不再消耗上游调用**，直接返回最后一个 Key 的失败信息（附各 Key 状态摘要）。
 - 手动开关：面板可单独把某个 Key 关掉/打开。关掉后该 Key **永不被选中**（无视其额度与健康状态），其绑定的会话立即解绑并在下次请求切到其他 Key；打开后**立即可用**（清除手动标记与冷却/禁用状态、丢弃已缓存的余额并后台刷新），充值后用它恢复即可。自动冷却逻辑与手动开关互不影响。
-- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数（含 `enabled`/`manual`/`cooldown_seconds`），`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/disable` 关闭某个 Key，`POST /admin/api/keys/{后四位}/enable` 打开（解除冷却/禁用并清除余额缓存）。
+- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数（含 `enabled`/`manual`/`cooldown_seconds`），`POST /admin/api/keys` 新增一个 Key，`DELETE /admin/api/keys/{后四位}` 删除一个 Key，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/disable` 关闭某个 Key，`POST /admin/api/keys/{后四位}/enable` 打开（解除冷却/禁用并清除余额缓存）。
 
 ### 日志
 
@@ -269,7 +271,7 @@ docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CC_ADAPTER_CC_API_KEY` | — | Command Code API Key (required) |
+| `CC_ADAPTER_CC_API_KEY` | — | Command Code API Key (optional, see below) |
 | `CC_ADAPTER_CC_BASE_URL` | `https://api.commandcode.ai` | CC API base URL |
 | `CC_ADAPTER_HOST` | `0.0.0.0` | Listen address |
 | `CC_ADAPTER_PORT` | `8080` | Listen port |
@@ -301,6 +303,8 @@ volumes:
 
 Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel's atomic rewrite (temp file + `rename`) fails with `EBUSY` on a single-file mount; (2) environment variables outrank that file, so a field you want the panel to manage must not be injected as an environment variable.
 
+**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool).
+
 ### Multi-key routing
 
 With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adapter assigns upstream keys by session stickiness plus first-usable fallback:
@@ -310,7 +314,7 @@ With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adap
 - Failures fail over automatically: 401/403 disables a key, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
 - When every key is unusable the adapter makes **no further upstream call** and returns the last key's failure together with a per-key state summary.
 - Manual switch: the panel can turn an individual key off/on. Off means the key is **never selected** (regardless of its credits or health) and its bound sessions are unbound immediately, so the next turn moves to another key; on makes it **immediately selectable** (manual mark plus cooling/disabled state cleared, cached balance dropped and refreshed in the background), which is the way to restore a key right after a top-up. Automatic cooldowns keep working independently of the switch.
-- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key, plus `enabled`/`manual`/`cooldown_seconds`), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/disable` (take a key out of rotation), `POST /admin/api/keys/{last4}/enable` (clear manual off + cooling/disabled + cached balance).
+- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key, plus `enabled`/`manual`/`cooldown_seconds`), `POST /admin/api/keys` (add a key), `DELETE /admin/api/keys/{last4}` (remove a key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/disable` (take a key out of rotation), `POST /admin/api/keys/{last4}/enable` (clear manual off + cooling/disabled + cached balance).
 
 ### Logging
 
