@@ -94,6 +94,16 @@ def _make_http2_safe(http2: bool) -> bool:
 
 
 class CommandCodeClient:
+    """Streaming CC client that keeps one httpx pool per upstream key.
+
+    A keep-alive connection carries the ``Authorization`` header of the key that
+    opened it, so a pool shared by every key would let the upstream link two keys
+    through TCP/TLS connection reuse. Each key therefore owns its own
+    ``httpx.AsyncClient`` (own sockets, own multiplexing scope): HTTP/1.1 stays the
+    default, and with ``http2=True`` every key multiplexes its streams over its own
+    connection instead of sharing one connection across keys.
+    """
+
     def __init__(
         self,
         base_url: str,
@@ -111,8 +121,12 @@ class CommandCodeClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
-        self._http_client = http_client
+        # A caller-supplied client (tests, custom transports) is shared by every
+        # key, which bypasses the per-key connection isolation.
+        self._injected_http_client = http_client
         self._owns_http_client = http_client is None
+        # Per-key pools, created lazily on first use of each key.
+        self._pools: dict[str, httpx.AsyncClient] = {}
         self._max_connections = max_connections
         self._max_keepalive_connections = max_keepalive_connections
         self._http2 = _make_http2_safe(http2)
@@ -134,9 +148,19 @@ class CommandCodeClient:
         else:
             self.scheduler = None
 
-    def _client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
+    def _client(self, key: str) -> httpx.AsyncClient:
+        """Return the httpx pool of ``key``, creating it on first use.
+
+        Each key gets its own pool so keep-alive connections never carry another
+        key's Authorization header. An injected ``http_client`` is returned for
+        every key instead and is never owned (nor closed) by this client.
+        """
+        if self._injected_http_client is not None and not self._injected_http_client.is_closed:
+            return self._injected_http_client
+
+        pool = self._pools.get(key)
+        if pool is None or pool.is_closed:
+            pool = httpx.AsyncClient(
                 timeout=self.timeout,
                 limits=httpx.Limits(
                     max_connections=self._max_connections,
@@ -144,12 +168,22 @@ class CommandCodeClient:
                 ),
                 http2=self._http2,
             )
+            self._pools[key] = pool
             self._owns_http_client = True
-        return self._http_client
+        return pool
 
     async def aclose(self) -> None:
-        if self._http_client is not None and self._owns_http_client:
-            await self._http_client.aclose()
+        """Close every pool this client owns.
+
+        Pools are created per key and are always owned; a caller-supplied
+        ``http_client`` is shared by every key and stays open for its owner.
+        """
+        if not self._owns_http_client:
+            return
+        pools = list(self._pools.values())
+        self._pools.clear()
+        for pool in pools:
+            await pool.aclose()
 
     @property
     def inflight(self) -> int:
@@ -236,21 +270,22 @@ class CommandCodeClient:
 
             tried_keys.add(key)
 
-            session_id, project_slug = extractor.derive(signal.flag, key)
+            identity = extractor.derive(signal.flag, key)
             # Keep the forged cwd consistent with the slug sent as x-project-slug.
             config = body.get("config")
             if isinstance(config, dict):
-                bind_workspace(config, project_slug)
+                bind_workspace(config, identity.project_slug, identity.home_login)
 
             headers = make_cc_headers(key)
             if zdr_downgraded:
                 headers.pop("x-cmd-zdr", None)
-            headers["x-session-id"] = session_id
-            headers["x-project-slug"] = project_slug
+            headers["x-session-id"] = identity.session_id
+            headers["x-project-slug"] = identity.project_slug
 
             url = f"{self.base_url}/alpha/generate"
 
-            client = self._client()
+            # Each attempt uses the pool of the key that serves it.
+            client = self._client(key)
             try:
                 async with client.stream("POST", url, json=body, headers=headers) as response:
                     if response.is_error:

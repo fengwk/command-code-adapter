@@ -9,12 +9,14 @@ import re
 
 import cc_adapter.command_code.body as body_module
 from cc_adapter.command_code.body import (
-    _WORKSPACE_ROOT,
+    _DEFAULT_HOME_LOGIN,
+    _DEFAULT_PROJECT_SLUG,
     bind_workspace,
     make_cc_body,
     make_config,
     recent_commits,
     workspace_dir,
+    workspace_root,
 )
 
 _NODE_PLATFORMS = ("linux", "darwin", "win32")
@@ -63,30 +65,44 @@ def test_recent_commits_shape():
 
 def test_bind_workspace_sets_working_dir_basename_to_slug():
     config = make_config()
-    bind_workspace(config, "checkout-service")
-    assert config["workingDir"] == f"{_WORKSPACE_ROOT}/checkout-service"
+    bind_workspace(config, "checkout-service", "mchen")
+    assert config["workingDir"] == "/home/mchen/proj/checkout-service"
     assert os.path.basename(config["workingDir"]) == "checkout-service"
     assert config["recentCommits"] == recent_commits("checkout-service")
+
+
+def test_workspace_dir_uses_the_home_login():
+    # The forged cwd carries the key's home login, with the slug as its basename.
+    assert workspace_root("priya") == "/home/priya/proj"
+    assert workspace_dir("search-gateway", "priya") == "/home/priya/proj/search-gateway"
+    assert workspace_dir("search-gateway", "dmitri") == "/home/dmitri/proj/search-gateway"
 
 
 def test_bind_workspace_is_deterministic_per_slug():
     first: dict = {}
     second: dict = {}
-    bind_workspace(first, "core-api")
-    bind_workspace(second, "core-api")
+    bind_workspace(first, "core-api", "alex")
+    bind_workspace(second, "core-api", "alex")
     assert first["workingDir"] == second["workingDir"]
     assert first["recentCommits"] == second["recentCommits"]
 
     other: dict = {}
-    bind_workspace(other, "data-platform")
+    bind_workspace(other, "data-platform", "alex")
     assert other["workingDir"] != first["workingDir"]
     assert other["recentCommits"] != first["recentCommits"]
+
+    # Same project on another key's home login: only the home part changes.
+    same_slug_other_login: dict = {}
+    bind_workspace(same_slug_other_login, "core-api", "priya")
+    assert same_slug_other_login["workingDir"] == "/home/priya/proj/core-api"
+    assert same_slug_other_login["recentCommits"] == first["recentCommits"]
 
 
 def test_make_config_default_working_dir_matches_workspace_dir():
     config = make_config()
-    assert config["workingDir"] == workspace_dir(body_module._DEFAULT_PROJECT_SLUG)
-    assert config["recentCommits"] == recent_commits(body_module._DEFAULT_PROJECT_SLUG)
+    assert config["workingDir"] == workspace_dir(_DEFAULT_PROJECT_SLUG, _DEFAULT_HOME_LOGIN)
+    assert config["workingDir"] == "/home/dev/proj/cc-adapter"  # unchanged default identity
+    assert config["recentCommits"] == recent_commits(_DEFAULT_PROJECT_SLUG)
 
 
 def test_make_config_overrides_win():

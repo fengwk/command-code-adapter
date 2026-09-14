@@ -63,7 +63,7 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_ADMIN_PASSWORD` | — | Admin panel password |
 | `CC_ADAPTER_HTTP_MAX_CONNECTIONS` | `200` | |
 | `CC_ADAPTER_HTTP_MAX_KEEPALIVE_CONNECTIONS` | `50` | |
-| `CC_ADAPTER_HTTP2` | `false` | |
+| `CC_ADAPTER_HTTP2` | `false` | Per-key HTTP/2 (each key keeps its own pool and multiplexes only its own streams) |
 | `CC_ADAPTER_KEY_COOLDOWN_BASE` | `60` | Rate-limit (429) cooldown start, seconds — doubles per failure |
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap, seconds |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat park window for an out-of-credits key, seconds |
@@ -84,7 +84,11 @@ Both translate to CC /alpha/generate body, stream SSE back.
 
 - **Two translator pairs** in `providers/anthropic/` and `providers/openai/` (request→CC, response←CC); shared code in `providers/shared/`, `command_code/`, `core/`.
 - **Singletons** owned by `core/runtime.py`: `_config`, `_cc_client`, translator instances (lazy init via `get_*()`). Also `_version_checker` and `_model_fetcher`.
-- **`get_or_create_client()`** at `runtime.py:41` — auto-creates a client with `AppConfig()` defaults if `init()` hasn't been called, logging a warning. Used by all routers when no client is available.
+- - **Balance probes are staggered**: the scheduler refreshes every key's credits on one cadence, so
+  the background refresh delays each key by a deterministic per-key offset (`KEY_CREDITS_PROBE_SPREAD`, 4 min)
+  instead of firing all probes in the same instant from one IP - a synchronized multi-key burst is a
+  multi-account signature. The first (cold) fetch and explicit refreshes stay immediate.
+**`get_or_create_client()`** at `runtime.py:41` — auto-creates a client with `AppConfig()` defaults if `init()` hasn't been called, logging a warning. Used by all routers when no client is available.
 - **Auth headers**: `core/headers.py` — `extract_token()` (Bearer/x-api-key), `auth_error_response(message, protocol)` (401). Branches on `protocol: "openai" | "anthropic"` for correct error shape; `message` parameter allows custom error text.
 - **Retry**: `core/retry.py` — `stream_with_retry()` drives a streaming request (`generate_fn` → `translate_fn`) for all three routers and retries once on an empty upstream response; the optional `_BufferDetector` (OpenAI chat with tools) spots that empty response before any visible delta, and `error_fn` turns a final failure into an SSE error event. Non-streaming requests go through the providers' own `collect_and_translate_*_nonstream()` helpers — there is no non-streaming retry helper. Inside `client.py:generate()` a retryable upstream error (402/429/400-insufficient-credits) or a key error (401/403) feeds `KeyScheduler.report()` and moves to the next key.
 - **Admin auth**: HMAC-signed token in `core/auth.py` (not JWT); embeds `exp` (24h) + password hash prefix. API access validation at `core/auth.py:check_api_access()`. When `CC_ADAPTER_ADMIN_PASSWORD` is empty the admin API is **unauthenticated** (`verify_auth` short-circuits it; `main.py` logs a startup warning) — intranet-only deployments rely on this, do not reintroduce a 503 gate.
@@ -104,10 +108,15 @@ Both translate to CC /alpha/generate body, stream SSE back.
 - `Authorization: Bearer <key>` when a key is given, `x-cmd-zdr: 1` when ZDR is on, `x-oss-primary-provider` when configured
 - `x-co-flag` is **NOT** sent — the CLI never sends it, do not re-add it
 
-`x-session-id` / `x-project-slug` are **not** in this function — `client.py:generate()` derives them per (session flag, chosen key) via `SessionExtractor.derive()`:
+`x-session-id` / `x-project-slug` are **not** in this function — `CommandCodeClient` derives them per (session flag, chosen key) via `SessionExtractor.derive()`:
 
-- `sess_<16 hex>` + a slug from a fixed pool; the same conversation on the same key always yields the same pair (mirrors the CLI's per-process id)
+- `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`, each value read from a disjoint digest segment: `sess_<16 hex>` (from the session digest) + a slug from a 64-entry pool (same digest, later bytes) + a home login from a 64-entry pool (derived from the key **only**, so every session of one key reports the same forged machine)
+- the same conversation on the same key always yields the same triple (mirrors the CLI's per-process id); another key yields a different session id, slug and — for a different login — home directory, which is intentional: each key is a different upstream account
 - billing/credits/usage/whoami calls receive the base headers only
+
+### Per-key connection pools
+
+`CommandCodeClient._client(key)` (client.py) keeps **one `httpx.AsyncClient` per upstream key** in `self._pools`, created lazily on that key's first attempt, so a keep-alive connection never carries a second key's `Authorization` header — the upstream cannot link two keys through TCP/TLS connection reuse. `aclose()` (and therefore `schedule_close_when_idle()`) closes and clears every pool. `CC_ADAPTER_HTTP_MAX_CONNECTIONS` / `_MAX_KEEPALIVE_CONNECTIONS` / `CC_ADAPTER_HTTP2` apply **per pool**; HTTP/2 stays off by default, and with `http2=True` each key multiplexes only its own streams. A caller-injected `http_client=` is shared by every key and bypasses that isolation (tests only), and is never closed by the client.
 
 ### CC Request Body
 
@@ -115,7 +124,7 @@ Both translate to CC /alpha/generate body, stream SSE back.
 
 - `date: "YYYY-MM-DD"` (UTC), `environment` = node platform name (`linux` inside Docker)
 - `gitStatus: "Working tree clean"`, `recentCommits`: three commits derived deterministically from the slug
-- `workingDir` rewritten by `bind_workspace(config, slug)` (called from `client.py:generate()`) to `/home/dev/proj/<slug>` so its basename equals the `x-project-slug` header, like the real CLI
+- `workingDir` rewritten by `bind_workspace(config, slug, home_login)` (called from `client.py:generate()`) to `/home/<home_login>/proj/<slug>` so its basename equals the `x-project-slug` header, like the real CLI. `make_config()` keeps the legacy default identity (`_DEFAULT_HOME_LOGIN = "dev"` → `/home/dev/proj/cc-adapter`)
 
 Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends neither. `_STATIC_CONFIG` deliberately does **NOT** contain an `"env"` field.
 
@@ -126,6 +135,7 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 - **Sticky**: an explicit client session identity (see the `SessionExtractor.extract()` chain: `x-claude-code-session-id`, `metadata.user_id`, `session-id`, `x-session-id`, `x-conversation-id`, `prompt_cache_key`, …) is bound to a key; a new session is bound round-robin in configured key order.
 - An established binding outranks key order — a recovered key does not steal a session back.
 - **Fill-first**: requests without an explicit identity (content-hash fallback, `explicit=False`) always go to the first usable key and are never bound.
+- **Per-key isolation**: each key keeps its own httpx pool (no shared TCP/TLS connection) and its own forged machine — `workingDir` is `/home/<login>/proj/<slug>` with the login derived from the key alone. A conversation that moves to another key switches session id + slug, which is intended.
 - Bindings slide: 1h TTL, 4096 entries, LRU eviction (`constants.py`).
 - Health: 401/403 disables a key and unbinds its sessions; 429 cools it down with escalating backoff (`KEY_COOLDOWN_BASE` → `KEY_COOLDOWN_MAX`); an out-of-credits failure (400 + "insufficient credits", or 402) parks the key for a flat `KEY_CREDIT_COOLDOWN` (30 min), zeroes its cached balance (the 30-min credits refresh, or `POST /admin/api/keys/{suffix}/enable`, clears it) and unbinds the affected session; 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
 - **Manual switch**: `POST /admin/api/keys/{suffix}/disable` marks a key off in `KeyScheduler._manual_off` — `_usable()` rejects it no matter its health or credits, and its bindings are dropped (the response reports `unbound_sessions`). `POST .../enable` clears the mark and runs `reset_key()` (health + cached balance + background credits refresh), so the key is selectable immediately; automatic cooldowns keep working while a key is on. `key_state()` exposes `enabled` / `manual` plus `cooldown_seconds` (remaining cooling seconds, `None` when not cooling), and `unavailable_summary()` renders an off key as `****abcd disabled by admin`.
@@ -135,7 +145,7 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 ## Translation quirks
 
 **Shared (`providers/shared/`):**
-- `session_extractor.py`: `extract(headers, original, body)` returns `SessionSignal(flag, explicit)` using the CLIProxyAPI-style priority chain (Claude Code header → `metadata.user_id` → `session-id` → `x-http-session-id` → `x-session-id`/affinity/slot → conversation/thread headers → `prompt_cache_key` → `conversation.id` → body session ids → content-hash fallback). `x-client-request-id` is deliberately excluded (per-request UUID). `derive(flag, key)` returns the upstream `sess_<16 hex>` + project slug.
+- `session_extractor.py`: `extract(headers, original, body)` returns `SessionSignal(flag, explicit)` using the CLIProxyAPI-style priority chain (Claude Code header → `metadata.user_id` → `session-id` → `x-http-session-id` → `x-session-id`/affinity/slot → conversation/thread headers → `prompt_cache_key` → `conversation.id` → body session ids → content-hash fallback). `x-client-request-id` is deliberately excluded (per-request UUID). `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`; the login pool is key-scoped, the session id/slug pool is (flag, key)-scoped.
 - `model_mapping.py`: `MODEL_PROVIDER_MAP` — bare names → canonical CC IDs. `clamp_reasoning_effort()` — nearest-higher clamping per model's supported range (from `MODEL_REASONING_EFFORTS_MAP`); unknown models drop the effort. Maps are mutable at runtime via `refresh_maps()`.
 - `tool_mapping.py`: `normalize_schema()` (filePath↔path), `normalize_args()` (path/old_str/new_str→filePath/oldString/newString for file tools), `translate_tool_choice()` (auto/none/required↔type), `make_tool_call_block()`/`make_tool_result_block()`.
 

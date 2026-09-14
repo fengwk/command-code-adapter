@@ -16,6 +16,12 @@ NPM_ERROR_BACKOFF: int = 60
 KEY_CREDITS_CACHE_TTL: int = 1800
 KEY_CREDITS_ERROR_BACKOFF: int = 60
 
+# Upper bound (seconds) of the per-key delay applied to *background* balance
+# probes. Every key is refreshed on the same cadence; firing those probes in the
+# same instant from one IP is a multi-account signature, so the arrivals are
+# spread over this window instead (deterministically per key).
+KEY_CREDITS_PROBE_SPREAD: float = 240.0
+
 KEY_COOLDOWN_BASE: float = 60.0
 KEY_COOLDOWN_MAX: float = 1800.0
 # Flat cooldown for a key the upstream reported as out of credits: the balance

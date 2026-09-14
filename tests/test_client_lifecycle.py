@@ -9,6 +9,7 @@ the whole HTTP path (httpx pool included) is exercised without network access.
 
 import asyncio
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -102,6 +103,12 @@ def _client(upstream: _FakeSSEUpstream) -> CommandCodeClient:
     return CommandCodeClient(base_url=f"http://127.0.0.1:{upstream.port}", api_key="key")
 
 
+def _single_pool(client: CommandCodeClient) -> httpx.AsyncClient:
+    """The one per-key pool a single-key client created on its first request."""
+    (pool,) = client._pools.values()
+    return pool
+
+
 def _body() -> dict:
     return make_cc_body(config=make_config(), params={"model": "test", "messages": []})
 
@@ -134,8 +141,9 @@ async def test_stream_survives_scheduled_close_mid_stream(upstream):
             if index == 1:
                 # Two of six frames consumed: schedule the panel-style retirement on a live stream.
                 assert client.inflight == 1
+                pool = _single_pool(client)
                 close_task = client.schedule_close_when_idle()
-                assert client._http_client.is_closed is False
+                assert pool.is_closed is False
 
         assert [event["text"] for event in received] == [f"f{index}" for index in range(FRAME_COUNT)]
         assert upstream.aborted is False  # nothing cut the response short
@@ -146,7 +154,7 @@ async def test_stream_survives_scheduled_close_mid_stream(upstream):
 
         assert close_task is not None
         await asyncio.wait_for(close_task, timeout=5)
-        assert client._http_client.is_closed is True  # the pool closes, just later
+        assert pool.is_closed is True  # the pool closes, just later
     finally:
         await _aclose_quietly(gen)
         await asyncio.gather(*client._close_tasks, return_exceptions=True)
@@ -163,11 +171,37 @@ async def test_idle_client_closes_promptly(upstream):
         assert received[0]["text"] == "f0"
         await _end_stream(upstream, gen)
         assert client.inflight == 0
-        assert client._http_client.is_closed is False
+        pool = _single_pool(client)
+        assert pool.is_closed is False
 
         task = client.schedule_close_when_idle()
         await asyncio.wait_for(task, timeout=2)
-        assert client._http_client.is_closed is True
+        assert pool.is_closed is True
+    finally:
+        await _aclose_quietly(gen)
+        await asyncio.gather(*client._close_tasks, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_close_closes_every_key_pool(upstream):
+    # Intent: retirement closes each key's pool, not only the one that served the stream.
+    client = _client(upstream)
+    gen = client.generate(_body())
+    try:
+        await _read_frames(upstream, gen, 0, 1)
+        # In production a second pool exists because another key served a request;
+        # materialise it directly so the close path covers more than one pool.
+        client._client("second-key")
+        pools = dict(client._pools)
+        assert len(pools) == 2
+
+        await _end_stream(upstream, gen)
+        task = client.schedule_close_when_idle()
+        await asyncio.wait_for(task, timeout=2)
+
+        assert [pool.is_closed for pool in pools.values()] == [True, True]
+        assert client._pools == {}
     finally:
         await _aclose_quietly(gen)
         await asyncio.gather(*client._close_tasks, return_exceptions=True)
@@ -183,11 +217,12 @@ async def test_close_after_timeout_while_stream_still_running(upstream):
         received = await _read_frames(upstream, gen, 0, 1)
         assert received[0]["text"] == "f0"
         assert client.inflight == 1
+        pool = _single_pool(client)
 
         task = client.schedule_close_when_idle(timeout=0.2)
         await asyncio.wait_for(task, timeout=5)  # the grace window expires; the pool is closed anyway
         assert client.inflight == 1
-        assert client._http_client.is_closed is True
+        assert pool.is_closed is True
 
         # Cleaning up may surface AdapterError from the broken connection; the slot must still be released.
         await _aclose_quietly(gen)
@@ -210,13 +245,14 @@ async def test_apply_config_update_keeps_inflight_stream(upstream):
     try:
         received = await _read_frames(upstream, gen, 0, 2)
         assert client.inflight == 1
+        pool = _single_pool(client)
 
         await ConfigManager.apply_config_update({"cc_base_url": cfg.cc_base_url})
         rebuilt = runtime.get_client()
         assert rebuilt is not None and rebuilt is not client
         close_tasks = list(client._close_tasks)
         assert len(close_tasks) == 1  # the panel scheduled the retirement, it did not close the pool
-        assert client._http_client.is_closed is False
+        assert pool.is_closed is False
 
         received += await _read_frames(upstream, gen, 2, FRAME_COUNT)
         assert [event["text"] for event in received] == [f"f{index}" for index in range(FRAME_COUNT)]
@@ -225,7 +261,7 @@ async def test_apply_config_update_keeps_inflight_stream(upstream):
         assert client.inflight == 0
 
         await asyncio.wait_for(asyncio.gather(*close_tasks), timeout=5)
-        assert client._http_client.is_closed is True
+        assert pool.is_closed is True
     finally:
         runtime.init(*previous)  # restore the global runtime state for other tests
         await _aclose_quietly(gen)

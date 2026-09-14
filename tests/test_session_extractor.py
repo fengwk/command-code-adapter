@@ -1,6 +1,8 @@
 """Tests for cc_adapter.providers.shared.session_extractor."""
 
+import dataclasses
 import hashlib
+import re
 
 import pytest
 
@@ -9,7 +11,10 @@ from cc_adapter.providers.anthropic.models import AnthropicRequest
 from cc_adapter.providers.openai.models import ChatCompletionRequest
 from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
 from cc_adapter.providers.shared.session_extractor import (
+    _HOME_LOGIN_POOL,
+    _PROJECT_SLUG_POOL,
     SessionExtractor,
+    SessionIdentity,
     SessionSignal,
     get_session_extractor,
     is_valid_cmd_session_id,
@@ -376,29 +381,51 @@ class TestSessionExtractorDerive:
         self.ex = SessionExtractor()
 
     def test_derive_returns_cmd_compatible_session_id(self):
-        session_id, slug = self.ex.derive("msg:abc123", "key1")
-        assert is_valid_cmd_session_id(session_id)
-        assert session_id.startswith("sess_")
-        assert len(session_id) == 21
+        identity = self.ex.derive("msg:abc123", "key1")
+        assert is_valid_cmd_session_id(identity.session_id)
+        assert identity.session_id.startswith("sess_")
+        assert len(identity.session_id) == 21
 
-    def test_derive_returns_valid_slug(self):
-        _, slug = self.ex.derive("msg:abc123", "key1")
-        assert slug
-        assert slug.islower()
+    def test_derive_returns_frozen_identity(self):
+        identity = self.ex.derive("msg:abc123", "key1")
+        assert isinstance(identity, SessionIdentity)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            identity.session_id = "sess_0000000000000000"
+
+    def test_derive_returns_valid_slug_and_login(self):
+        identity = self.ex.derive("msg:abc123", "key1")
+        assert identity.project_slug
+        assert identity.project_slug.islower()
+        assert identity.project_slug in _PROJECT_SLUG_POOL
+        assert identity.home_login in _HOME_LOGIN_POOL
 
     def test_derive_is_deterministic(self):
-        a = self.ex.derive("msg:abc", "key1")
-        b = self.ex.derive("msg:abc", "key1")
-        assert a == b
+        assert self.ex.derive("msg:abc", "key1") == self.ex.derive("msg:abc", "key1")
 
     def test_derive_session_changes_per_key(self):
-        s1, _ = self.ex.derive("msg:same", "key1")
-        s2, _ = self.ex.derive("msg:same", "key2")
-        assert s1 != s2
+        assert self.ex.derive("msg:same", "key1").session_id != self.ex.derive("msg:same", "key2").session_id
+
+    def test_home_login_is_stable_per_key_across_sessions(self):
+        # One upstream key is one forged machine: every session it serves reports
+        # the same home login, while session id and slug stay per session.
+        identities = [self.ex.derive(f"msg:session{i}", "key1") for i in range(32)]
+        assert len({identity.home_login for identity in identities}) == 1
+
+        first, second = identities[0], identities[1]
+        assert first.session_id != second.session_id
+        assert first.project_slug != second.project_slug
+
+    def test_same_session_on_another_key_changes_all_three_values(self):
+        first = self.ex.derive("msg:same", "key1")
+        second = self.ex.derive("msg:same", "key2")
+        assert first.session_id != second.session_id
+        assert first.project_slug != second.project_slug
+        assert first.home_login != second.home_login
 
     def test_derive_slug_spreads_across_pool(self):
-        slugs = {self.ex.derive(f"msg:flag{i}", "key1")[1] for i in range(64)}
-        assert len(slugs) >= 8
+        # 64 distinct sessions must land on well more than the old 16-slug spread.
+        slugs = {self.ex.derive(f"msg:flag{i}", "key1").project_slug for i in range(64)}
+        assert len(slugs) >= 16
 
     def test_derive_validates_empty_inputs(self):
         with pytest.raises(ValueError):
@@ -412,6 +439,31 @@ class TestSessionExtractorDerive:
             self.ex.derive(bad, "key1")
         with pytest.raises(ValueError):
             self.ex.derive("msg:abc", bad)
+
+
+class TestIdentityPools:
+    def test_project_slug_pool_is_expanded_and_unique(self):
+        assert len(_PROJECT_SLUG_POOL) >= 64
+        assert len(set(_PROJECT_SLUG_POOL)) == len(_PROJECT_SLUG_POOL)
+        for slug in _PROJECT_SLUG_POOL:
+            assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)+", slug)
+
+    def test_home_login_pool_looks_like_real_logins(self):
+        assert len(_HOME_LOGIN_POOL) == 64
+        assert len(set(_HOME_LOGIN_POOL)) == len(_HOME_LOGIN_POOL)
+        for login in _HOME_LOGIN_POOL:
+            assert re.fullmatch(r"[a-z]{3,10}", login)
+        # No generic service-account names: those would identify the adapter.
+        assert not {"dev", "user", "root", "admin"} & set(_HOME_LOGIN_POOL)
+
+    def test_digest_segments_do_not_overlap(self):
+        # session_id reads digest[:8], the slug digest[8:12] and the login comes
+        # from a separate key-only digest, so the 64-entry slug pool and the
+        # 64-entry login pool stay independent of the session id.
+        flags = [f"msg:flag{i}" for i in range(64)]
+        identities = [SessionExtractor().derive(flag, "key1") for flag in flags]
+        assert len({identity.session_id for identity in identities}) == 64
+        assert len({identity.home_login for identity in identities}) == 1
 
 
 class TestSessionExtractorSingleton:

@@ -24,6 +24,7 @@ currently known state and refresh the credits cache in the background.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Any
 
@@ -37,6 +38,7 @@ from cc_adapter.core.constants import (
     KEY_CREDIT_COOLDOWN,
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
+    KEY_CREDITS_PROBE_SPREAD,
     SESSION_AFFINITY_MAX_ENTRIES,
     SESSION_AFFINITY_TTL,
 )
@@ -389,7 +391,9 @@ class KeyScheduler:
             except Exception:
                 logger.warning("initial_credits_fetch_failed", exc_info=True)
         else:
-            self._trigger_refresh()
+            # Background refresh: the probes of the single keys are staggered so
+            # they do not all leave one IP in the same instant.
+            self._trigger_refresh(stagger=True)
 
     def _is_stale(self) -> bool:
         if self._last_fetch is None:
@@ -397,22 +401,28 @@ class KeyScheduler:
         ttl = KEY_CREDITS_ERROR_BACKOFF if self._last_error else KEY_CREDITS_CACHE_TTL
         return time.monotonic() - self._last_fetch > ttl
 
-    def _trigger_refresh(self) -> None:
+    def _trigger_refresh(self, *, stagger: bool = False) -> None:
         try:
             loop = asyncio.get_running_loop()
             if not self._fetch_task or self._fetch_task.done():
-                self._fetch_task = loop.create_task(self.refresh())
+                self._fetch_task = loop.create_task(self.refresh(stagger=stagger))
         except RuntimeError:
             pass
 
-    async def refresh(self) -> None:
-        async with self._fetch_lock:
-            await self._refresh()
+    async def refresh(self, *, stagger: bool = False) -> None:
+        """Refresh every key balance.
 
-    async def _refresh(self) -> None:
+        ``stagger=True`` delays each key's probe by its own offset, which is what
+        the scheduled refresh uses; an explicit refresh (tests, admin actions)
+        stays immediate.
+        """
+        async with self._fetch_lock:
+            await self._refresh(stagger=stagger)
+
+    async def _refresh(self, *, stagger: bool = False) -> None:
         self._last_error = None
         try:
-            tasks = [self._fetch_credits(key) for key in self._keys]
+            tasks = [self._probe(key, stagger=stagger) for key in self._keys]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             success_count = 0
             for key, result in zip(self._keys, results):
@@ -428,6 +438,22 @@ class KeyScheduler:
             self._last_error = str(e)
             self._last_fetch = time.monotonic()
             logger.warning("credits_refresh_failed", error=str(e))
+
+    async def _probe(self, api_key: str, *, stagger: bool = False) -> int | None:
+        """Fetch one balance, optionally after this key's share of the probe window."""
+        if stagger:
+            await self._stagger_probe(api_key)
+        return await self._fetch_credits(api_key)
+
+    def _probe_offset(self, api_key: str) -> float:
+        """Deterministic delay (0..KEY_CREDITS_PROBE_SPREAD) for one key's probe."""
+        digest = hashlib.sha256(f"probe:{api_key}".encode()).digest()
+        return float(int.from_bytes(digest[:4], "big") % int(KEY_CREDITS_PROBE_SPREAD))
+
+    async def _stagger_probe(self, api_key: str) -> None:
+        """Wait this key's share of the probe window (nothing to spread for one key)."""
+        if len(self._keys) > 1:
+            await asyncio.sleep(self._probe_offset(api_key))
 
     async def _fetch_credits(self, api_key: str) -> int | None:
         headers = make_cc_headers(api_key)

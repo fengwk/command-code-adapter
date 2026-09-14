@@ -15,8 +15,10 @@ _CC_BODY_SKELETON: dict[str, Any] = {
 
 # The cmd CLI reports the session cwd as workingDir and its directory name as
 # x-project-slug. The adapter forges a dev-machine project layout instead of
-# leaking the container path, keeping both values consistent per slug.
-_WORKSPACE_ROOT = "/home/dev/proj"
+# leaking the container path, keeping both values consistent per slug. The home
+# login is part of the forged identity too: every key serves its sessions from
+# one forged machine, so workingDir is /home/<login>/proj/<slug>.
+_DEFAULT_HOME_LOGIN = "dev"
 _DEFAULT_PROJECT_SLUG = "cc-adapter"
 
 # Pool of plausible conventional-commit subjects for the forged recentCommits.
@@ -57,9 +59,14 @@ _STATIC_CONFIG: dict[str, Any] = {
 }
 
 
-def workspace_dir(project_slug: str) -> str:
-    """Absolute forged workingDir for a project slug (basename == project_slug)."""
-    return f"{_WORKSPACE_ROOT}/{project_slug}"
+def workspace_root(home_login: str) -> str:
+    """Forged project root of a home login (``/home/<login>/proj``)."""
+    return f"/home/{home_login}/proj"
+
+
+def workspace_dir(project_slug: str, home_login: str) -> str:
+    """Absolute forged workingDir (basename == project_slug)."""
+    return f"{workspace_root(home_login)}/{project_slug}"
 
 
 def recent_commits(project_slug: str) -> list[str]:
@@ -74,19 +81,19 @@ def recent_commits(project_slug: str) -> list[str]:
     return commits
 
 
-def bind_workspace(config: dict[str, Any], project_slug: str) -> None:
+def bind_workspace(config: dict[str, Any], project_slug: str, home_login: str) -> None:
     """Bind a CC body config to a workspace identity, in place.
 
     `project_slug` must be the same slug sent as the x-project-slug header so
     that workingDir and the header agree, like the real CLI.
     """
-    config["workingDir"] = workspace_dir(project_slug)
+    config["workingDir"] = workspace_dir(project_slug, home_login)
     config["recentCommits"] = recent_commits(project_slug)
 
 
 def make_config(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     base: dict[str, Any] = {
-        "workingDir": workspace_dir(_DEFAULT_PROJECT_SLUG),
+        "workingDir": workspace_dir(_DEFAULT_PROJECT_SLUG, _DEFAULT_HOME_LOGIN),
         "date": _utc_date(),
         **_STATIC_CONFIG,
         "structure": list(_STATIC_CONFIG["structure"]),

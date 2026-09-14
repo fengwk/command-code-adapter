@@ -20,6 +20,7 @@ from cc_adapter.core.constants import (
     KEY_CREDIT_COOLDOWN,
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
+    KEY_CREDITS_PROBE_SPREAD,
     SESSION_AFFINITY_TTL,
 )
 from cc_adapter.core.key_scheduler import KeyScheduler, SessionAffinityCache
@@ -552,6 +553,66 @@ class TestManualSwitch:
         assert sched.manual_disabled_keys() == set()
 
 
+class TestProbeStagger:
+    """The scheduled balance refresh must not fire every key in one instant.
+
+    Firing all probes together from a single IP once per TTL is a multi-account
+    signature, so the background refresh delays each key by its own offset.
+    """
+
+    def test_offset_is_stable_and_within_spread(self):
+        sched = KeyScheduler(keys=[K1, K2, "key-c"], base_url=BASE_URL)
+        offsets = {key: sched._probe_offset(key) for key in (K1, K2, "key-c")}
+        assert all(0.0 <= value < KEY_CREDITS_PROBE_SPREAD for value in offsets.values())
+        assert offsets == {key: sched._probe_offset(key) for key in (K1, K2, "key-c")}
+        assert len(set(offsets.values())) > 1
+
+    @pytest.mark.asyncio
+    async def test_scheduled_refresh_staggers_every_key(self, monkeypatch):
+        staggered: list[str] = []
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+
+        async def record(api_key: str) -> None:
+            staggered.append(api_key)
+
+        monkeypatch.setattr(sched, "_stagger_probe", record)
+        stub_credits(monkeypatch, {K1: 100, K2: 100})
+
+        await sched.refresh(stagger=True)
+        assert sorted(staggered) == sorted([K1, K2])
+
+        staggered.clear()
+        await sched.refresh()
+        assert staggered == []
+
+    @pytest.mark.asyncio
+    async def test_stale_background_refresh_staggers(self, monkeypatch):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        seen: list[bool] = []
+
+        async def fake_refresh(*, stagger: bool = False) -> None:
+            seen.append(stagger)
+
+        monkeypatch.setattr(sched, "refresh", fake_refresh)
+        sched._last_fetch = time.monotonic() - KEY_CREDITS_CACHE_TTL - 1
+        await sched._ensure_credits()
+        if sched._fetch_task is not None:
+            await sched._fetch_task
+        assert seen == [True]
+
+    @pytest.mark.asyncio
+    async def test_cold_fetch_is_not_staggered(self, monkeypatch):
+        sched = KeyScheduler(keys=[K1, K2], base_url=BASE_URL)
+        seen: list[bool] = []
+
+        async def fake_refresh(*, stagger: bool = False) -> None:
+            seen.append(stagger)
+
+        monkeypatch.setattr(sched, "refresh", fake_refresh)
+        await sched._ensure_credits()  # _last_fetch is None: the first request needs the balances
+        assert seen == [False]
+
+
 class TestCreditsPlumbing:
     @pytest.mark.asyncio
     async def test_first_select_blocks_on_a_single_fetch(self, monkeypatch):
@@ -580,7 +641,7 @@ class TestCreditsPlumbing:
         """select() must never block once a snapshot exists, even when it is stale."""
         refreshed = asyncio.Event()
 
-        async def fake_refresh(self):
+        async def fake_refresh(self, *, stagger: bool = False):
             refreshed.set()
 
         monkeypatch.setattr(KeyScheduler, "_refresh", fake_refresh)

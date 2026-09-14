@@ -1,23 +1,28 @@
 """Session identity extraction and stateless session-id derivation.
 
-Upstream session id / project slug derivation
----------------------------------------------
+Upstream identity derivation
+----------------------------
 The upstream cmd CLI derives a per-process `sess_<16 hex>` id on startup and
 keeps it stable for the process lifetime. The adapter can not imitate that
 verbatim (it is a long-running server, not a short-lived CLI) without leaking
 signals (one session id covering many distinct end-users).
 
-Instead we derive both the upstream session id and the project slug from a
-deterministic function of the inbound request and the chosen cmd key:
+Instead we forge the whole upstream identity from a deterministic function of
+the inbound request and the chosen cmd key, with every value taken from a
+disjoint digest segment so none of them can be derived from another:
 
     fig          = sha256(stable_flag | cmd_key)
     session_id   = "sess_" + fig.hex()[:16]        # matches cmd CLI shape
-    project_slug = POOL[fig uint32 % len(POOL)]    # looks like a real cwd slug
+    project_slug = SLUGS[fig[8:12] uint32 % 64]    # looks like a real cwd slug
+    home_login   = LOGINS[sha256("login:" + cmd_key) uint32 % 64]
 
-This makes every (stable_flag, cmd_key) pair land on a unique (session_id,
-slug) tuple with no in-memory state. Switching cmd keys invalidates the
-session id, which is the correct behavior: each cmd key is a different
-upstream account and must not share session-scoped state.
+The home login is derived from the key alone on purpose: one upstream account is
+one forged machine, so every session that key serves reports the same home
+directory while each (stable_flag, cmd_key) pair gets its own session id and
+project slug. Switching cmd keys invalidates the session id, which is the
+correct behavior: each cmd key is a different upstream account and must not
+share session-scoped state. Two keys that map to the same login still differ in
+session id and project slug.
 
 Session identity extraction (CLIProxyAPI-style priority chain)
 -------------------------------------------------------------
@@ -70,7 +75,8 @@ from typing import Any
 
 
 # Pool of plausible project slugs (lowercase, hyphenated, cwd-style).
-# Sized so that a 16-element pool gives ~4 bits of spread per slug.
+# 64 entries keep two keys that share a slug unlikely and make the slug a
+# meaningful part of the forged identity.
 _PROJECT_SLUG_POOL: tuple[str, ...] = (
     "alpha-services",
     "analytics-pipeline",
@@ -88,6 +94,123 @@ _PROJECT_SLUG_POOL: tuple[str, ...] = (
     "storage-layer",
     "user-portal",
     "video-pipeline",
+    "api-monitor",
+    "audit-service",
+    "billing-engine",
+    "cache-proxy",
+    "cli-toolkit",
+    "config-service",
+    "crawl-orchestrator",
+    "customer-portal",
+    "deploy-bot",
+    "device-registry",
+    "docs-site",
+    "event-bus",
+    "feature-flags",
+    "file-sync",
+    "fraud-detection",
+    "gis-tools",
+    "graph-service",
+    "identity-provider",
+    "image-service",
+    "ingest-worker",
+    "inventory-sync",
+    "job-runner",
+    "ledger-service",
+    "log-pipeline",
+    "mail-relay",
+    "media-transcoder",
+    "metrics-collector",
+    "mobile-backend",
+    "order-service",
+    "partner-api",
+    "pricing-engine",
+    "profile-service",
+    "push-gateway",
+    "queue-manager",
+    "rate-limiter",
+    "recommendation-engine",
+    "report-builder",
+    "risk-engine",
+    "scheduler-core",
+    "search-gateway",
+    "session-store",
+    "shipping-service",
+    "stream-processor",
+    "support-desk",
+    "tenant-service",
+    "threat-scanner",
+    "trace-collector",
+    "webhook-dispatch",
+)
+
+# Pool of plausible developer home-directory logins (lowercase ASCII, 3-10
+# chars). A home login belongs to one forged machine, i.e. to one upstream key.
+_HOME_LOGIN_POOL: tuple[str, ...] = (
+    "alex",
+    "amelia",
+    "anika",
+    "arjun",
+    "benoit",
+    "carla",
+    "chiara",
+    "dmitri",
+    "elena",
+    "emeka",
+    "fatima",
+    "felix",
+    "gauri",
+    "hana",
+    "hugo",
+    "imani",
+    "iris",
+    "jae",
+    "jdoe",
+    "julia",
+    "kaito",
+    "kavya",
+    "kiran",
+    "lars",
+    "leila",
+    "lucas",
+    "mai",
+    "marco",
+    "mateo",
+    "mchen",
+    "meera",
+    "mila",
+    "nadia",
+    "nate",
+    "niels",
+    "noor",
+    "olga",
+    "oscar",
+    "pablo",
+    "priya",
+    "qasim",
+    "rafael",
+    "rania",
+    "rohan",
+    "saanvi",
+    "sabine",
+    "samir",
+    "sana",
+    "shreya",
+    "simon",
+    "skowalski",
+    "sofia",
+    "stefan",
+    "surya",
+    "tanya",
+    "theo",
+    "thomas",
+    "tnguyen",
+    "tomas",
+    "ursa",
+    "vikram",
+    "wei",
+    "yara",
+    "zoe",
 )
 
 _CMD_SESSION_PATTERN = re.compile(r"^sess_[0-9a-f]{16}$")
@@ -149,10 +272,22 @@ class SessionSignal:
     explicit: bool
 
 
-class SessionExtractor:
-    """Stateless extractor: request -> SessionSignal, then -> session id/slug."""
+@dataclass(frozen=True)
+class SessionIdentity:
+    """Forged upstream identity of one (session flag, cmd key) pair.
 
-    _POOL_SIZE = len(_PROJECT_SLUG_POOL)
+    session_id: `sess_<16 hex>`, stable for the conversation on that key.
+    project_slug: cwd-style slug reported as x-project-slug.
+    home_login: home directory name of the forged machine, stable per key.
+    """
+
+    session_id: str
+    project_slug: str
+    home_login: str
+
+
+class SessionExtractor:
+    """Stateless extractor: request -> SessionSignal, then -> SessionIdentity."""
 
     def extract(
         self,
@@ -223,10 +358,13 @@ class SessionExtractor:
         # 10. Content-hash fallback: stable across the turns of a conversation.
         return SessionSignal(f"msg:{self._content_hash(body)}", False)
 
-    def derive(self, stable_flag: str, cmd_key: str) -> tuple[str, str]:
-        """Return (session_id, project_slug) for a (stable_flag, cmd_key) pair.
+    def derive(self, stable_flag: str, cmd_key: str) -> SessionIdentity:
+        """Return the forged identity for a (stable_flag, cmd_key) pair.
 
-        Pure function: same inputs always yield the same outputs.
+        Pure function: same inputs always yield the same outputs. Each value is
+        read from a disjoint digest segment, so the home login (key-scoped) can
+        not be traced back to the session id or the project slug (session-scoped)
+        and vice versa.
         """
         if not isinstance(stable_flag, str) or not stable_flag:
             raise ValueError("stable_flag must be a non-empty string")
@@ -234,9 +372,12 @@ class SessionExtractor:
             raise ValueError("cmd_key must be a non-empty string")
 
         digest = hashlib.sha256(f"{stable_flag}|{cmd_key}".encode()).digest()
-        session_id = f"sess_{digest.hex()[:16]}"
-        slug = _PROJECT_SLUG_POOL[int.from_bytes(digest[:4], "big") % self._POOL_SIZE]
-        return session_id, slug
+        login_digest = hashlib.sha256(f"login:{cmd_key}".encode()).digest()
+        return SessionIdentity(
+            session_id=f"sess_{digest[:8].hex()}",
+            project_slug=_PROJECT_SLUG_POOL[int.from_bytes(digest[8:12], "big") % len(_PROJECT_SLUG_POOL)],
+            home_login=_HOME_LOGIN_POOL[int.from_bytes(login_digest[:4], "big") % len(_HOME_LOGIN_POOL)],
+        )
 
     # ------------------------------------------------------------------
     # helpers
