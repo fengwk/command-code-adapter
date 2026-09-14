@@ -248,6 +248,14 @@ def test_workspace_metadata_varies_across_slugs():
     assert sum(1 for entry in metadata if _plain_identity(entry)) * 2 > len(metadata)
 
 
+def test_workspace_metadata_plain_ratio_over_the_real_project_pool():
+    """The pool is what production reports, and it must stay in the documented band."""
+    from cc_adapter.providers.shared.session_extractor import _PROJECT_SLUG_POOL
+
+    plain = sum(1 for slug in _PROJECT_SLUG_POOL if _plain_identity(workspace_metadata(slug)))
+    assert 2 / 3 <= plain / len(_PROJECT_SLUG_POOL) <= 3 / 4
+
+
 def test_workspace_metadata_plain_ratio_is_about_two_thirds_to_three_quarters():
     """~2/3 to 3/4 of the slugs keep main + clean tree + the default structure."""
     slugs = [f"proj-{index}" for index in range(2000)]

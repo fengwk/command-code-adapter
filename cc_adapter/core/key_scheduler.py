@@ -191,16 +191,17 @@ class KeyScheduler:
         bounces between accounts after its key recovers from a cooldown.
 
         `load` is the caller's in-flight stream counter (`None` - the default -
-        disables the concurrency cap, which keeps the scheduler usable on its own):
-        a key at `KEY_MAX_CONCURRENT_STREAMS` is skipped while any usable key is
-        below the cap, and when *every* usable key is saturated the least loaded one
-        takes the stream instead of failing the request. The cap is a fairness
-        guard, never a reason to reject traffic.
+        disables the concurrency cap, which keeps the scheduler usable on its own).
+        The cap shapes how *new* work fans out over the accounts: a key at
+        `KEY_MAX_CONCURRENT_STREAMS` is passed over while another usable key has room,
+        and when every usable key is saturated the least loaded one takes the stream
+        instead of failing the request. The cap is a fairness guard, never a reason to
+        reject traffic.
 
-        Stickiness across the cap: a bound session keeps its key while that key is
-        below the cap; a saturated bound key is handled like an unusable one, so the
-        session is rebound to a key with room (or, with everything saturated, lands
-        on the least loaded key).
+        A conversation that already owns a key keeps it even when that key sits at the
+        cap: moving it would make the same conversation show up under a second account,
+        which is what the binding exists to prevent. Only an unusable key (cooling,
+        disabled, out of credits, or excluded by the caller) moves a bound session.
         """
         await self._ensure_credits()
         skip = exclude or set()
@@ -212,38 +213,43 @@ class KeyScheduler:
             # burning another upstream call on a key known to be unusable.
             return None
 
-        saturated = False
-        if load is not None:
-            below_cap = [key for key in usable if load(key) < KEY_MAX_CONCURRENT_STREAMS]
-            if below_cap:
-                usable = below_cap
-            else:
-                # Every usable key already carries the maximum number of streams:
-                # honouring the cap would have to fail the request, so the least
-                # loaded key takes one more (ties keep configuration order).
-                usable = sorted(usable, key=load)
-                saturated = True
-
         if session_flag:
             bound = self._affinity.get_and_refresh(session_flag)
-            if bound is not None and bound in usable and not saturated:
+            if bound is not None and bound in usable:
                 logger.info("key.select", session=session_flag[:8], key=bound[-4:], reason="sticky")
                 return bound
-            # First sight of a conversation. A client-provided identity rotates
-            # through the ring; a content-anchored one keeps the fill-first
+            # First sight of a conversation, or a key that went unusable. Prefer a key
+            # with room; when every key is saturated the least loaded one wins, because
+            # ring rotation would ignore the load order. A client-provided identity
+            # rotates through the ring, a content-anchored one keeps the fill-first
             # behaviour, yet is bound from now on: without the binding every
             # conversation would follow the head key's cooldown and back, so one
-            # conversation would show up under two accounts over and over. While
-            # every key is saturated the least loaded key wins directly, since ring
-            # rotation would ignore the load order.
-            chosen = usable[0] if (saturated or not explicit) else self._next_round_robin(usable)
+            # conversation would show up under two accounts over and over.
+            candidates, spread = self._spread(usable, load)
+            chosen = candidates[0] if (spread or not explicit) else self._next_round_robin(candidates)
             self._affinity.set(session_flag, chosen)
             logger.info("key.bind", session=session_flag[:8], key=chosen[-4:], explicit=explicit)
             return chosen
 
-        chosen = usable[0]
+        chosen = self._spread(usable, load)[0][0]
         logger.info("key.select", key=chosen[-4:], reason="no-session")
         return chosen
+
+    @staticmethod
+    def _spread(usable: list[str], load: Callable[[str], int] | None) -> tuple[list[str], bool]:
+        """Order the candidates of a *new* stream: keys with room first, else by load.
+
+        Returns `(candidates, saturated)`. `saturated` is True when the cap could not be
+        honoured because every usable key is already full; `candidates` is then ordered
+        by load so the caller takes the least loaded key instead of rotating the ring.
+        Without a load source the configuration order is returned untouched.
+        """
+        if load is None:
+            return usable, False
+        below_cap = [key for key in usable if load(key) < KEY_MAX_CONCURRENT_STREAMS]
+        if below_cap:
+            return below_cap, False
+        return sorted(usable, key=load), True
 
     def _next_round_robin(self, candidates: list[str]) -> str:
         """First candidate after the cursor in configured order (ring semantics).

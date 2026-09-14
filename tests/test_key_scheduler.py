@@ -284,16 +284,31 @@ class TestConcurrencyCap:
         assert sched._affinity.get_and_refresh(flag) == K1
 
     @pytest.mark.asyncio
-    async def test_saturated_bound_key_is_handled_like_an_unusable_one(self):
-        """The session is rebound, and stays there for its next turn."""
+    async def test_a_bound_key_at_the_cap_keeps_its_session(self):
+        """A busy key must not hand a running conversation to another account.
+
+        The cap is a fan-out guard for *new* work: moving a bound session would show
+        the same conversation under a second account, so the binding wins over the cap.
+        """
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "header:busy-session"
+        assert await sched.select(flag, explicit=True) == K1
+        load = {K1: KEY_MAX_CONCURRENT_STREAMS + 2, K2: 0}
+        assert await sched.select(flag, explicit=True, load=load.get) == K1
+        assert sched._affinity.get_and_refresh(flag) == K1
+        # ...and a fresh conversation still prefers the key with room.
+        assert await sched.select("header:new-session", explicit=True, load=load.get) == K2
+
+    @pytest.mark.asyncio
+    async def test_only_an_unusable_bound_key_moves_its_session(self):
+        """Cooling (here: removed from the usable set) still migrates the session."""
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
         flag = "header:blocked-session"
         assert await sched.select(flag, explicit=True) == K1
-        load = {K1: KEY_MAX_CONCURRENT_STREAMS, K2: 0}
+        sched.disable(K1)
+        load = {K1: 0, K2: 0}
         assert await sched.select(flag, explicit=True, load=load.get) == K2
         assert sched._affinity.get_and_refresh(flag) == K2
-        load[K1] = 0
-        assert await sched.select(flag, explicit=True, load=load.get) == K2  # rebind is sticky
 
 
 class TestAffinityCarryOver:

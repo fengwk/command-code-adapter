@@ -66,11 +66,13 @@ _DIRTY_GIT_STATUS: tuple[str, ...] = (
 _FEATURE_VERBS: tuple[str, ...] = ("add", "fix", "refactor", "improve", "harden")
 
 # Digest thresholds (raw sha256 bytes) - no randomness, no global state.
-# digest[0] < 180, i.e. 180/256 ~= 70% (about 2/3 to 3/4) of all slugs, keeps the
-# whole identity plain: "main", "Working tree clean" and the default structure.
-# The remaining ~30% spread over the alternatives above; inside that share each
-# field still keeps its plain value about half of the time.
-_PLAIN_PROJECT_MIN = 180
+# digest[0] < 175 keeps the whole identity plain: "main", "Working tree clean" and
+# the default structure. 175/256 is ~68% for arbitrary slugs, and ~73% over the
+# project pool the adapter actually reports (its 64 digests skew slightly low), so
+# production stays inside the intended 2/3 .. 3/4 band either way. The remaining
+# share spreads over the alternatives above; inside it each field still keeps its
+# plain value about half of the time.
+_PLAIN_PROJECT_MIN = 175
 
 
 def _node_platform() -> str:

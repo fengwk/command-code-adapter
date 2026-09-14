@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from cc_adapter.command_code.client import CommandCodeClient
 from cc_adapter.core.constants import KEY_MAX_CONCURRENT_STREAMS
 from cc_adapter.core.errors import AdapterError, AuthenticationError, UpstreamError
+from cc_adapter.providers.shared.session_extractor import SessionSignal
 
 
 @pytest.fixture
@@ -628,8 +629,8 @@ def _blocking_stream(gate: asyncio.Event, started: asyncio.Event | None = None, 
     return _stream
 
 
-async def _drain(client, body: dict, headers: dict | None = None) -> None:
-    async for _ in client.generate(body, headers):
+async def _drain(client, body: dict, headers: dict | None = None, session=None) -> None:
+    async for _ in client.generate(body, headers, session):
         pass
 
 
@@ -713,7 +714,7 @@ class TestPerKeyConcurrency:
 
     @pytest.mark.asyncio
     async def test_a_key_at_the_cap_hands_new_streams_to_another_key(self):
-        """KEY_MAX_CONCURRENT_STREAMS in action: the 5th stream leaves a 4-stream key."""
+        """KEY_MAX_CONCURRENT_STREAMS in action: a *new* conversation leaves a full key."""
         client = self._client()
         gate = asyncio.Event()
         all_busy = asyncio.Event()
@@ -733,15 +734,18 @@ class TestPerKeyConcurrency:
                 overflow_routed.set()
             return _blocking_stream(gate, on_start=on_start)(method, url, json, headers, **kwargs)
 
+        body = {"params": {"model": "test", "messages": []}}
         with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
             tasks = [
-                asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+                asyncio.create_task(_drain(client, body, session=SessionSignal(flag="msg:busy", explicit=False)))
                 for _ in range(KEY_MAX_CONCURRENT_STREAMS)
             ]
             await asyncio.wait_for(all_busy.wait(), timeout=5)
             assert client.key_load("key1") == KEY_MAX_CONCURRENT_STREAMS
-            # the saturated key is skipped: the next stream goes to the other account
-            overflow = asyncio.create_task(_drain(client, {"params": {"model": "test", "messages": []}}))
+            # the saturated key is skipped: the next *new* conversation goes to the other account
+            overflow = asyncio.create_task(
+                _drain(client, body, session=SessionSignal(flag="msg:overflow", explicit=False))
+            )
             await asyncio.wait_for(overflow_routed.wait(), timeout=5)
             assert used_keys == ["key1"] * KEY_MAX_CONCURRENT_STREAMS + ["key2"]
             gate.set()
