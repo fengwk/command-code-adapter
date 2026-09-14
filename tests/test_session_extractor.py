@@ -276,6 +276,46 @@ class TestFallbackStability:
         assert self.ex.extract({}, None, a).flag == self.ex.extract({}, None, b).flag
 
 
+class TestFallbackAnchorQuality:
+    """The content anchor must be specific enough not to merge conversations and
+    stable enough not to split one: both mistakes show up upstream as a wrong
+    session identity (a merged or a fresh conversation)."""
+
+    def setup_method(self):
+        self.ex = SessionExtractor()
+
+    def test_shared_boilerplate_head_does_not_merge_two_conversations(self):
+        # >100 characters of identical opening used to be enough to collide, which
+        # merged two unrelated conversations onto one upstream session identity.
+        boilerplate = "You are a helpful coding assistant working on a repository. " * 3
+        first = _cc_body(
+            model="m", system=boilerplate + "project alpha", messages=[{"role": "user", "content": "start"}]
+        )
+        second = _cc_body(
+            model="m", system=boilerplate + "project beta", messages=[{"role": "user", "content": "start"}]
+        )
+        assert self.ex.extract({}, None, first).flag != self.ex.extract({}, None, second).flag
+
+    def test_full_first_user_message_not_just_its_head(self):
+        head = "please review this diff " * 10  # shared opening well past 100 characters
+        a = _cc_body(model="m", system="s", messages=[{"role": "user", "content": head + "option A"}])
+        b = _cc_body(model="m", system="s", messages=[{"role": "user", "content": head + "option B"}])
+        assert self.ex.extract({}, None, a).flag != self.ex.extract({}, None, b).flag
+
+    def test_masked_system_dynamics_keep_the_anchor_stable(self):
+        def flag(system: str) -> str:
+            body = _cc_body(model="m", system=system, messages=[{"role": "user", "content": "hi"}])
+            return self.ex.extract({}, None, body).flag
+
+        assert flag("Today is 2026-09-15T00:00:00Z.") == flag("Today is 2026-09-16T11:22:33.500+08:00.")
+        assert flag("Today's date: 2026-09-15") == flag("Today's date: 2026-10-01")
+        assert flag("request 3f2504e0-4f89-11d3-9a0c-0305e82c3301") == flag(
+            "request 6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        )
+        # Stable content still separates conversations.
+        assert flag("Today is 2026-09-15. Project alpha.") != flag("Today is 2026-09-15. Project beta.")
+
+
 class TestContentHashFallbackShape:
     """Body-shape edge cases of the content hash (defensive, must not raise)."""
 

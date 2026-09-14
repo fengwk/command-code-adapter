@@ -6,11 +6,12 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
   ``KEY_COOLDOWN_BASE`` → ``KEY_COOLDOWN_MAX``, an out-of-credits key is parked
   for a flat ``KEY_CREDIT_COOLDOWN`` (30 min) with its cached balance zeroed;
 * credits-aware usability (a key with known zero credits is not usable);
-* round-robin bindings for explicit session identities, sticky for as long as
-  the session keeps talking (sliding TTL), so every turn of one conversation
-  stays on the same upstream account;
-* fill-first selection (first usable key) for requests without an explicit
-  session identity;
+* per-session bindings, sticky for as long as the session keeps talking (sliding
+  TTL), so every turn of one conversation stays on the same upstream account -
+  including conversations the adapter only knows by their content anchor, which
+  would otherwise be dragged to another account whenever the head key changes;
+* fill-first first assignment (first usable key) for conversations without an
+  explicit session identity, round-robin for the ones that carry one;
 * a manual per-key on/off switch for the admin panel (``disable()`` /
   ``enable()``): an off key is never selected regardless of its credits or
   health, and turning it back on clears the automatic health/credit marks so the
@@ -157,6 +158,13 @@ class KeyScheduler:
     # ------------------------------------------------------------------ select
 
     async def select(self, session_flag: str | None, *, explicit: bool, exclude: set[str] | None = None) -> str | None:
+        """Pick the key for one request.
+
+        `explicit` only decides how a conversation is *distributed on first sight*
+        (round-robin for a client-provided identity, fill-first for a content
+        anchor); either way the choice is remembered, so a conversation never
+        bounces between accounts after its key recovers from a cooldown.
+        """
         await self._ensure_credits()
         skip = exclude or set()
 
@@ -167,14 +175,19 @@ class KeyScheduler:
             # burning another upstream call on a key known to be unusable.
             return None
 
-        if explicit and session_flag:
+        if session_flag:
             bound = self._affinity.get_and_refresh(session_flag)
             if bound is not None and bound in usable:
                 logger.info("key.select", session=session_flag[:8], key=bound[-4:], reason="sticky")
                 return bound
-            chosen = self._next_round_robin(usable)
+            # First sight of a conversation. A client-provided identity rotates
+            # through the ring; a content-anchored one keeps the fill-first
+            # behaviour, yet is bound from now on: without the binding every
+            # conversation would follow the head key's cooldown and back, so one
+            # conversation would show up under two accounts over and over.
+            chosen = self._next_round_robin(usable) if explicit else usable[0]
             self._affinity.set(session_flag, chosen)
-            logger.info("key.bind", session=session_flag[:8], key=chosen[-4:])
+            logger.info("key.bind", session=session_flag[:8], key=chosen[-4:], explicit=explicit)
             return chosen
 
         chosen = usable[0]

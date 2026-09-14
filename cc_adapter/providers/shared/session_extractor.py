@@ -43,13 +43,17 @@ client-provided session identity down to a content hash of the translated body:
 8.  ``conversation`` (string, or object with ``id``)   -> ``conv:<value>``
 9.  ``session_id`` / ``sessionId``                     -> ``session:<value>``
     ``conversation_id`` / ``chat_id``                  -> ``conv:<value>``
-10. content hash of the CC body (system + first user
-    message, 100 chars each)                           -> ``msg:<hash16>``
+10. content hash of the CC body head (the full system
+    prompt + the full first user message, with dynamic
+    fragments masked)                                  -> ``msg:<hash16>``
 
 Levels 1-9 carry a client-provided session identity and yield
 ``explicit=True``; level 10 is the derived fallback and yields
 ``explicit=False``. The fallback anchors on the system prompt plus the *first*
-user message, so it stays identical while a conversation grows.
+user message, so it stays identical while a conversation grows. Both are hashed
+in full: truncating them let unrelated conversations with a shared boilerplate
+open the same upstream session, and timestamps are masked so a system prompt
+carrying "today" does not give the same conversation a new identity every day.
 
 Sources are duck-typed: inbound headers, the inbound protocol request (dict or
 pydantic model) and the translated CC body. Levels 7-9 are looked up on the
@@ -211,6 +215,23 @@ _HOME_LOGIN_POOL: tuple[str, ...] = (
     "wei",
     "yara",
     "zoe",
+)
+
+# Dynamic fragments a client injects into the system prompt per request (a clock,
+# a request id). They are masked before the prompt anchors the fallback identity,
+# mirroring CLIProxyAPI's normalizeText(maskSystemDynamics=true): without it the
+# same conversation looks like a new session whenever the value changes.
+_MASKED_SYSTEM_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"),
+        "<timestamp>",
+    ),
+    # A bare date drifts the same way a full timestamp does ("Today's date: ...").
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "<date>"),
+    (
+        re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"),
+        "<uuid>",
+    ),
 )
 
 _CMD_SESSION_PATTERN = re.compile(r"^sess_[0-9a-f]{16}$")
@@ -423,15 +444,14 @@ class SessionExtractor:
         return f"user:{hashlib.sha256(user_id.encode()).hexdigest()[:16]}"
 
     def _content_hash(self, body: Any) -> str:
-        """Hash system + first user message (truncated to 100 chars each).
+        """Hash the conversation head (system prompt + first user message).
 
-        The adapter sends a CC body ({..., params: {system, messages, ...}}) to
-        the upstream. System and messages live inside *params*, not at the
-        top level.
-
-        Anchors are chosen so the hash is identical across every turn of one
-        conversation: system prompt is stable, and only the first user message
-        is taken (later user turns and assistant replies do not contribute).
+        The anchor must be identical for every turn of one conversation, so it only
+        covers the head: the system prompt does not change mid-conversation and no
+        later turn touches the first user message. Both are hashed in full, so two
+        conversations that merely share a boilerplate opening stay distinct, and the
+        dynamic fragments of the system prompt are masked so a changing clock or
+        request id cannot split one conversation into several identities.
         """
         params = body.get("params") if isinstance(body, dict) else {}
         if not isinstance(params, dict):
@@ -439,11 +459,19 @@ class SessionExtractor:
         if not params:
             return "empty"
         h = hashlib.sha256()
-        h.update(f"sys:{self._first_text(params.get('system'))[:100]}\n".encode())
+        system = self._mask_system_dynamics(self._first_text(params.get("system")))
+        h.update(f"sys:{system}\n".encode())
         user_text = self._first_text_from_role(params.get("messages", []), "user")
         if user_text:
-            h.update(f"usr:{user_text[:100]}\n".encode())
+            h.update(f"usr:{user_text}\n".encode())
         return h.hexdigest()[:16]
+
+    @staticmethod
+    def _mask_system_dynamics(text: str) -> str:
+        """Replace per-request values (timestamps, dates, UUIDs) with placeholders."""
+        for pattern, replacement in _MASKED_SYSTEM_PATTERNS:
+            text = pattern.sub(replacement, text)
+        return text
 
     @staticmethod
     def _first_text(value: Any) -> str:

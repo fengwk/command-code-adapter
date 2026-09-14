@@ -96,7 +96,7 @@ Both translate to CC /alpha/generate body, stream SSE back.
 - **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `KEY_CREDIT_COOLDOWN`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `CLIENT_CLOSE_GRACE_SECONDS`, `VERSION`. The three key cooldowns are also config fields (`CC_ADAPTER_KEY_COOLDOWN_BASE|MAX`, `CC_ADAPTER_KEY_CREDIT_COOLDOWN`) so deployments can tune them from the environment.
 - **Version checker**: Background npm polling, cached 30min, fallback `1.6.0` (env `CC_ADAPTER_DEFAULT_VERSION`). See `core/version_checker.py`. Tests must set `_last_fetch_time = None` (not `0.0`) to guarantee cache invalidation.
 - **Model fetcher**: `core/model_fetcher.py` — downloads the cmd CLI npm tarball (`registry.npmjs.org`, 30min TTL), extracts model ids/context windows/reasoning efforts and rebuilds the model list plus `MODEL_PROVIDER_MAP` / `MODEL_REASONING_EFFORTS_MAP` via `refresh_maps()`. Unknown model ids pass through unchanged, so new upstream models need no code change; the static tables in `catalog/models_data.py` / `providers/shared/model_mapping.py` are only the pre-fetch fallback.
-- **Key scheduler**: `core/key_scheduler.py` — `KeyScheduler` replaces the old `KeyPool` (deleted). Owns per-key health (ok/cooling/disabled), credits, round-robin + sticky session bindings and the fill-first fallback.
+- **Key scheduler**: `core/key_scheduler.py` — `KeyScheduler` replaces the old `KeyPool` (deleted). Owns per-key health (ok/cooling/disabled), credits, per-session sticky bindings and the first-sight distribution (round-robin for client identities, fill-first for content anchors).
 
 ### CC Request Headers
 
@@ -134,7 +134,13 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 
 - **Sticky**: an explicit client session identity (see the `SessionExtractor.extract()` chain: `x-claude-code-session-id`, `metadata.user_id`, `session-id`, `x-session-id`, `x-conversation-id`, `prompt_cache_key`, …) is bound to a key; a new session is bound round-robin in configured key order.
 - An established binding outranks key order — a recovered key does not steal a session back.
-- **Fill-first**: requests without an explicit identity (content-hash fallback, `explicit=False`) always go to the first usable key and are never bound.
+- **First-sight distribution then stickiness**: an unbound conversation starts on the first usable key when the adapter only knows
+  its content anchor (`explicit=False`) and on the next ring slot when the client provided an identity (`explicit=True`); either way the
+  choice is bound to that session. Without the binding a content-anchored conversation would follow the head key's cooldown and back, so
+  one conversation would keep showing up under two accounts.
+- **Content anchor**: the fallback identity hashes the *full* system prompt and the *full* first user message (never truncated), with
+  timestamps, dates and UUIDs in the system prompt masked - a truncated head merged unrelated conversations, and an unmasked clock split one
+  conversation into a new identity every day.
 - **Per-key isolation**: each key keeps its own httpx pool (no shared TCP/TLS connection) and its own forged machine — `workingDir` is `/home/<login>/proj/<slug>` with the login derived from the key alone. A conversation that moves to another key switches session id + slug, which is intended.
 - Bindings slide: 1h TTL, 4096 entries, LRU eviction (`constants.py`).
 - Health: 401/403 disables a key and unbinds its sessions; 429 cools it down with escalating backoff (`KEY_COOLDOWN_BASE` → `KEY_COOLDOWN_MAX`); an out-of-credits failure (400 + "insufficient credits", or 402) parks the key for a flat `KEY_CREDIT_COOLDOWN` (30 min), zeroes its cached balance (the 30-min credits refresh, or `POST /admin/api/keys/{suffix}/enable`, clears it) and unbinds the affected session; 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.

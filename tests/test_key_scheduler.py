@@ -138,11 +138,30 @@ class TestFillFirstSelection:
         assert [await sched.select(None, explicit=False) for _ in range(3)] == [K1, K1, K1]
 
     @pytest.mark.asyncio
-    async def test_implicit_session_flag_is_never_bound(self):
-        """Only explicit session identities get affinity bindings."""
+    async def test_implicit_session_flag_binds_the_fill_first_head(self):
+        """A content-anchored conversation is bound too, but still starts at the head."""
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
-        assert await sched.select("header:implicit", explicit=False) == K1
-        assert sched._affinity.stats()["entries"] == 0
+        assert await sched.select("msg:implicit", explicit=False) == K1
+        assert sched._affinity.get_and_refresh("msg:implicit") == K1
+        assert sched._affinity.stats()["entries"] == 1
+        assert await sched.select("msg:implicit-2", explicit=False) == K1  # still fill-first
+
+    @pytest.mark.asyncio
+    async def test_bound_conversation_does_not_bounce_back_to_a_recovered_head(self):
+        """The binding is what keeps one conversation out of two accounts.
+
+        Fill-first alone drags every conversation to the head key as soon as its
+        cooldown expires, so the same content would reappear under two accounts
+        every time the head key cools and recovers.
+        """
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "msg:conversation"
+        assert await sched.select(flag, explicit=False) == K1
+        sched.report(K1, ok=False, status=429, session_flag=flag)  # K1 cools: migrate once
+        assert await sched.select(flag, explicit=False) == K2
+        expire_cooldown(sched, K1)  # head key is healthy again ...
+        assert await sched.select(flag, explicit=False) == K2  # ... and the conversation stays put
+        assert await sched.select("msg:another", explicit=False) == K1  # new one still fill-first
 
     @pytest.mark.asyncio
     async def test_zero_credit_head_key_is_skipped_until_credits_recover(self):
@@ -749,7 +768,7 @@ class TestLogging:
 
         events = recorder.events
         assert [event for event, _ in events] == ["key.bind", "key.cooldown", "key.disabled", "key.select"]
-        assert events[0][1] == {"session": flag[:8], "key": K1[-4:]}
+        assert events[0][1] == {"session": flag[:8], "key": K1[-4:], "explicit": True}
         assert events[3][1] == {"key": K2[-4:], "reason": "no-session"}  # K1 is disabled, fill-first moves on
         for _, kwargs in events:
             assert flag not in str(kwargs)

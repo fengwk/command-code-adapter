@@ -86,7 +86,7 @@ volumes:
 配置多个 Key（`CC_ADAPTER_CC_API_KEY=["k1","k2"]`）时，适配器按"会话粘性 + 首可用优先"分配上游 Key：
 
 - 客户端带会话标识时（Claude Code 的 `x-claude-code-session-id` / `metadata.user_id`、Codex 的 `session-id`、`x-session-id`、`prompt_cache_key` 等），同一会话固定使用同一个 Key；新会话按配置顺序轮询分配 —— 目的是最大化上游 prompt cache 命中率。
-- 识别不到会话标识的请求固定使用第一个可用 Key（fill-first），保证行为可预期。
+- 识别不到会话标识的请求（按内容锚定）首次仍取第一个可用 Key（fill-first），但其会话绑定会被记住：即使该 Key 进入冷却后恢复，这段对话也不会被搬回去，避免同一段内容反复出现在两个账号上。
 - Key 故障自动切换：401/403 直接禁用该 Key；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
 - 所有 Key 都不可用时**不再消耗上游调用**，直接返回最后一个 Key 的失败信息（附各 Key 状态摘要）。
 - 手动开关：面板可单独把某个 Key 关掉/打开。关掉后该 Key **永不被选中**（无视其额度与健康状态），其绑定的会话立即解绑并在下次请求切到其他 Key；打开后**立即可用**（清除手动标记与冷却/禁用状态、丢弃已缓存的余额并后台刷新），充值后用它恢复即可。自动冷却逻辑与手动开关互不影响。
@@ -319,7 +319,9 @@ Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel'
 With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adapter assigns upstream keys by session stickiness plus first-usable fallback:
 
 - Requests carrying a session identity (Claude Code `x-claude-code-session-id` / `metadata.user_id`, Codex `session-id`, `x-session-id`, `prompt_cache_key`, …) stick to one key per conversation; new sessions are bound round-robin in configured order — this maximizes upstream prompt-cache hits.
-- Requests without a session identity always use the first usable key (fill-first).
+- A request the adapter can only identify by its content anchor still starts on the first usable key (fill-first), but that
+  conversation is bound from then on: once its key cools down and recovers, the conversation is not dragged back, so one
+  conversation never keeps reappearing under two accounts.
 - Failures fail over automatically: 401/403 disables a key, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
 - When every key is unusable the adapter makes **no further upstream call** and returns the last key's failure together with a per-key state summary.
 - Manual switch: the panel can turn an individual key off/on. Off means the key is **never selected** (regardless of its credits or health) and its bound sessions are unbound immediately, so the next turn moves to another key; on makes it **immediately selectable** (manual mark plus cooling/disabled state cleared, cached balance dropped and refreshed in the background), which is the way to restore a key right after a top-up. Automatic cooldowns keep working independently of the switch.
