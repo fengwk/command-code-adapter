@@ -5,6 +5,7 @@ import os
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from cc_adapter.core.constants import KEY_COOLDOWN_BASE, KEY_COOLDOWN_MAX, KEY_CREDIT_COOLDOWN
 from cc_adapter.core.utils import normalize_api_keys
 
 
@@ -40,6 +41,12 @@ class AppConfig(BaseSettings):
     http_max_connections: int = 200
     http_max_keepalive_connections: int = 50
     http2: bool = False
+
+    # Key-scheduler cooldowns (seconds). Defaults mirror core/constants.py so the
+    # values can be tuned from the environment without touching the code.
+    key_cooldown_base: float = KEY_COOLDOWN_BASE
+    key_cooldown_max: float = KEY_COOLDOWN_MAX
+    key_credit_cooldown: float = KEY_CREDIT_COOLDOWN
 
     zdr: bool = True
 

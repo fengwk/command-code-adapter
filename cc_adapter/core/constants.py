@@ -18,6 +18,9 @@ KEY_CREDITS_ERROR_BACKOFF: int = 60
 
 KEY_COOLDOWN_BASE: float = 60.0
 KEY_COOLDOWN_MAX: float = 1800.0
+# Flat cooldown for a key the upstream reported as out of credits: the balance
+# cannot recover by itself, so short retries only waste upstream calls.
+KEY_CREDIT_COOLDOWN: float = 1800.0
 SESSION_AFFINITY_TTL: float = 3600.0
 SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 

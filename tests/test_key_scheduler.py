@@ -17,6 +17,7 @@ from cc_adapter.core import key_scheduler as ks
 from cc_adapter.core.constants import (
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
+    KEY_CREDIT_COOLDOWN,
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
     SESSION_AFFINITY_TTL,
@@ -241,29 +242,65 @@ class TestSessionAffinity:
 
 
 class TestReport:
-    def test_402_cools_down_with_escalating_backoff(self):
+    def test_out_of_credits_parks_key_for_flat_window(self):
         sched = make_scheduler([K1], {K1: 100})
         for attempt in (1, 2, 3):
-            sched.report(K1, ok=False, status=402)
+            sched.report(K1, ok=False, status=400, reason="insufficient_credits")
             state = sched.key_state(K1)
             assert state["state"] == "cooling"
             assert state["failures"] == attempt
-            assert state["reason"] == "http_402"
+            assert state["reason"] == "insufficient_credits"
+            assert state["credits"] == 0  # cached balance is zeroed
+            # flat window, no exponential ramp
+            assert state["until"] - time.monotonic() == pytest.approx(KEY_CREDIT_COOLDOWN, abs=1.0)
+
+    def test_payment_required_also_parks_key(self):
+        sched = make_scheduler([K1], {K1: 100})
+        sched.report(K1, ok=False, status=402)
+        state = sched.key_state(K1)
+        assert state["credits"] == 0
+        assert state["until"] - time.monotonic() == pytest.approx(KEY_CREDIT_COOLDOWN, abs=1.0)
+
+    def test_parked_key_is_second_choice_for_the_next_request(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.report(K1, ok=False, status=400, reason="insufficient_credits")
+        assert asyncio.run(sched.select("header:s1", explicit=True)) == K2
+
+    def test_rate_limit_cools_down_with_escalating_backoff(self):
+        sched = make_scheduler([K1], {K1: 100})
+        for attempt in (1, 2, 3):
+            sched.report(K1, ok=False, status=429, reason="rate_limited")
+            state = sched.key_state(K1)
+            assert state["state"] == "cooling"
+            assert state["failures"] == attempt
+            assert state["reason"] == "rate_limited"
             assert state["until"] - time.monotonic() == pytest.approx(KEY_COOLDOWN_BASE * 2 ** (attempt - 1), abs=1.0)
 
     def test_cooldown_escalation_caps_at_max(self):
         sched = make_scheduler([K1], {K1: 100})
         for _ in range(10):
-            sched.report(K1, ok=False, status=429)
+            sched.report(K1, ok=False, status=429, reason="rate_limited")
         assert sched.key_state(K1)["failures"] == 10
         assert sched.key_state(K1)["until"] - time.monotonic() == pytest.approx(KEY_COOLDOWN_MAX, abs=1.0)
 
-    def test_insufficient_credits_reason_cools_key(self):
+    def test_scheduler_cooldowns_are_injectable(self):
+        sched = KeyScheduler([K1], BASE_URL, cooldown_base=5, cooldown_max=7, credit_cooldown=42)
+        sched._credits[K1] = 100
+        sched._last_fetch = time.monotonic()
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
+        assert sched.key_state(K1)["until"] - time.monotonic() == pytest.approx(5, abs=1.0)
+        sched.report(K1, ok=False, status=400, reason="insufficient_credits")
+        assert sched.key_state(K1)["until"] - time.monotonic() == pytest.approx(42, abs=1.0)
+
+    def test_reset_clears_the_zero_credit_mark(self):
         sched = make_scheduler([K1], {K1: 100})
-        sched.report(K1, ok=False, reason="insufficient_credits")
+        sched.report(K1, ok=False, status=400, reason="insufficient_credits")
+        assert sched.key_state(K1)["credits"] == 0
+        sched.reset_key(K1)
         state = sched.key_state(K1)
-        assert state["state"] == "cooling"
-        assert state["reason"] == "insufficient_credits"
+        assert state["state"] == "ok"
+        assert state["credits"] is None
+        assert state["until"] is None
 
     @pytest.mark.parametrize("status", [401, 403])
     def test_auth_status_disables_key_and_unbinds_sessions(self, status):
@@ -300,7 +337,7 @@ class TestReport:
 
     def test_report_ok_resets_health(self):
         sched = make_scheduler([K1], {K1: 100})
-        sched.report(K1, ok=False, status=402)
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
         sched.report(K1, ok=True)
         assert sched.key_state(K1) == {
             "state": "ok",
@@ -311,23 +348,31 @@ class TestReport:
             "sessions": 0,
         }
 
+    def test_success_does_not_clear_a_zero_credit_mark(self):
+        """A key parked for credits only recovers via the credits refresh or /reset."""
+        sched = make_scheduler([K1], {K1: 100})
+        sched.report(K1, ok=False, status=400, reason="insufficient_credits")
+        sched.report(K1, ok=True)
+        assert sched.key_state(K1)["credits"] == 0
+        assert sched.key_state(K1)["state"] == "ok"
+
     def test_cooling_window_expiry_keeps_failures_so_backoff_keeps_escalating(self):
         sched = make_scheduler([K1], {K1: 100})
-        sched.report(K1, ok=False, status=402)
-        sched.report(K1, ok=False, status=402)
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
         expire_cooldown(sched, K1)
         expired = sched.key_state(K1)
         assert expired["state"] == "ok"
         assert expired["until"] is None
         assert expired["reason"] is None
         assert expired["failures"] == 2  # counter survives the window
-        sched.report(K1, ok=False, status=402)
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
         assert sched.key_state(K1)["until"] - time.monotonic() == pytest.approx(KEY_COOLDOWN_BASE * 4, abs=1.0)
 
     def test_reset_key_clears_cooling_and_disabled_health(self):
         sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
         sched.report(K1, ok=False, status=401)
-        sched.report(K2, ok=False, status=429)
+        sched.report(K2, ok=False, status=429, reason="rate_limited")
         sched.reset_key(K1)
         sched.reset_key(K2)
         assert sched.key_state(K1)["state"] == "ok"
@@ -335,7 +380,7 @@ class TestReport:
             "state": "ok",
             "until": None,
             "reason": None,
-            "credits": 100,
+            "credits": None,  # reset drops the cached balance so the key is selectable now
             "failures": 0,
             "sessions": 0,
         }
@@ -367,33 +412,37 @@ class TestReport:
         assert await sched.select(flag, explicit=True) == K2
 
 
-class TestSelectExcludeAndRelax:
+class TestSelectExcludeAndFailFast:
     @pytest.mark.asyncio
     async def test_exclude_removes_key_from_selection(self):
         sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
         assert await sched.select(None, explicit=False, exclude={K1}) == K2
 
     @pytest.mark.asyncio
-    async def test_relaxed_selection_ignores_cooldown_and_zero_credits(self):
+    async def test_no_selection_when_every_key_is_cooling_or_out_of_credits(self):
         sched = make_scheduler([K1, K2], {K1: 0, K2: 0})
         sched.report(K1, ok=False, status=402)
-        assert await sched.select(None, explicit=False) == K1
-        assert await sched.select(None, explicit=False, exclude={K1}) == K2
+        assert await sched.select(None, explicit=False) is None
+        assert await sched.select("header:s1", explicit=True) is None
 
     @pytest.mark.asyncio
-    async def test_relaxed_selection_still_skips_disabled_keys(self):
+    async def test_no_selection_skips_disabled_keys(self):
         sched = make_scheduler([K1, K2], {K1: 100, K2: 0})
         sched.report(K1, ok=False, status=401)
         sched.report(K2, ok=False, status=402)
-        assert await sched.select(None, explicit=False) == K2
+        assert await sched.select(None, explicit=False) is None
 
     @pytest.mark.asyncio
-    async def test_relaxed_selection_returns_the_bound_key_for_a_sticky_session(self):
-        """When nothing is strictly usable, an explicit session keeps its binding anyway."""
-        sched = make_scheduler([K1, K2], {K1: 0, K2: 0})
-        flag = "header:relaxed-session"
+    async def test_cooled_key_recovers_after_the_window_and_keeps_its_binding(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        flag = "header:parked-session"
         assert await sched.select(flag, explicit=True) == K1
-        sched.report(K1, ok=False, status=402)
+        sched.report(K1, ok=False, status=429, reason="rate_limited", session_flag=flag)
+        # Other keys are busy-free, so the session rebinds instead of failing.
+        assert await sched.select(flag, explicit=True) == K2
+        sched.report(K2, ok=False, status=429, reason="rate_limited", session_flag=flag)
+        assert await sched.select(flag, explicit=True) is None
+        expire_cooldown(sched, K1)
         assert await sched.select(flag, explicit=True) == K1
 
     @pytest.mark.asyncio

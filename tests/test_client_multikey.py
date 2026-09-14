@@ -257,8 +257,8 @@ class TestMultiKeyClient:
         assert call_count == 1
 
     @pytest.mark.asyncio
-    async def test_all_keys_exhausted_raises_last_error(self, error_response_402):
-        """When all keys return 402, the last error is raised."""
+    async def test_keys_without_credits_fail_fast_without_upstream_call(self, error_response_402):
+        """Known-broke keys are never tried: the error explains every key's state."""
         client = CommandCodeClient(
             base_url="https://api.example.com",
             api_key="key1",
@@ -275,11 +275,71 @@ class TestMultiKeyClient:
             return error_response_402
 
         with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            with pytest.raises(AdapterError) as excinfo:
+                async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                    pass
+
+        assert call_count == 0
+        message = str(excinfo.value)
+        assert "no usable CC key" in message
+        assert "out of credits" in message
+
+    @pytest.mark.asyncio
+    async def test_all_keys_parked_reports_the_last_upstream_failure(self, error_response_400_insufficient_credits):
+        """Once every key is parked the next request fails with the last upstream error."""
+        client = CommandCodeClient(
+            base_url="https://api.example.com",
+            api_key="key1",
+            api_keys=["key1", "key2"],
+        )
+        client.scheduler._credits = {"key1": 100, "key2": 100}
+        client.scheduler._last_fetch = time.monotonic()
+
+        call_count = 0
+
+        def mock_stream(method, url, json, headers, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return error_response_400_insufficient_credits
+
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            with pytest.raises(AdapterError):
+                async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                    pass
+            assert call_count == 2  # both keys parked on the first request
+            assert client.scheduler.last_failure()["status"] == 400
+
+            with pytest.raises(AdapterError) as excinfo:
+                async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                    pass
+
+        assert call_count == 2  # fail-fast: no further upstream call
+        message = str(excinfo.value)
+        assert "insufficient credits" in message
+        assert "****key1" in message or "****key2" in message
+        assert client.scheduler.last_failure()["detail"].startswith('{"success":false')
+
+    @pytest.mark.asyncio
+    async def test_cooldowns_come_from_the_config(self, error_response_400_insufficient_credits):
+        """CC_ADAPTER_KEY_CREDIT_COOLDOWN reaches the scheduler through create_client()."""
+        from cc_adapter.core.config import AppConfig
+        from cc_adapter.core.runtime import create_client
+
+        cfg = AppConfig(cc_api_key=["key1", "key2"], key_credit_cooldown=90)
+        client = create_client(cfg)
+        client.scheduler._credits = {"key1": 100, "key2": 100}
+        client.scheduler._last_fetch = time.monotonic()
+
+        with patch.object(
+            httpx.AsyncClient, "stream", side_effect=lambda *a, **kw: error_response_400_insufficient_credits
+        ):
             with pytest.raises(AdapterError):
                 async for _ in client.generate({"params": {"model": "test", "messages": []}}):
                     pass
 
-        assert call_count == 2
+        state = client.scheduler.key_state("key1")
+        assert state["reason"] == "insufficient_credits"
+        assert state["until"] - time.monotonic() == pytest.approx(90, abs=2.0)
 
     @pytest.mark.asyncio
     async def test_retry_order_follows_key_priority(self, sse_stream):

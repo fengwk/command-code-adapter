@@ -6,7 +6,8 @@ from typing import AsyncGenerator, Any
 
 import httpx
 
-from cc_adapter.core.errors import map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
+from cc_adapter.core.constants import KEY_COOLDOWN_BASE, KEY_COOLDOWN_MAX, KEY_CREDIT_COOLDOWN
+from cc_adapter.core.errors import AdapterError, map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
 from cc_adapter.command_code.body import bind_workspace
 from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.providers.shared.session_extractor import SessionSignal, get_session_extractor
@@ -97,6 +98,9 @@ class CommandCodeClient:
         max_keepalive_connections: int = 50,
         http2: bool = False,
         api_keys: list[str] | None = None,
+        key_cooldown_base: float = KEY_COOLDOWN_BASE,
+        key_cooldown_max: float = KEY_COOLDOWN_MAX,
+        key_credit_cooldown: float = KEY_CREDIT_COOLDOWN,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -110,7 +114,13 @@ class CommandCodeClient:
         if api_keys and len(api_keys) > 1:
             from cc_adapter.core.key_scheduler import KeyScheduler
 
-            self.scheduler: KeyScheduler | None = KeyScheduler(api_keys, self.base_url)
+            self.scheduler: KeyScheduler | None = KeyScheduler(
+                api_keys,
+                self.base_url,
+                cooldown_base=key_cooldown_base,
+                cooldown_max=key_cooldown_max,
+                credit_cooldown=key_credit_cooldown,
+            )
         else:
             self.scheduler = None
 
@@ -158,12 +168,12 @@ class CommandCodeClient:
             if not key:
                 if last_error is not None:
                     raise last_error
-                raise AuthenticationError("CC_ADAPTER_CC_API_KEY is not configured")
+                raise self._no_key_error()
 
             if key in tried_keys:
                 if last_error is not None:
                     raise last_error
-                raise AuthenticationError("CC_ADAPTER_CC_API_KEY is not configured")
+                raise self._no_key_error()
 
             tried_keys.add(key)
 
@@ -229,4 +239,23 @@ class CommandCodeClient:
             reason = "rate_limited"
         elif status_code == 400 and any(p in body_text.lower() for p in _INSUFFICIENT_CREDITS_PHRASES):
             reason = "insufficient_credits"
-        self.scheduler.report(key, ok=False, status=status_code, reason=reason, session_flag=signal.flag)
+        self.scheduler.report(
+            key,
+            ok=False,
+            status=status_code,
+            reason=reason,
+            session_flag=signal.flag,
+            detail=body_text,
+        )
+
+    def _no_key_error(self) -> AdapterError:
+        """Error for a request the scheduler cannot route: report the last failure."""
+        if self.scheduler is None:
+            return AuthenticationError("CC_ADAPTER_CC_API_KEY is not configured")
+        message = self.scheduler.unavailable_summary()
+        last = self.scheduler.last_failure()
+        if last and last.get("detail"):
+            message += f"; last upstream error ({last['status']}): {last['detail']}"
+        if last and last.get("status"):
+            return map_upstream_error(int(last["status"]), message)
+        return AdapterError(message, status_code=503, original_status=503)

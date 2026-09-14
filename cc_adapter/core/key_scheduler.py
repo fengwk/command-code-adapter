@@ -2,7 +2,9 @@
 
 Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
 
-* per-key health (``ok`` / ``cooling`` with escalating backoff / ``disabled``);
+* per-key health (``ok`` / ``cooling`` / ``disabled``): rate limits escalate
+  ``KEY_COOLDOWN_BASE`` → ``KEY_COOLDOWN_MAX``, an out-of-credits key is parked
+  for a flat ``KEY_CREDIT_COOLDOWN`` (30 min) with its cached balance zeroed;
 * credits-aware usability (a key with known zero credits is not usable);
 * round-robin bindings for explicit session identities, sticky for as long as
   the session keeps talking (sliding TTL), so every turn of one conversation
@@ -26,6 +28,7 @@ from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.core.constants import (
     KEY_COOLDOWN_BASE,
     KEY_COOLDOWN_MAX,
+    KEY_CREDIT_COOLDOWN,
     KEY_CREDITS_CACHE_TTL,
     KEY_CREDITS_ERROR_BACKOFF,
     SESSION_AFFINITY_MAX_ENTRIES,
@@ -43,6 +46,16 @@ def _reason_text(reason: str | None, status: int | None) -> str | None:
     if reason:
         return reason
     return f"http_{status}" if status is not None else None
+
+
+def _format_remaining(seconds: float) -> str:
+    """Compact remaining-cooldown text for logs and error messages."""
+    seconds = max(seconds, 0.0)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 class SessionAffinityCache:
@@ -104,12 +117,24 @@ class SessionAffinityCache:
 
 
 class KeyScheduler:
-    def __init__(self, keys: list[str], base_url: str):
+    def __init__(
+        self,
+        keys: list[str],
+        base_url: str,
+        *,
+        cooldown_base: float = KEY_COOLDOWN_BASE,
+        cooldown_max: float = KEY_COOLDOWN_MAX,
+        credit_cooldown: float = KEY_CREDIT_COOLDOWN,
+    ):
         self._keys = list(keys)
         self._base_url = base_url.rstrip("/")
+        self._cooldown_base = float(cooldown_base)
+        self._cooldown_max = float(cooldown_max)
+        self._credit_cooldown = float(credit_cooldown)
         self._credits: dict[str, int] = {}
         self._last_fetch: float | None = None
         self._last_error: str | None = None
+        self._last_failure: dict[str, Any] | None = None
         self._fetch_task: asyncio.Task[None] | None = None
         self._fetch_lock = asyncio.Lock()
 
@@ -128,10 +153,9 @@ class KeyScheduler:
 
         usable = [key for key in self._keys if key not in skip and self._usable(key)]
         if not usable:
-            # Everything is cooling or out of credits: relax health and credits,
-            # but never hand out a disabled key.
-            usable = [key for key in self._keys if key not in skip and self._health(key) != STATE_DISABLED]
-        if not usable:
+            # Nothing can serve the request (every key is cooling, disabled or out of
+            # credits). Fail fast: the caller reports `last_failure()` instead of
+            # burning another upstream call on a key known to be unusable.
             return None
 
         if explicit and session_flag:
@@ -177,10 +201,19 @@ class KeyScheduler:
         status: int | None = None,
         reason: str | None = None,
         session_flag: str | None = None,
+        detail: str | None = None,
     ) -> None:
         if ok:
             self._clear_health(key)
             return
+
+        self._last_failure = {
+            "key": key,
+            "status": status,
+            "reason": _reason_text(reason, status),
+            "detail": (detail or "")[:300] or None,
+            "at": time.monotonic(),
+        }
 
         if status in (401, 403) or reason == "invalid_key":
             self._state[key] = STATE_DISABLED
@@ -193,7 +226,15 @@ class KeyScheduler:
         if status in (402, 429) or reason == "insufficient_credits":
             failures = self._failures.get(key, 0) + 1
             self._failures[key] = failures
-            cooldown = min(KEY_COOLDOWN_BASE * 2 ** (failures - 1), KEY_COOLDOWN_MAX)
+            if reason == "insufficient_credits" or status == 402:
+                # Out of credits: no request can succeed until the account is topped up,
+                # so park the key for a fixed window instead of probing it every minute.
+                # The credits refresh (30 min TTL) replaces the zero mark once the
+                # balance recovers; POST /admin/api/keys/{suffix}/reset clears it early.
+                self._credits[key] = 0
+                cooldown = self._credit_cooldown
+            else:
+                cooldown = min(self._cooldown_base * 2 ** (failures - 1), self._cooldown_max)
             self._state[key] = STATE_COOLING
             self._until[key] = time.monotonic() + cooldown
             self._reason[key] = _reason_text(reason, status)
@@ -202,6 +243,7 @@ class KeyScheduler:
                 "key.cooldown",
                 key=key[-4:],
                 status=status,
+                reason=self._reason[key],
                 failures=failures,
                 cooldown=cooldown,
                 unbound=unbound,
@@ -252,6 +294,26 @@ class KeyScheduler:
         """Masked key suffixes in configured order (admin display)."""
         return [f"****{key[-4:]}" for key in self._keys]
 
+    def last_failure(self) -> dict[str, Any] | None:
+        """Most recent key-level upstream failure, for error reporting."""
+        return dict(self._last_failure) if self._last_failure else None
+
+    def unavailable_summary(self) -> str:
+        """One-line per-key state describing why no key can serve a request."""
+        now = time.monotonic()
+        parts: list[str] = []
+        for key in self._keys:
+            state = self.key_state(key)
+            detail = state["state"]
+            if state["state"] == STATE_COOLING and state["until"] is not None:
+                detail += f" {_format_remaining(state['until'] - now)} left"
+            if state["reason"]:
+                detail += f" ({state['reason']})"
+            elif state["credits"] == 0:
+                detail += " (out of credits)"
+            parts.append(f"****{key[-4:]} {detail}")
+        return f"no usable CC key: {len(self._keys)} configured [{'; '.join(parts)}]"
+
     def key_by_suffix(self, suffix: str) -> str | None:
         """Resolve a configured key from its last characters, None when ambiguous."""
         suffix = suffix.lstrip("*")
@@ -262,8 +324,15 @@ class KeyScheduler:
         return self._affinity.clear()
 
     def reset_key(self, key: str) -> None:
-        """Clear cooling/disabled health so the key is selectable again."""
+        """Clear cooling/disabled health and the cached zero-credit mark.
+
+        This is the ops escape hatch after topping an account up: dropping the
+        cached credits makes the key selectable immediately, and the background
+        refresh replaces it with the real balance.
+        """
         self._clear_health(key)
+        self._credits.pop(key, None)
+        self._trigger_refresh()
 
     # ----------------------------------------------------------------- credits
 

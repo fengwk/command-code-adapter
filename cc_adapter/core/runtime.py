@@ -23,6 +23,9 @@ def create_client(cfg: AppConfig, *, timeout: float | None = None) -> CommandCod
         max_keepalive_connections=cfg.http_max_keepalive_connections,
         http2=cfg.http2,
         timeout=timeout if timeout is not None else 60.0,
+        key_cooldown_base=cfg.key_cooldown_base,
+        key_cooldown_max=cfg.key_cooldown_max,
+        key_credit_cooldown=cfg.key_credit_cooldown,
     )
 
 
