@@ -10,6 +10,8 @@ from typing import Any
 
 import structlog
 
+from cc_adapter.core.config import data_dir
+
 logger = structlog.get_logger(__name__)
 
 DEFAULT_DATA_FILE = "token_usage.json"
@@ -17,7 +19,7 @@ DEFAULT_DATA_FILE = "token_usage.json"
 
 class TokenRecorder:
     def __init__(self, data_path: str | Path | None = None) -> None:
-        self._path = Path(data_path) if data_path else Path(DEFAULT_DATA_FILE)
+        self._path = Path(data_path) if data_path else data_dir() / DEFAULT_DATA_FILE
         self._lock = asyncio.Lock()
         self._data: dict[str, dict[str, Any]] = {}
         self._loaded = False
@@ -67,7 +69,9 @@ class TokenRecorder:
             self._atomic_write()
 
     def _atomic_write(self) -> None:
-        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="token_usage_")
+        # Keep the temp file next to the target: the data directory may live on a mounted
+        # volume, where renaming from /tmp would fail with EXDEV (cross-device link).
+        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="token_usage_", dir=str(self._path.parent))
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(self._data, f, indent=2, sort_keys=True)

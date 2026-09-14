@@ -14,6 +14,9 @@ from pathlib import Path
 import httpx
 import structlog
 
+from cc_adapter.core.config import data_dir
+from cc_adapter.core.constants import NPM_URL, NPM_CACHE_TTL, NPM_ERROR_BACKOFF
+
 logger = structlog.get_logger(__name__)
 
 MODEL_PREFIXES = (
@@ -32,14 +35,12 @@ MODEL_PREFIXES = (
     "xiaomi/",
 )
 
-from cc_adapter.core.constants import NPM_URL, NPM_CACHE_TTL, NPM_ERROR_BACKOFF
-
 DEFAULT_CACHE_FILE = "models_cache.json"
 
 
 class ModelFetcher:
     def __init__(self, cache_path: str | Path | None = None) -> None:
-        self._cache_path = Path(cache_path) if cache_path else Path(DEFAULT_CACHE_FILE)
+        self._cache_path = Path(cache_path) if cache_path else data_dir() / DEFAULT_CACHE_FILE
         self._models_data: list[dict] = []
         self._provider_map: dict[str, str] = {}
         self._reasoning_efforts: dict[str, list[str]] = {}
@@ -285,7 +286,9 @@ class ModelFetcher:
             return entries
 
     def _atomic_write_cache(self, data: dict) -> None:
-        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="models_cache_")
+        # Keep the temp file next to the target: the data directory may live on a mounted
+        # volume, where renaming from /tmp would fail with EXDEV (cross-device link).
+        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="models_cache_", dir=str(self._cache_path.parent))
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)

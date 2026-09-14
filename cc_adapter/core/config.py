@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,16 @@ def env_file_path() -> str:
     mount of ``/app/.env`` would break the atomic rewrite in ``update_env_file``.
     """
     return os.environ.get(ENV_FILE_ENV_VAR) or ".env"
+
+
+def data_dir() -> Path:
+    """Directory that holds runtime data files (token usage, model cache).
+
+    They live next to the dotenv file so panel-written config and the artefacts
+    that go with it share the mounted volume and survive a container recreate
+    (``docker compose up --force-recreate``) instead of vanishing with the CWD.
+    """
+    return Path(env_file_path()).parent
 
 
 class AppConfig(BaseSettings):
