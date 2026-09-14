@@ -692,30 +692,30 @@ function showTokenManager() {
     const keyVal = keyInput.value.trim();
     if (!keyVal) return;
     const row = document.createElement("div");
+    // Full key stays on the row; only the masked form is rendered (and it must never be read back)
+    row.dataset.key = keyVal;
     row.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid var(--border);";
     row.innerHTML = `
-      <input class="tm-item-label" value="${labelInput.value.trim()}" placeholder="${t("tokenLabel")}" style="width:80px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);font-size:12px;">
-      <code style="flex:1;font-size:12px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${keyVal.slice(0, 12)}...${keyVal.slice(-8)}</code>
+      <input class="tm-item-label" placeholder="${t("tokenLabel")}" style="width:80px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);font-size:12px;">
+      <code style="flex:1;font-size:12px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(keyVal.slice(0, 12) + "..." + keyVal.slice(-8))}</code>
       <button style="color:var(--error);background:none;border:none;cursor:pointer;font-size:16px;" onclick="this.parentElement.remove()">&times;</button>`;
+    // Set the label via DOM property so operator input is never interpolated into markup
+    row.querySelector(".tm-item-label").value = labelInput.value.trim();
     listEl.appendChild(row);
     keyInput.value = "";
     labelInput.value = "";
   };
 
   document.getElementById("tm-save").onclick = async () => {
-    const items = listEl.querySelectorAll(".tm-item-label");
     const tokens = [];
-    // Reconstruct from DOM: each row has a label input and a code element
-    const rows = listEl.children;
-    for (const row of rows) {
+    // Build the token list from the stored full keys, never from the masked row text
+    for (const row of listEl.children) {
+      const keyVal = row.dataset.key;
+      if (!keyVal) continue;
+      tokens.push(keyVal);
       const labelInput = row.querySelector(".tm-item-label");
-      const codeEl = row.querySelector("code");
-      if (codeEl) {
-        const keyVal = codeEl.textContent.replace("...", "");
-        tokens.push(keyVal);
-        if (labelInput && labelInput.value) {
-          localStorage.setItem("cc-token-label-" + keyVal, labelInput.value);
-        }
+      if (labelInput && labelInput.value) {
+        localStorage.setItem("cc-token-label-" + keyVal, labelInput.value);
       }
     }
     const body = { cc_api_key: JSON.stringify(tokens) };

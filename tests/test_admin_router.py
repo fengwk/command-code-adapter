@@ -200,3 +200,18 @@ def test_admin_js_shows_key_summary_only_as_placeholder():
     assert "keyInput.placeholder = configData.cc_api_key" in src
     # loadConfig and saveConfig both leave the input empty
     assert src.count('keyInput.value = ""') >= 2
+
+
+def test_admin_js_token_manager_saves_full_keys():
+    """Static guard: the token dialog must save the stored full keys, never the masked row text."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    # The row carries the full key; only the masked form is rendered (escaped, and only here)
+    assert "row.dataset.key = keyVal" in src
+    assert "escapeHtml(keyVal.slice(0, 12)" in src
+    assert src.count("keyVal.slice(0, 12)") == 1
+    # tm-save rebuilds the token list from the stored value, not from the truncated DOM text
+    assert "const keyVal = row.dataset.key;" in src
+    assert 'codeEl.textContent.replace("...", "")' not in src
+    assert 'querySelector("code")' not in src
