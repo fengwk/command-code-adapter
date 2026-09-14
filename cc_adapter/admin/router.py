@@ -193,7 +193,7 @@ def _mask_key(key: str) -> str:
 
 @router.get("/keys")
 async def list_keys(_=Depends(verify_auth)):
-    """Per-key scheduler state (credits, health, bound sessions) for ops."""
+    """Per-key scheduler state (credits, health, manual switch, bound sessions) for ops."""
     scheduler = _key_scheduler()
     if scheduler is None:
         cfg = get_config()
@@ -204,10 +204,13 @@ async def list_keys(_=Depends(verify_auth)):
                     "key": _mask_key(key),
                     "state": "unmanaged",
                     "until": None,
+                    "cooldown_seconds": None,
                     "reason": None,
                     "credits": None,
                     "failures": 0,
                     "sessions": 0,
+                    "enabled": True,
+                    "manual": False,
                 }
                 for key in keys
             ]
@@ -224,18 +227,33 @@ async def clear_sessions(_=Depends(verify_auth)):
     return {"cleared": cleared}
 
 
-@router.post("/keys/{suffix}/reset")
-async def reset_key(suffix: str, _=Depends(verify_auth)):
-    """Clear the cooling/disabled state of one key (identified by its suffix)."""
+def _scheduler_and_key(suffix: str):
+    """Resolve the active scheduler and one of its keys by suffix (404 otherwise)."""
     scheduler = _key_scheduler()
     if scheduler is None:
         raise HTTPException(status_code=404, detail="No key scheduler is active")
     key = scheduler.key_by_suffix(suffix)
     if key is None:
-        raise HTTPException(status_code=404, detail="Unknown key suffix")
-    scheduler.reset_key(key)
-    logger.info("admin.key.reset", key_last4=suffix)
+        raise HTTPException(status_code=404, detail="Unknown or ambiguous key suffix")
+    return scheduler, key
+
+
+@router.post("/keys/{suffix}/enable")
+async def enable_key(suffix: str, _=Depends(verify_auth)):
+    """Make one key selectable again: manual off + cooling/disabled + cached balance cleared."""
+    scheduler, key = _scheduler_and_key(suffix)
+    scheduler.enable(key)
+    logger.info("admin.key.enabled", key_last4=key[-4:])
     return {"key": _mask_key(key), **scheduler.key_state(key)}
+
+
+@router.post("/keys/{suffix}/disable")
+async def disable_key(suffix: str, _=Depends(verify_auth)):
+    """Take one key out of rotation until it is enabled again."""
+    scheduler, key = _scheduler_and_key(suffix)
+    unbound = scheduler.disable(key)
+    logger.info("admin.key.disabled", key_last4=key[-4:], unbound_sessions=unbound)
+    return {"key": _mask_key(key), "unbound_sessions": unbound, **scheduler.key_state(key)}
 
 
 @router.post("/verify-key")

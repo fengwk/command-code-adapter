@@ -83,7 +83,8 @@ volumes:
 - 识别不到会话标识的请求固定使用第一个可用 Key（fill-first），保证行为可预期。
 - Key 故障自动切换：401/403 直接禁用该 Key；限流（429）进入指数冷却（默认 60s → 上限 1800s）；**额度用尽**（上游返回 insufficient credits）会把该 Key 固定冷却一段时间（默认 30 分钟，可用 `CC_ADAPTER_KEY_CREDIT_COOLDOWN` 调整）并清掉其已知余额；冷却/禁用会解除受影响会话的绑定，重试时自动绑定到健康 Key。
 - 所有 Key 都不可用时**不再消耗上游调用**，直接返回最后一个 Key 的失败信息（附各 Key 状态摘要）。
-- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/reset` 解除冷却/禁用并清除余额缓存（充值后用）。
+- 手动开关：面板可单独把某个 Key 关掉/打开。关掉后该 Key **永不被选中**（无视其额度与健康状态），其绑定的会话立即解绑并在下次请求切到其他 Key；打开后**立即可用**（清除手动标记与冷却/禁用状态、丢弃已缓存的余额并后台刷新），充值后用它恢复即可。自动冷却逻辑与手动开关互不影响。
+- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数（含 `enabled`/`manual`/`cooldown_seconds`），`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/disable` 关闭某个 Key，`POST /admin/api/keys/{后四位}/enable` 打开（解除冷却/禁用并清除余额缓存）。
 
 ### 日志
 
@@ -308,7 +309,8 @@ With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adap
 - Requests without a session identity always use the first usable key (fill-first).
 - Failures fail over automatically: 401/403 disables a key, a rate limit (429) puts it in escalating cooling backoff (60s → 1800s cap), and an out-of-credits response parks it for a flat window (`CC_ADAPTER_KEY_CREDIT_COOLDOWN`, default 30 min) while zeroing its cached balance; parked keys unbind the affected sessions, which rebind to a healthy key on retry.
 - When every key is unusable the adapter makes **no further upstream call** and returns the last key's failure together with a per-key state summary.
-- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/reset` (clear cooling/disabled and the cached balance after a top-up).
+- Manual switch: the panel can turn an individual key off/on. Off means the key is **never selected** (regardless of its credits or health) and its bound sessions are unbound immediately, so the next turn moves to another key; on makes it **immediately selectable** (manual mark plus cooling/disabled state cleared, cached balance dropped and refreshed in the background), which is the way to restore a key right after a top-up. Automatic cooldowns keep working independently of the switch.
+- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key, plus `enabled`/`manual`/`cooldown_seconds`), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/disable` (take a key out of rotation), `POST /admin/api/keys/{last4}/enable` (clear manual off + cooling/disabled + cached balance).
 
 ### Logging
 

@@ -30,9 +30,10 @@ docker compose up -d                  # docker-compose.yml + optional docker-com
 | `GET /v1/models` | `main.py` (dynamic via `get_models_data()`) | none |
 | `GET /admin/api/models` | `admin/router.py` (public listing, no auth) | none |
 | `POST /admin/api/models/refresh` | `admin/router.py` | admin auth |
-| `GET /admin/api/keys` | `admin/router.py` (per-key scheduler state) | admin auth |
+| `GET /admin/api/keys` | `admin/router.py` (per-key scheduler state + manual switch) | admin auth |
 | `DELETE /admin/api/sessions` | `admin/router.py` (drop session→key bindings) | admin auth |
-| `POST /admin/api/keys/{suffix}/reset` | `admin/router.py` (clear cooling/disabled) | admin auth |
+| `POST /admin/api/keys/{suffix}/enable` | `admin/router.py` (switch key on: clears manual off + cooling/disabled + cached balance) | admin auth |
+| `POST /admin/api/keys/{suffix}/disable` | `admin/router.py` (switch key off: never selected, unbinds its sessions) | admin auth |
 
 Entry: `cc_adapter/__main__.py` → `main.py:run()` → uvicorn. Import: `from cc_adapter.main import app`.
 
@@ -118,9 +119,10 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 - An established binding outranks key order — a recovered key does not steal a session back.
 - **Fill-first**: requests without an explicit identity (content-hash fallback, `explicit=False`) always go to the first usable key and are never bound.
 - Bindings slide: 1h TTL, 4096 entries, LRU eviction (`constants.py`).
-- Health: 401/403 disables a key and unbinds its sessions; 429 cools it down with escalating backoff (`KEY_COOLDOWN_BASE` → `KEY_COOLDOWN_MAX`); an out-of-credits failure (400 + "insufficient credits", or 402) parks the key for a flat `KEY_CREDIT_COOLDOWN` (30 min), zeroes its cached balance (the 30-min credits refresh, or `POST /admin/api/keys/{suffix}/reset`, clears it) and unbinds the affected session; 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
+- Health: 401/403 disables a key and unbinds its sessions; 429 cools it down with escalating backoff (`KEY_COOLDOWN_BASE` → `KEY_COOLDOWN_MAX`); an out-of-credits failure (400 + "insufficient credits", or 402) parks the key for a flat `KEY_CREDIT_COOLDOWN` (30 min), zeroes its cached balance (the 30-min credits refresh, or `POST /admin/api/keys/{suffix}/enable`, clears it) and unbinds the affected session; 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
+- **Manual switch**: `POST /admin/api/keys/{suffix}/disable` marks a key off in `KeyScheduler._manual_off` — `_usable()` rejects it no matter its health or credits, and its bindings are dropped (the response reports `unbound_sessions`). `POST .../enable` clears the mark and runs `reset_key()` (health + cached balance + background credits refresh), so the key is selectable immediately; automatic cooldowns keep working while a key is on. `key_state()` exposes `enabled` / `manual` plus `cooldown_seconds` (remaining cooling seconds, `None` when not cooling), and `unavailable_summary()` renders an off key as `****abcd disabled by admin`.
 - **Fail-fast**: when no key is usable, `select()` returns `None` and `client.py:_no_key_error()` raises the remembered `last_failure()` (status + upstream text) plus a per-key state summary — no extra upstream call is made. Tune the windows with `CC_ADAPTER_KEY_COOLDOWN_BASE` / `CC_ADAPTER_KEY_COOLDOWN_MAX` / `CC_ADAPTER_KEY_CREDIT_COOLDOWN`.
-- Ops endpoints: `GET /admin/api/keys`, `DELETE /admin/api/sessions`, `POST /admin/api/keys/{suffix}/reset`.
+- Ops endpoints: `GET /admin/api/keys`, `DELETE /admin/api/sessions`, `POST /admin/api/keys/{suffix}/enable`, `POST /admin/api/keys/{suffix}/disable`.
 
 ## Translation quirks
 

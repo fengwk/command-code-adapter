@@ -10,7 +10,12 @@ Adds four behaviours on top of the previous plain ``KeyPool`` precedence list:
   the session keeps talking (sliding TTL), so every turn of one conversation
   stays on the same upstream account;
 * fill-first selection (first usable key) for requests without an explicit
-  session identity.
+  session identity;
+* a manual per-key on/off switch for the admin panel (``disable()`` /
+  ``enable()``): an off key is never selected regardless of its credits or
+  health, and turning it back on clears the automatic health/credit marks so the
+  key is usable immediately. Automatic cooldowns keep running independently of
+  the manual switch.
 
 ``select()`` blocks only on the very first credits fetch; later calls use the
 currently known state and refresh the credits cache in the background.
@@ -142,6 +147,7 @@ class KeyScheduler:
         self._until: dict[str, float] = {}
         self._reason: dict[str, str | None] = {}
         self._failures: dict[str, int] = {}
+        self._manual_off: set[str] = set()
         self._cursor_key: str | None = None
         self._affinity = SessionAffinityCache(SESSION_AFFINITY_TTL, SESSION_AFFINITY_MAX_ENTRIES)
 
@@ -230,7 +236,7 @@ class KeyScheduler:
                 # Out of credits: no request can succeed until the account is topped up,
                 # so park the key for a fixed window instead of probing it every minute.
                 # The credits refresh (30 min TTL) replaces the zero mark once the
-                # balance recovers; POST /admin/api/keys/{suffix}/reset clears it early.
+                # balance recovers; POST /admin/api/keys/{suffix}/enable clears it early.
                 self._credits[key] = 0
                 cooldown = self._credit_cooldown
             else:
@@ -265,6 +271,8 @@ class KeyScheduler:
         return self._state.get(key, STATE_OK)
 
     def _usable(self, key: str) -> bool:
+        if key in self._manual_off:
+            return False
         if self._health(key) != STATE_OK:
             return False
         credits = self._credits.get(key)
@@ -278,13 +286,18 @@ class KeyScheduler:
 
     def key_state(self, key: str) -> dict:
         state = self._health(key)
+        until = self._until.get(key)
+        manual_off = key in self._manual_off
         return {
             "state": state,
-            "until": self._until.get(key),
+            "until": until,
+            "cooldown_seconds": max(0.0, until - time.monotonic()) if until is not None else None,
             "reason": self._reason.get(key),
             "credits": self._credits.get(key),
             "failures": self._failures.get(key, 0),
             "sessions": self._affinity.stats()["bound_by_key"].get(key, 0),
+            "enabled": not manual_off,
+            "manual": manual_off,
         }
 
     def states(self) -> list[dict]:
@@ -304,6 +317,9 @@ class KeyScheduler:
         parts: list[str] = []
         for key in self._keys:
             state = self.key_state(key)
+            if state["manual"]:
+                parts.append(f"****{key[-4:]} disabled by admin")
+                continue
             detail = state["state"]
             if state["state"] == STATE_COOLING and state["until"] is not None:
                 detail += f" {_format_remaining(state['until'] - now)} left"
@@ -322,6 +338,25 @@ class KeyScheduler:
 
     def clear_sessions(self) -> int:
         return self._affinity.clear()
+
+    def disable(self, key: str) -> int:
+        """Take a key out of rotation until it is enabled again (admin switch).
+
+        A manually disabled key is skipped by ``select()`` no matter how healthy
+        it looks or how many credits it has, and its sessions are unbound so the
+        next turn of every conversation moves to another key. Idempotent: a
+        second call for the same key unbinds nothing and returns 0.
+        """
+        self._manual_off.add(key)
+        unbound = self._affinity.delete_by_key(key)
+        logger.info("key.admin_disabled", key=key[-4:], sessions=unbound)
+        return unbound
+
+    def enable(self, key: str) -> None:
+        """Clear the manual off mark and the automatic health/credit marks."""
+        self._manual_off.discard(key)
+        self.reset_key(key)
+        logger.info("key.admin_enabled", key=key[-4:])
 
     def reset_key(self, key: str) -> None:
         """Clear cooling/disabled health and the cached zero-credit mark.

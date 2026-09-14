@@ -329,10 +329,13 @@ class TestReport:
         assert state == {
             "state": "ok",
             "until": None,
+            "cooldown_seconds": None,
             "reason": None,
             "credits": 100,
             "failures": 0,
             "sessions": 0,
+            "enabled": True,
+            "manual": False,
         }
 
     def test_report_ok_resets_health(self):
@@ -342,14 +345,17 @@ class TestReport:
         assert sched.key_state(K1) == {
             "state": "ok",
             "until": None,
+            "cooldown_seconds": None,
             "reason": None,
             "credits": 100,
             "failures": 0,
             "sessions": 0,
+            "enabled": True,
+            "manual": False,
         }
 
     def test_success_does_not_clear_a_zero_credit_mark(self):
-        """A key parked for credits only recovers via the credits refresh or /reset."""
+        """A key parked for credits only recovers via the credits refresh or /enable."""
         sched = make_scheduler([K1], {K1: 100})
         sched.report(K1, ok=False, status=400, reason="insufficient_credits")
         sched.report(K1, ok=True)
@@ -379,10 +385,13 @@ class TestReport:
         assert sched.key_state(K2) == {
             "state": "ok",
             "until": None,
+            "cooldown_seconds": None,
             "reason": None,
             "credits": None,  # reset drops the cached balance so the key is selectable now
             "failures": 0,
             "sessions": 0,
+            "enabled": True,
+            "manual": False,
         }
 
     def test_cooldown_unbinds_only_the_session_that_used_the_key(self):
@@ -463,6 +472,73 @@ class TestSelectExcludeAndFailFast:
         sched = KeyScheduler(keys=[], base_url=BASE_URL)
         assert await sched.select(None, explicit=False) is None
         assert sched.last_fetch_time is None  # nothing to fetch, no blocking call
+
+
+class TestManualSwitch:
+    """The admin on/off switch: off means "never select this key"."""
+
+    def test_disabled_key_is_never_selected_despite_health_and_credits(self):
+        """The manual switch outranks both an expired cooldown and a positive balance."""
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.report(K1, ok=False, status=429, reason="rate_limited")
+        sched.disable(K1)
+        expire_cooldown(sched, K1)  # automatic window is over and the key is funded again
+        assert sched.key_state(K1)["state"] == "ok"
+        assert asyncio.run(sched.select(None, explicit=False)) == K2
+        assert asyncio.run(sched.select("header:s1", explicit=True)) == K2
+
+    def test_returns_none_when_every_key_is_manually_disabled(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched.disable(K1)
+        sched.disable(K2)
+        assert asyncio.run(sched.select(None, explicit=False)) is None
+        assert asyncio.run(sched.select("header:s1", explicit=True)) is None
+
+    def test_disable_unbinds_only_that_keys_sessions_and_returns_the_count(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 100})
+        sched._affinity.set("header:s1", K1)
+        sched._affinity.set("header:s2", K1)
+        sched._affinity.set("header:s3", K2)
+        assert sched.disable(K1) == 2
+        assert sched._affinity.stats() == {"entries": 1, "bound_by_key": {K2: 1}}
+        assert sched.disable(K1) == 0  # idempotent: nothing left to unbind
+
+    def test_enable_restores_selection_and_clears_health_and_credit_marks(self):
+        sched = make_scheduler([K1, K2], {K1: 0, K2: 100})
+        sched.report(K1, ok=False, status=401)  # automatic disabled health
+        sched.disable(K1)
+        assert sched.key_state(K1)["manual"] is True
+        assert asyncio.run(sched.select(None, explicit=False)) == K2
+
+        sched.enable(K1)  # no running loop -> the background credits refresh is skipped
+        state = sched.key_state(K1)
+        assert state["enabled"] is True
+        assert state["manual"] is False
+        assert state["state"] == "ok"
+        assert state["until"] is None
+        assert state["cooldown_seconds"] is None
+        assert state["credits"] is None  # cached zero mark dropped -> selectable right away
+        assert asyncio.run(sched.select(None, explicit=False)) == K1
+
+    def test_states_expose_the_manual_switch_and_the_remaining_cooldown(self):
+        sched = make_scheduler([K1, K2, K3], {K1: 100, K2: 100, K3: 100})
+        sched.report(K2, ok=False, status=429, reason="rate_limited")
+        sched.disable(K1)
+        states = sched.states()
+        assert [s["enabled"] for s in states] == [False, True, True]
+        assert [s["manual"] for s in states] == [True, False, False]
+        assert states[0]["cooldown_seconds"] is None
+        assert states[1]["cooldown_seconds"] == pytest.approx(KEY_COOLDOWN_BASE, abs=1.0)
+        assert states[2]["cooldown_seconds"] is None
+        expire_cooldown(sched, K2)
+        assert sched.key_state(K2)["cooldown_seconds"] is None  # expired, never negative
+
+    def test_unavailable_summary_marks_a_manually_disabled_key(self):
+        sched = make_scheduler([K1, K2], {K1: 100, K2: 0})
+        sched.disable(K1)
+        summary = sched.unavailable_summary()
+        assert f"****{K1[-4:]} disabled by admin" in summary
+        assert f"****{K2[-4:]} ok (out of credits)" in summary
 
 
 class TestCreditsPlumbing:
@@ -606,3 +682,16 @@ class TestLogging:
         for _, kwargs in events:
             assert flag not in str(kwargs)
             assert K1 not in str(kwargs)
+
+    def test_logs_the_admin_switch_with_the_key_suffix_and_unbound_count(self, monkeypatch):
+        recorder = _RecordingLogger()
+        monkeypatch.setattr(ks, "logger", recorder)
+        sched = make_scheduler([K1], {K1: 100})
+        sched._affinity.set("header:secret-session-identity", K1)
+        assert sched.disable(K1) == 1
+        sched.enable(K1)
+        assert [event for event, _ in recorder.events] == ["key.admin_disabled", "key.admin_enabled"]
+        assert recorder.events[0][1] == {"key": K1[-4:], "sessions": 1}
+        assert recorder.events[1][1] == {"key": K1[-4:]}
+        for _, kwargs in recorder.events:
+            assert K1 not in str(kwargs)  # only the masked suffix is logged

@@ -230,6 +230,16 @@ def _init_multi_key_client(keys: list[str]):
     return client
 
 
+def _stub_refresh(monkeypatch):
+    """Keep /enable's background credits refresh off the network."""
+    from cc_adapter.core.key_scheduler import KeyScheduler
+
+    async def fake_refresh(self):
+        return None
+
+    monkeypatch.setattr(KeyScheduler, "_refresh", fake_refresh)
+
+
 @pytest.mark.asyncio
 async def test_list_keys_requires_auth():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -253,6 +263,10 @@ async def test_list_keys_without_scheduler_reports_unmanaged():
     assert len(keys) == 1
     assert keys[0]["key"] == "****1234"
     assert keys[0]["state"] == "unmanaged"
+    # The manual-switch fields are always present so the panel renders one shape.
+    assert keys[0]["enabled"] is True
+    assert keys[0]["manual"] is False
+    assert keys[0]["cooldown_seconds"] is None
 
 
 @pytest.mark.asyncio
@@ -292,30 +306,97 @@ async def test_clear_sessions_endpoint_drops_bindings():
 
 
 @pytest.mark.asyncio
-async def test_reset_key_endpoint_clears_health():
+async def test_enable_key_endpoint_clears_manual_off_and_health(monkeypatch):
+    """POST /keys/{suffix}/enable turns a key back on: manual off, health and balance cleared."""
+    _stub_refresh(monkeypatch)
     from cc_adapter.core.auth import generate_token
 
     client_impl = _init_multi_key_client(["key1111", "key2222"])
-    client_impl.scheduler.report("key1111", ok=False, status=429)
-    assert client_impl.scheduler.key_state("key1111")["state"] == "cooling"
+    scheduler = client_impl.scheduler
+    scheduler.report("key1111", ok=False, status=429, reason="rate_limited")
+    scheduler.disable("key1111")
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post("/admin/api/keys/1111/reset", headers={"Authorization": f"Bearer {my_token}"})
+        resp = await client.post("/admin/api/keys/1111/enable", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 200
-    assert resp.json()["state"] == "ok"
-    assert client_impl.scheduler.key_state("key1111")["state"] == "ok"
+    body = resp.json()
+    assert body["key"] == "****1111"
+    assert body["state"] == "ok"
+    assert body["enabled"] is True
+    assert body["manual"] is False
+    assert body["cooldown_seconds"] is None
+    assert body["credits"] is None  # cached balance dropped, so the key is selectable right away
+    assert await scheduler.select(None, explicit=False) == "key1111"
 
 
 @pytest.mark.asyncio
-async def test_reset_key_endpoint_rejects_unknown_suffix():
+async def test_disable_key_endpoint_unbinds_sessions_and_is_idempotent():
+    """POST /keys/{suffix}/disable takes one key out of rotation without touching the others."""
     from cc_adapter.core.auth import generate_token
 
-    _init_multi_key_client(["key1111", "key2222"])
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    scheduler = client_impl.scheduler
+    await scheduler.select("claude:s1", explicit=True)  # key1111
+    await scheduler.select("claude:s2", explicit=True)  # key2222
+    await scheduler.select("claude:s3", explicit=True)  # key1111 again
+    assert scheduler.key_state("key1111")["sessions"] == 2
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post("/admin/api/keys/9999/reset", headers={"Authorization": f"Bearer {my_token}"})
+        resp = await client.post("/admin/api/keys/1111/disable", headers={"Authorization": f"Bearer {my_token}"})
+        again = await client.post("/admin/api/keys/1111/disable", headers={"Authorization": f"Bearer {my_token}"})
 
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["key"] == "****1111"
+    assert body["unbound_sessions"] == 2
+    assert body["enabled"] is False
+    assert body["manual"] is True
+    assert scheduler.key_state("key1111")["sessions"] == 0
+    assert scheduler.key_state("key2222")["sessions"] == 1  # other key untouched
+    assert await scheduler.select(None, explicit=False) == "key2222"
+    assert again.json()["unbound_sessions"] == 0  # idempotent
+
+
+@pytest.mark.parametrize(
+    "keys,suffix",
+    [
+        (["key1111", "key2222"], "9999"),  # unknown suffix
+        (["aaa-7777", "bbb-7777"], "7777"),  # ambiguous suffix
+    ],
+)
+@pytest.mark.asyncio
+async def test_key_switch_endpoints_reject_unresolvable_suffixes(keys, suffix):
+    from cc_adapter.core.auth import generate_token
+
+    _init_multi_key_client(keys)
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for verb in ("enable", "disable"):
+            resp = await client.post(
+                f"/admin/api/keys/{suffix}/{verb}", headers={"Authorization": f"Bearer {my_token}"}
+            )
+            assert resp.status_code == 404
+            assert resp.json()["detail"] == "Unknown or ambiguous key suffix"
+
+
+@pytest.mark.asyncio
+async def test_list_keys_reports_the_manual_switch_fields():
+    from cc_adapter.core.auth import generate_token
+
+    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl.scheduler.disable("key2222")
+    my_token = generate_token()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/admin/api/keys", headers={"Authorization": f"Bearer {my_token}"})
+
+    assert resp.status_code == 200
+    keys = resp.json()["keys"]
+    assert [entry["key"] for entry in keys] == ["****1111", "****2222"]
+    assert [entry["enabled"] for entry in keys] == [True, False]
+    assert [entry["manual"] for entry in keys] == [False, True]
+    assert [entry["cooldown_seconds"] for entry in keys] == [None, None]
