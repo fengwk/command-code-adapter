@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import os
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -6,9 +10,21 @@ from cc_adapter.core.utils import normalize_api_keys
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
+ENV_FILE_ENV_VAR = "CC_ADAPTER_ENV_FILE"
+
+
+def env_file_path() -> str:
+    """Dotenv file read at startup and rewritten by the admin panel.
+
+    Defaults to ``.env`` in the working directory. Point it at a mounted volume
+    (e.g. ``/app/data/.env``) to persist panel-managed config: a single-file bind
+    mount of ``/app/.env`` would break the atomic rewrite in ``update_env_file``.
+    """
+    return os.environ.get(ENV_FILE_ENV_VAR) or ".env"
+
 
 class AppConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CC_ADAPTER_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="CC_ADAPTER_", env_file=env_file_path(), extra="ignore")
 
     host: str = "0.0.0.0"
     port: int = 8080

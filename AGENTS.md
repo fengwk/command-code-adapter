@@ -60,6 +60,7 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_HTTP2` | `false` | |
 | `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
+| `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). |
 
 ## Architecture
 

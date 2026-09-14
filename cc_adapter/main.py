@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from cc_adapter.core.config import AppConfig, get_config_or_default
+from cc_adapter.core.config import AppConfig, env_file_path, get_config_or_default
 from cc_adapter.core.constants import VERSION
 
 from cc_adapter.core.logging import configure_logging, CorrelationIDMiddleware
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     cfg = get_config_or_default()
     configure_logging(log_format=cfg.log_format, log_level=cfg.log_level)
     set_password(cfg.admin_password)
-    logger.info("app.start", base=cfg.cc_base_url, port=cfg.port)
+    logger.info("app.start", base=cfg.cc_base_url, port=cfg.port, env_file=env_file_path())
     if not cfg.cc_api_key:
         logger.warning("app.start", message="CC_ADAPTER_CC_API_KEY is not set")
     if not cfg.admin_password:

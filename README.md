@@ -57,8 +57,20 @@ docker compose up -d
 | `CC_ADAPTER_HTTP2` | `false` | 启用 HTTP/2 |
 | `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存） |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | 可选的 OSS 提供商名称，作为 `x-oss-primary-provider` 请求头发送 |
+| `CC_ADAPTER_ENV_FILE` | `.env` | 配置文件路径（管理面板读写此文件，见下） |
 
 也可通过 `.env` 文件配置（参考 `.env.example`）。
+
+管理面板保存的配置会写回 `CC_ADAPTER_ENV_FILE` 指向的文件（默认工作目录下的 `.env`）。容器里想持久化面板改动，把它指向挂载卷内的路径即可，例如：
+
+```yaml
+environment:
+  CC_ADAPTER_ENV_FILE: /app/data/.env
+volumes:
+  - ./data:/app/data
+```
+
+两点注意：① 不要用单文件挂载 `/app/.env`——面板的原子写入（临时文件 + `rename`）在单文件挂载上会报 `EBUSY`；② 环境变量优先级高于该文件，想让某个字段"由面板管理"，就不要再用环境变量注入它（否则重启后被环境变量覆盖）。
 
 ### 多 Key 路由
 
@@ -266,8 +278,20 @@ docker compose up -d
 | `CC_ADAPTER_HTTP2` | `false` | Enable HTTP/2 |
 | `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
+| `CC_ADAPTER_ENV_FILE` | `.env` | Config file path (the admin panel reads and rewrites this file) |
 
 You can also configure via a `.env` file (see `.env.example`).
+
+Config saved in the admin panel is written back to the file referenced by `CC_ADAPTER_ENV_FILE` (`.env` in the working directory by default). To persist panel changes in a container, point it at a mounted volume:
+
+```yaml
+environment:
+  CC_ADAPTER_ENV_FILE: /app/data/.env
+volumes:
+  - ./data:/app/data
+```
+
+Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel's atomic rewrite (temp file + `rename`) fails with `EBUSY` on a single-file mount; (2) environment variables outrank that file, so a field you want the panel to manage must not be injected as an environment variable.
 
 ### Multi-key routing
 
