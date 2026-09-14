@@ -38,3 +38,6 @@ Thumbs.db
 .worktrees/
 docs/
 token_usage.json
+
+# Local agent workspaces
+.workspace/
