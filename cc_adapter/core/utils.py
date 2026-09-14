@@ -27,6 +27,20 @@ def generate_id(prefix: str = "", length: int = 12) -> str:
     return f"{prefix}{uuid.uuid4().hex[:length]}"
 
 
+def mask_api_key(key: str) -> str:
+    """Display form of an upstream key: the panel never receives the full value.
+
+    ``>20`` characters keep the first 10 and the last 6 (enough for an operator to tell
+    accounts apart), shorter keys keep only the last 4. The admin UI mirrors this rule
+    (``maskToken`` in ``admin/static/admin.js``) for values it never sends to the server.
+    """
+    if len(key) > 20:
+        return f"{key[:10]}…{key[-6:]}"
+    if len(key) >= 4:
+        return f"****{key[-4:]}"
+    return "****"
+
+
 def normalize_api_keys(value: str | list[str] | None) -> list[str]:
     if isinstance(value, list):
         return [k for k in value if k]

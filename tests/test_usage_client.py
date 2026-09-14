@@ -103,6 +103,28 @@ class TestQueryTokenUsage:
         assert result["error"] == "Invalid API key"
 
     @pytest.mark.asyncio
+    async def test_result_masks_the_api_key(self, base_url):
+        """The panel must never receive the full upstream key."""
+        long_key = "user_abcdefghij0123456789ABCDEFGHIJ"
+        with respx.mock(base_url=base_url) as mock:
+            mock.get("/alpha/whoami").mock(return_value=httpx.Response(401, json={"error": "unauthorized"}))
+
+            result = await query_token_usage(base_url, long_key)
+
+        assert result["token"] == long_key[:10] + "…" + long_key[-6:]
+        assert long_key not in json.dumps(result)
+
+    @pytest.mark.asyncio
+    async def test_short_key_is_fully_hidden(self, base_url):
+        with respx.mock(base_url=base_url) as mock:
+            mock.get("/alpha/whoami").mock(return_value=httpx.Response(401, json={"error": "unauthorized"}))
+
+            result = await query_token_usage(base_url, "test-api-key")
+
+        assert result["token"] == "****-key"
+        assert "test-api-key" not in json.dumps(result)
+
+    @pytest.mark.asyncio
     async def test_whoami_network_error(self, base_url, api_key):
         with respx.mock(base_url=base_url) as mock:
             mock.get("/alpha/whoami").mock(side_effect=httpx.ConnectError("connection refused"))

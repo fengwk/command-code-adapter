@@ -102,6 +102,26 @@ const i18n = {
     keyReasonCredits: "额度用尽",
     keyReasonRateLimited: "限流",
     keyReasonInvalidKey: "密钥无效",
+    // Dashboard / usage / token manager (were missing, the UI rendered the raw key names)
+    manage: "管理",
+    refresh: "刷新",
+    noTokens: "暂无数据",
+    themeDark: "深色",
+    themeLight: "浅色",
+    tokenUsage: "Token 用量",
+    tokenAccount: "账号",
+    tokenPlan: "套餐",
+    tokenPeriod: "周期",
+    tokenUsed: "已用",
+    tokenTotal: "总额度",
+    tokenNormal: "正常",
+    tokenInvalid: "无效",
+    tokenLabel: "标签",
+    tokenKey: "API Key",
+    addToken: "添加",
+    tokenSave: "添加到 Key 池",
+    tokenCancel: "取消",
+    tokenManageTitle: "Token 管理",
   },
   en: {
     title: "CC Adapter Admin",
@@ -205,6 +225,26 @@ const i18n = {
     keyReasonCredits: "out of credits",
     keyReasonRateLimited: "rate limited",
     keyReasonInvalidKey: "invalid key",
+    // Dashboard / usage / token manager (were missing, the UI rendered the raw key names)
+    manage: "Manage",
+    refresh: "Refresh",
+    noTokens: "No data",
+    themeDark: "Dark",
+    themeLight: "Light",
+    tokenUsage: "Token usage",
+    tokenAccount: "Account",
+    tokenPlan: "Plan",
+    tokenPeriod: "Period",
+    tokenUsed: "Used",
+    tokenTotal: "Total",
+    tokenNormal: "OK",
+    tokenInvalid: "Invalid",
+    tokenLabel: "Label",
+    tokenKey: "API Key",
+    addToken: "Add",
+    tokenSave: "Add to key pool",
+    tokenCancel: "Cancel",
+    tokenManageTitle: "Token manager",
   },
 };
 
@@ -653,10 +693,24 @@ async function loadTokenUsageData() {
   }
 }
 
+// Mirrors the server-side masking of upstream keys: >20 chars keep the first 10 and the
+// last 6, shorter keys keep only the last 4, everything else is hidden completely.
+function maskToken(token) {
+  const s = String(token || "");
+  if (s.length > 20) return s.slice(0, 10) + "…" + s.slice(-6);
+  if (s.length >= 4) return "****" + s.slice(-4);
+  return "****";
+}
+
 function renderTokenCard(item) {
   const card = document.createElement("div");
   card.className = "token-card" + (item.ok ? "" : " error");
-  const labelKey = localStorage.getItem("cc-token-label-" + item.token) || item.label || "";
+  // The usage API reports the token already masked; fall back to maskToken() (what the
+  // token dialog stores under) so a response carrying the raw key still resolves the label.
+  const labelKey = localStorage.getItem("cc-token-label-" + item.token)
+    || localStorage.getItem("cc-token-label-" + maskToken(item.token))
+    || item.label
+    || "";
 
   if (item.ok) {
     const usage = item.usage || { total_cost: 0, total_count: 0, models: [] };
@@ -673,16 +727,16 @@ function renderTokenCard(item) {
       <div class="token-card-header">
         <div>
           <span class="status-dot ok"></span>
-          <strong title="${item.token}">${item.token.slice(0, 10)}...${item.token.slice(-6)}</strong>
-          ${labelKey ? `<span class="token-label-badge">${labelKey}</span>` : ""}
+          <strong class="token-value">${escapeHtml(item.token)}</strong>
+          ${labelKey ? `<span class="token-label-badge">${escapeHtml(labelKey)}</span>` : ""}
         </div>
         <span style="font-size:12px;color:var(--success)">${t("tokenNormal")}</span>
       </div>
       <div class="token-card-info">
-        ${user.name ? `<div><div class="label">${t("tokenAccount")}</div><div class="value">${user.name}</div></div>` : ""}
-        ${sub.plan_name ? `<div><div class="label">${t("tokenPlan")}</div><div class="value">${sub.plan_name} <span style="color:var(--text-muted);font-size:11px">(${sub.status})</span></div></div>` : ""}
-        ${user.email ? `<div><div class="label">Email</div><div class="value">${user.email}</div></div>` : ""}
-        ${periodStr ? `<div><div class="label">${t("tokenPeriod")}</div><div class="value">${periodStr}</div></div>` : ""}
+        ${user.name ? `<div><div class="label">${t("tokenAccount")}</div><div class="value">${escapeHtml(user.name)}</div></div>` : ""}
+        ${sub.plan_name ? `<div><div class="label">${t("tokenPlan")}</div><div class="value">${escapeHtml(sub.plan_name)} <span style="color:var(--text-muted);font-size:11px">(${escapeHtml(sub.status)})</span></div></div>` : ""}
+        ${user.email ? `<div><div class="label">Email</div><div class="value">${escapeHtml(user.email)}</div></div>` : ""}
+        ${periodStr ? `<div><div class="label">${t("tokenPeriod")}</div><div class="value">${escapeHtml(periodStr)}</div></div>` : ""}
       </div>
       <div class="token-usage-bar">
         <div class="token-usage-bar-header">
@@ -735,13 +789,17 @@ function renderTokenCard(item) {
       <div class="token-card-header">
         <div>
           <span class="status-dot err"></span>
-          <strong title="${item.token}">${item.token.slice(0, 10)}...${item.token.slice(-6)}</strong>
-          ${labelKey ? `<span class="token-label-badge">${labelKey}</span>` : ""}
+          <strong class="token-value">${escapeHtml(item.token)}</strong>
+          ${labelKey ? `<span class="token-label-badge">${escapeHtml(labelKey)}</span>` : ""}
         </div>
         <span style="font-size:12px;color:var(--error)">${t("tokenInvalid")}</span>
       </div>
-      <div class="token-error-text">${errMsg}</div>`;
+      <div class="token-error-text">${escapeHtml(errMsg)}</div>`;
   }
+  // Attribute context: escapeHtml() only covers text nodes (it does not escape quotes), so
+  // the title goes through a DOM property, the same way the Keys tab sets its attributes.
+  const tokenEl = card.querySelector(".token-value");
+  if (tokenEl) tokenEl.title = item.token;
   return card;
 }
 
@@ -797,7 +855,9 @@ function showTokenManager() {
       tokens.push(keyVal);
       const labelInput = row.querySelector(".tm-item-label");
       if (labelInput && labelInput.value) {
-        localStorage.setItem("cc-token-label-" + keyVal, labelInput.value);
+        // Store under the masked key: that is the token value the usage API reports back,
+        // so the card can resolve the label without ever persisting the raw key.
+        localStorage.setItem("cc-token-label-" + maskToken(keyVal), labelInput.value);
       }
     }
     if (tokens.length === 0) {
@@ -962,12 +1022,12 @@ async function renderPlayground() {
     if (uiCfg.default_model) defaultModelVal = uiCfg.default_model;
     const modelsData = await modelsResp.json();
     const modelOptions = modelsData.models
-      .map(m => `<option value="${m.id}"${m.id === defaultModelVal ? " selected" : ""}>${m.name}</option>`)
+      .map(m => `<option value="${escapeAttr(m.id)}"${m.id === defaultModelVal ? " selected" : ""}>${escapeHtml(m.name)}</option>`)
       .join("");
     window._modelSelectHtml = modelOptions;
   } catch {}
   if (!window._modelSelectHtml) {
-    window._modelSelectHtml = `<option value="${defaultModelVal}">${defaultModelVal}</option>`;
+    window._modelSelectHtml = `<option value="${escapeAttr(defaultModelVal)}">${escapeHtml(defaultModelVal)}</option>`;
   }
 
   const el = document.getElementById("tab-playground");
@@ -1027,7 +1087,7 @@ async function updateReasoningDropdown(modelId, selectEl) {
       const efforts = data.model_reasoning_efforts?.[modelId];
       if (efforts && efforts.length > 0) {
         for (const e of efforts) {
-          selectEl.innerHTML += `<option value="${e}">${e}</option>`;
+          selectEl.innerHTML += `<option value="${escapeAttr(e)}">${escapeHtml(e)}</option>`;
         }
       }
     }
@@ -1047,6 +1107,12 @@ function appendBubble(role, text, streaming) {
   chatEl.appendChild(bubble);
   chatEl.scrollTop = chatEl.scrollHeight;
   return bubble;
+}
+
+// escapeHtml is text-context only (it does not touch quotes), so attribute
+// values must go through this variant as well.
+function escapeAttr(str) {
+  return escapeHtml(String(str == null ? "" : str)).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function escapeHtml(str) {
@@ -1267,7 +1333,7 @@ async function loadUsageAnalyticsData() {
             <th>${t("usageModels")}</th>
           </tr></thead>
           <tbody>${[...data.daily].reverse().map(d => {
-            const modelsHtml = (d.models || []).map(m => `<span class="usage-model-badge">${m.model_id.split("/").pop()} $${m.cost.toFixed(2)}</span>`).join("");
+            const modelsHtml = (d.models || []).map(m => `<span class="usage-model-badge">${escapeHtml(m.model_id.split("/").pop())} $${m.cost.toFixed(2)}</span>`).join("");
             return `<tr><td>${d.date.slice(5)}</td><td>$${d.total_cost.toFixed(2)}</td><td>${d.total_count}</td><td>${modelsHtml || "-"}</td></tr>`;
           }).join("")}</tbody>
         </table>
@@ -1368,7 +1434,7 @@ async function renderLogs() {
       renderLogEntries(data.entries, data.total_in_buffer);
     } catch (e) {
       const entriesEl = document.getElementById("log-entries");
-      entriesEl.innerHTML = `<div class="log-error">Error: ${e.message}</div>`;
+      entriesEl.innerHTML = `<div class="log-error">Error: ${escapeHtml(e.message)}</div>`;
     }
   };
 

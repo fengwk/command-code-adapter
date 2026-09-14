@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from cc_adapter.command_code.headers import make_cc_headers
+from cc_adapter.core.utils import mask_api_key
 
 logger = structlog.get_logger(__name__)
 
@@ -25,7 +26,7 @@ PLAN_NAMES = {
 async def query_token_usage(base_url: str, api_key: str, timeout: float = 15.0) -> dict:
     headers = make_cc_headers(api_key)
 
-    result: dict = {"token": api_key, "label": "", "ok": False, "error": None}
+    result: dict = {"token": mask_api_key(api_key), "label": "", "ok": False, "error": None}
 
     async with httpx.AsyncClient(timeout=timeout, base_url=base_url) as client:
         try:
