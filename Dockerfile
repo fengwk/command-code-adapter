@@ -25,7 +25,11 @@ COPY cc_adapter/ ./cc_adapter/
 
 EXPOSE 8080
 
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser && \
+# The uid/gid are pinned so the image's file ownership is deterministic: a deployment
+# that mounts a data directory either runs as this user or overrides `user:` (see the
+# nas-aiproxy compose). `useradd -r` alone would take whatever the base image happens
+# to leave free and silently drift on a base image update.
+RUN groupadd -r -g 999 appuser && useradd -r -u 999 -g appuser -d /app -s /sbin/nologin appuser && \
     chown -R appuser:appuser /app
 
 USER appuser

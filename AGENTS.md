@@ -29,6 +29,9 @@ docker compose up -d                  # docker-compose.yml + optional docker-com
 | `POST /v1/responses` | `providers/openai/responses_router.py` | access_key |
 | `GET /v1/models` | `main.py` (dynamic via `get_models_data()`) | none |
 | `GET /admin/api/models` | `admin/router.py` (public listing, no auth) | none |
+| `GET /admin/api/ui-config` | `admin/router.py` (playground defaults) | none — intentionally public, exposes no secrets |
+| `GET /admin/api/reasoning-effort` | `admin/router.py` (model → reasoning-effort map) | none — intentionally public, exposes no secrets |
+| `GET /admin/api/models/status` | `admin/router.py` (model-fetch status) | none — intentionally public, exposes no secrets |
 | `POST /admin/api/models/refresh` | `admin/router.py` | admin auth |
 | `GET /admin/api/keys` | `admin/router.py` (per-key scheduler state + manual switch) | admin auth |
 | `POST /admin/api/keys` | `admin/router.py` (add one upstream key) | admin auth |
@@ -66,9 +69,10 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat park window for an out-of-credits key, seconds |
 | `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention) |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
-| `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). |
+| `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). Real environment variables still outrank this file, so anything the panel must own has to be absent from the container environment. |
 
-- **Keys are managed from the panel**: add/remove an upstream key at runtime (persisted into `CC_ADAPTER_ENV_FILE`, client rebuilt in-process, no restart) — nothing has to be injected as `CC_ADAPTER_CC_API_KEY`, and a zero-key startup is valid (requests fail with the client's own `AuthenticationError`). The Keys tab is the only key editor: the Configuration tab just reports `cc_api_key_count` and links there, and the Usage tab's token dialog adds keys through `POST /admin/api/keys` (it never rewrites the pool).
+- **The panel never receives a full key**: `GET /admin/api/keys` and `GET /admin/api/config` return masked forms, and `POST /admin/api/usage/query` masks each upstream key with `core/utils.py:mask_api_key()` (first 10 + last 6, `****` + last 4 for short keys) - the admin UI mirrors the rule in `admin/static/admin.js:maskToken()` and escapes every upstream-derived string at its `innerHTML` sink.
+- **Keys are managed from the panel**: add/remove an upstream key at runtime (persisted into `CC_ADAPTER_ENV_FILE`, client rebuilt in-process, no restart) — nothing has to be injected as `CC_ADAPTER_CC_API_KEY`, and a zero-key startup is valid (requests fail with the client's own `AuthenticationError`). The Keys tab is the only key editor: the Configuration tab just reports `cc_api_key_count` and links there, and the Usage tab's token dialog adds keys through `POST /admin/api/keys` (it never rewrites the pool). A rebuild retires the old client with `schedule_close_when_idle()` instead of closing it outright, so a stream that is still being read keeps its pool until it ends (at most `CLIENT_CLOSE_GRACE_SECONDS`).
 
 ## Architecture
 
@@ -82,11 +86,11 @@ Both translate to CC /alpha/generate body, stream SSE back.
 - **Singletons** owned by `core/runtime.py`: `_config`, `_cc_client`, translator instances (lazy init via `get_*()`). Also `_version_checker` and `_model_fetcher`.
 - **`get_or_create_client()`** at `runtime.py:41` — auto-creates a client with `AppConfig()` defaults if `init()` hasn't been called, logging a warning. Used by all routers when no client is available.
 - **Auth headers**: `core/headers.py` — `extract_token()` (Bearer/x-api-key), `auth_error_response(message, protocol)` (401). Branches on `protocol: "openai" | "anthropic"` for correct error shape; `message` parameter allows custom error text.
-- **Retry**: `core/retry.py` — `retry_on_empty()` for non-streaming (retries once on empty upstream response), `stream_with_retry()` for streaming (same retry logic + optional error event emission). Inside `client.py:generate()` a retryable upstream error (402/429/400-insufficient-credits) or a key error (401/403) feeds `KeyScheduler.report()` and moves to the next key.
+- **Retry**: `core/retry.py` — `stream_with_retry()` drives a streaming request (`generate_fn` → `translate_fn`) for all three routers and retries once on an empty upstream response; the optional `_BufferDetector` (OpenAI chat with tools) spots that empty response before any visible delta, and `error_fn` turns a final failure into an SSE error event. Non-streaming requests go through the providers' own `collect_and_translate_*_nonstream()` helpers — there is no non-streaming retry helper. Inside `client.py:generate()` a retryable upstream error (402/429/400-insufficient-credits) or a key error (401/403) feeds `KeyScheduler.report()` and moves to the next key.
 - **Admin auth**: HMAC-signed token in `core/auth.py` (not JWT); embeds `exp` (24h) + password hash prefix. API access validation at `core/auth.py:check_api_access()`. When `CC_ADAPTER_ADMIN_PASSWORD` is empty the admin API is **unauthenticated** (`verify_auth` short-circuits it; `main.py` logs a startup warning) — intranet-only deployments rely on this, do not reintroduce a 503 gate.
 - **ID generation**: `generate_id(prefix, length)` in `core/utils.py`.
-- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `KEY_CREDIT_COOLDOWN`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `VERSION`. The three key cooldowns are also config fields (`CC_ADAPTER_KEY_COOLDOWN_BASE|MAX`, `CC_ADAPTER_KEY_CREDIT_COOLDOWN`) so deployments can tune them from the environment.
-- **Version checker**: Background npm polling, cached 30min, fallback `0.25.2` (env `CC_ADAPTER_DEFAULT_VERSION`). See `core/version_checker.py`. Tests must set `_last_fetch_time = None` (not `0.0`) to guarantee cache invalidation.
+- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `KEY_CREDIT_COOLDOWN`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `CLIENT_CLOSE_GRACE_SECONDS`, `VERSION`. The three key cooldowns are also config fields (`CC_ADAPTER_KEY_COOLDOWN_BASE|MAX`, `CC_ADAPTER_KEY_CREDIT_COOLDOWN`) so deployments can tune them from the environment.
+- **Version checker**: Background npm polling, cached 30min, fallback `1.6.0` (env `CC_ADAPTER_DEFAULT_VERSION`). See `core/version_checker.py`. Tests must set `_last_fetch_time = None` (not `0.0`) to guarantee cache invalidation.
 - **Model fetcher**: `core/model_fetcher.py` — downloads the cmd CLI npm tarball (`registry.npmjs.org`, 30min TTL), extracts model ids/context windows/reasoning efforts and rebuilds the model list plus `MODEL_PROVIDER_MAP` / `MODEL_REASONING_EFFORTS_MAP` via `refresh_maps()`. Unknown model ids pass through unchanged, so new upstream models need no code change; the static tables in `catalog/models_data.py` / `providers/shared/model_mapping.py` are only the pre-fetch fallback.
 - **Key scheduler**: `core/key_scheduler.py` — `KeyScheduler` replaces the old `KeyPool` (deleted). Owns per-key health (ok/cooling/disabled), credits, round-robin + sticky session bindings and the fill-first fallback.
 
@@ -166,6 +170,11 @@ docker build -t ${DOCKERHUB_NAMESPACE:-yourname}/command-code-proxy:latest .
 # Port conflict? Create docker-compose.override.yml mapping 8081:8080
 docker compose up -d
 ```
+
+**Container user**: the image runs as `appuser` (uid/gid pinned to 999 in `Dockerfile`). A deployment that mounts a
+data directory for the panel-managed config either runs as that uid or overrides `user:` (the nas-aiproxy compose runs
+as the host uid and sets `PYTHONDONTWRITEBYTECODE=1`, since nothing is written inside `/app` once configuration,
+`token_usage.json` and `models_cache.json` live next to `CC_ADAPTER_ENV_FILE`).
 
 **Publishing to Docker Hub**: `.github/workflows/docker-publish.yml` runs on every push to the `docker` branch (and via `workflow_dispatch`). It logs in with `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets and pushes the image to `<DOCKERHUB_NAMESPACE>/command-code-proxy`. Set the `DOCKERHUB_NAMESPACE` repository variable to override the namespace; otherwise the workflow falls back to `DOCKERHUB_USERNAME`.
 

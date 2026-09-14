@@ -22,7 +22,6 @@ from cc_adapter.core.constants import VERSION
 from cc_adapter.command_code.body import make_cc_body, make_config
 from cc_adapter.admin.config_manager import ConfigManager
 from cc_adapter.admin.usage_client import query_all_tokens, query_daily_usage
-from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.core.utils import normalize_api_keys
 from cc_adapter.core import log_buffer
 
@@ -339,10 +338,10 @@ async def verify_key(_=Depends(verify_auth)):
 
     test_client = create_client(cfg, timeout=10.0)
     try:
+        # Standard /alpha/generate shape (same config/params as a real request), so the probe
+        # exercises the same body and key fingerprint as production traffic.
         test_body = make_cc_body(
-            config=make_config(
-                {"workingDir": "/tmp", "structure": [], "isGitRepo": False, "date": "2026-01-01T00:00:00Z"}
-            ),
+            config=make_config(),
             params={
                 "model": cfg.default_model,
                 "messages": [{"role": "user", "content": "ping"}],
@@ -350,8 +349,7 @@ async def verify_key(_=Depends(verify_auth)):
                 "stream": True,
             },
         )
-        headers = make_cc_headers()
-        async for _ in test_client.generate(test_body, headers):
+        async for _ in test_client.generate(test_body):
             break
         result = {"valid": True, "message": "API Key is valid"}
     except Exception as e:
