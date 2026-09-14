@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import structlog
 import time
 from datetime import date as date_type
@@ -161,9 +162,18 @@ async def models_refresh(_=Depends(verify_auth)):
         raise HTTPException(status_code=500, detail="Model refresh failed, check server logs")
 
 
+# GET /admin/api/config masks the pool as "<N> key(s) configured"; echoing it back would
+# replace the whole key pool with that bogus value, so reject it before persisting anything.
+_MASKED_KEY_SUMMARY_RE = re.compile(r"^\s*\d+\s+key\(s\)\s+configured\s*$", re.IGNORECASE)
+
+
 @router.put("/config")
 async def update_config(update: ConfigUpdate, _=Depends(verify_auth)):
     update_dict = update.model_dump(exclude_none=True)
+    cc_api_key = update_dict.get("cc_api_key")
+    if isinstance(cc_api_key, str) and _MASKED_KEY_SUMMARY_RE.match(cc_api_key):
+        logger.warning("admin.config.rejected", reason="masked_summary")
+        raise HTTPException(status_code=400, detail="cc_api_key must be a real key or omitted")
     ConfigManager.update_env_file(update_dict)
     await ConfigManager.apply_config_update(update_dict)
     return await get_config_endpoint()
