@@ -62,6 +62,29 @@ const i18n = {
     tokenLimitWeekly: "每周",
     tokenLimitReset: "重置",
     tokenLimitRestricted: "已限流",
+    keys: "Key 管理",
+    keysRefresh: "刷新",
+    keysLoading: "加载中...",
+    keysEmpty: "未配置上游 Key",
+    keysLoadFailed: "加载失败",
+    keysSwitchLabel: "Key 开关",
+    keysSwitchOn: "启用",
+    keysSwitchOff: "停用",
+    keysEnabledToast: "{key} 已启用",
+    keysDisabledToast: "{key} 已停用",
+    keyStateOk: "正常",
+    keyStateCooling: "冷却",
+    keyStateDisabled: "已停用",
+    keyStateOff: "已关闭",
+    keyStateUnmanaged: "未托管",
+    keyCredits: "额度",
+    keySessions: "会话",
+    keyFailures: "失败",
+    keyUnknown: "未知",
+    keyUnmanagedHint: "仅在配置多个 Key 时可管理",
+    keyReasonCredits: "额度用尽",
+    keyReasonRateLimited: "限流",
+    keyReasonInvalidKey: "密钥无效",
   },
   en: {
     title: "CC Adapter Admin",
@@ -125,6 +148,29 @@ const i18n = {
     tokenLimitWeekly: "Weekly",
     tokenLimitReset: "Resets in",
     tokenLimitRestricted: "Rate Limited",
+    keys: "Keys",
+    keysRefresh: "Refresh",
+    keysLoading: "Loading...",
+    keysEmpty: "No upstream keys configured",
+    keysLoadFailed: "Load failed",
+    keysSwitchLabel: "Key switch",
+    keysSwitchOn: "Enable",
+    keysSwitchOff: "Disable",
+    keysEnabledToast: "{key} enabled",
+    keysDisabledToast: "{key} disabled",
+    keyStateOk: "OK",
+    keyStateCooling: "Cooling",
+    keyStateDisabled: "Disabled",
+    keyStateOff: "Off",
+    keyStateUnmanaged: "Unmanaged",
+    keyCredits: "Credits",
+    keySessions: "Sessions",
+    keyFailures: "Failures",
+    keyUnknown: "unknown",
+    keyUnmanagedHint: "Manageable only with multiple keys",
+    keyReasonCredits: "out of credits",
+    keyReasonRateLimited: "rate limited",
+    keyReasonInvalidKey: "invalid key",
   },
 };
 
@@ -269,6 +315,7 @@ function renderTab(name) {
   else if (name === "config") renderConfig();
   else if (name === "playground") renderPlayground();
   else if (name === "usage") renderUsage();
+  else if (name === "keys") renderKeys();
   else if (name === "logs") renderLogs();
 }
 
@@ -1331,6 +1378,163 @@ function renderLogEntries(entries, totalInBuffer) {
     .replace("{shown}", entries.length)
     .replace("{total}", totalInBuffer);
   statusEl.textContent = statusText;
+}
+
+// Keys (per-key auth switches)
+let keysData = [];
+
+// Server-state field `until` is a monotonic clock value, so remaining time always
+// comes from `cooldown_seconds`.
+function keySuffix(label) {
+  return String(label || "").replace(/^\*+/, "");
+}
+
+function formatCooldown(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  const s = Math.max(0, Number(seconds) || 0);
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  return `${(s / 3600).toFixed(1)}h`;
+}
+
+function formatKeyReason(reason) {
+  if (reason === "insufficient_credits") return t("keyReasonCredits");
+  if (reason === "rate_limited") return t("keyReasonRateLimited");
+  if (reason === "http_401" || reason === "http_403") return t("keyReasonInvalidKey");
+  return String(reason);
+}
+
+async function readErrorDetail(resp) {
+  const data = await resp.json().catch(() => ({}));
+  return data.detail || `Error ${resp.status}`;
+}
+
+async function renderKeys() {
+  const el = document.getElementById("tab-keys");
+  keysData = [];
+  el.innerHTML = `
+    <div class="keys-header">
+      <h2>${t("keys")}</h2>
+      <button class="btn btn-secondary" id="keys-refresh-btn">${t("keysRefresh")}</button>
+    </div>
+    <div id="keys-list">
+      <div class="keys-empty">${t("keysLoading")}</div>
+    </div>`;
+  document.getElementById("keys-refresh-btn").onclick = loadKeys;
+  await loadKeys();
+}
+
+async function loadKeys() {
+  const container = document.getElementById("keys-list");
+  if (!container) return;
+  container.innerHTML = `<div class="keys-empty">${t("keysLoading")}</div>`;
+  try {
+    const resp = await api("GET", "/admin/api/keys");
+    if (!resp.ok) throw new Error(await readErrorDetail(resp));
+    const data = await resp.json();
+    keysData = data.keys || [];
+    if (keysData.length === 0) {
+      container.innerHTML = `<div class="keys-empty">${t("keysEmpty")}</div>`;
+      return;
+    }
+    container.innerHTML = "";
+    for (const item of keysData) container.appendChild(buildKeyRow(item));
+  } catch (e) {
+    container.innerHTML = `<div class="keys-empty">${escapeHtml(t("keysLoadFailed"))}: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function buildKeyRow(item) {
+  const state = item.state || "ok";
+  const unmanaged = state === "unmanaged";
+  const manual = item.manual === true;
+  const enabled = item.enabled !== false;
+  // A cooling key is parked by the scheduler, so it counts as off even when the
+  // operator never touched it; an unmanaged key has no scheduler state to show.
+  const on = unmanaged ? enabled : enabled && state !== "cooling";
+
+  let badgeKey = "keyStateOk";
+  let badgeClass = "ok";
+  let badgeExtra = "";
+  if (unmanaged) {
+    badgeKey = "keyStateUnmanaged";
+    badgeClass = "muted";
+  } else if (state === "cooling") {
+    badgeKey = "keyStateCooling";
+    badgeClass = "warn";
+    badgeExtra = formatCooldown(item.cooldown_seconds);
+  } else if (!enabled) {
+    badgeKey = manual ? "keyStateOff" : "keyStateDisabled";
+    badgeClass = "err";
+  }
+  const badgeText = badgeExtra ? `${t(badgeKey)} ${badgeExtra}` : t(badgeKey);
+  const credits = item.credits === null || item.credits === undefined ? t("keyUnknown") : item.credits;
+  const reason = item.reason ? formatKeyReason(item.reason) : "";
+
+  const row = document.createElement("div");
+  row.className = "card key-row";
+  row.dataset.suffix = keySuffix(item.key);
+  row.innerHTML = `
+    <div class="key-row-info">
+      <div class="key-row-head">
+        <strong class="key-label">${escapeHtml(item.key || "")}</strong>
+        <span class="key-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+        ${reason ? `<span class="key-reason">${escapeHtml(reason)}</span>` : ""}
+      </div>
+      <div class="key-row-metrics">
+        <span>${t("keyCredits")}: <strong>${escapeHtml(String(credits))}</strong></span>
+        <span>${t("keySessions")}: <strong>${escapeHtml(String(item.sessions || 0))}</strong></span>
+        <span>${t("keyFailures")}: <strong>${escapeHtml(String(item.failures || 0))}</strong></span>
+      </div>
+      ${unmanaged ? `<div class="key-hint">${t("keyUnmanagedHint")}</div>` : ""}
+    </div>
+    <button type="button" class="switch" role="switch" aria-checked="${on ? "true" : "false"}"></button>`;
+
+  const btn = row.querySelector(".switch");
+  btn.setAttribute("aria-label", `${t("keysSwitchLabel")} ${item.key || ""}`);
+  if (unmanaged) {
+    btn.disabled = true;
+    btn.title = t("keyUnmanagedHint");
+  } else {
+    btn.title = on ? t("keysSwitchOff") : t("keysSwitchOn");
+    const toggle = () => toggleKey(row.dataset.suffix, !on, row);
+    btn.onclick = toggle;
+    // Explicit Enter/Space support; preventDefault keeps the native button
+    // activation from firing a second toggle, and toggleKey() ignores clicks
+    // while a request is in flight.
+    btn.onkeydown = (e) => {
+      if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+      e.preventDefault();
+      toggle();
+    };
+  }
+  return row;
+}
+
+async function toggleKey(suffix, turnOn, row) {
+  const btn = row.querySelector(".switch");
+  if (!btn || btn.disabled) return;
+  btn.disabled = true; // in-flight guard
+  try {
+    const action = turnOn ? "enable" : "disable";
+    const resp = await api("POST", `/admin/api/keys/${encodeURIComponent(suffix)}/${action}`);
+    if (!resp.ok) throw new Error(await readErrorDetail(resp));
+    const data = await resp.json();
+    const index = keysData.findIndex(k => keySuffix(k.key) === suffix);
+    const merged = Object.assign({}, index >= 0 ? keysData[index] : {}, data);
+    if (data.enabled === true) merged.manual = false; // an enabled key is never manually off
+    if (index >= 0) keysData[index] = merged;
+    else keysData.push(merged);
+    row.replaceWith(buildKeyRow(merged)); // refresh just this row from the new state
+    const toast = turnOn ? t("keysEnabledToast") : t("keysDisabledToast");
+    showToast(toast.replace("{key}", merged.key || suffix), "success");
+  } catch (e) {
+    // Rebuild from the last known server state so the switch cannot stay out of sync.
+    const current = keysData.find(k => keySuffix(k.key) === suffix);
+    if (current) row.replaceWith(buildKeyRow(current));
+    else btn.disabled = false;
+    showToast(e.message, "error");
+  }
 }
 
 // Init

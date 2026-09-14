@@ -639,3 +639,86 @@ body {
   color: var(--text-muted);
   font-size: 13px;
 }
+
+/* ─── Keys ─── */
+.keys-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.keys-header h2 { font-size: 18px; }
+.keys-empty {
+  text-align: center;
+  padding: 32px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.key-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.key-row-info { min-width: 0; }
+.key-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.key-label { font-family: monospace; font-size: 14px; }
+.key-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.key-badge.ok { color: var(--success); border-color: var(--success); }
+.key-badge.warn { color: var(--warning); border-color: var(--warning); }
+.key-badge.err { color: var(--error); border-color: var(--error); }
+.key-badge.muted { color: var(--text-muted); }
+.key-reason { font-size: 12px; color: var(--text-secondary); }
+.key-hint { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
+.key-row-metrics {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.key-row-metrics strong { color: var(--text); font-weight: 600; }
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-tertiary);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+.switch[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch[aria-checked="true"]::after { transform: translateX(18px); }
+.switch:disabled { opacity: 0.45; cursor: not-allowed; }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
