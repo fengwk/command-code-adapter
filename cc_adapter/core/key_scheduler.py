@@ -248,6 +248,16 @@ class KeyScheduler:
     def states(self) -> list[dict]:
         return [self.key_state(key) for key in self._keys]
 
+    def key_labels(self) -> list[str]:
+        """Masked key suffixes in configured order (admin display)."""
+        return [f"****{key[-4:]}" for key in self._keys]
+
+    def key_by_suffix(self, suffix: str) -> str | None:
+        """Resolve a configured key from its last characters, None when ambiguous."""
+        suffix = suffix.lstrip("*")
+        matches = [key for key in self._keys if key.endswith(suffix)]
+        return matches[0] if len(matches) == 1 else None
+
     def clear_sessions(self) -> int:
         return self._affinity.clear()
 

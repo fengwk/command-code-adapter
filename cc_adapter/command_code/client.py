@@ -7,6 +7,7 @@ from typing import AsyncGenerator, Any
 import httpx
 
 from cc_adapter.core.errors import map_upstream_error, AuthenticationError, TimeoutError_, UpstreamError
+from cc_adapter.command_code.body import bind_workspace
 from cc_adapter.command_code.headers import make_cc_headers
 from cc_adapter.providers.shared.session_extractor import SessionSignal, get_session_extractor
 
@@ -62,6 +63,11 @@ def _is_retryable_error(status_code: int, body_text: str) -> bool:
     return False
 
 
+def _is_key_error(status_code: int) -> bool:
+    """An upstream 401/403 means this CC key is invalid, not the request."""
+    return status_code in (401, 403)
+
+
 def _is_zdr_error(status_code: int, body_text: str) -> bool:
     if status_code != 400:
         return False
@@ -102,11 +108,11 @@ class CommandCodeClient:
         self._http2 = _make_http2_safe(http2)
 
         if api_keys and len(api_keys) > 1:
-            from cc_adapter.core.key_pool import KeyPool
+            from cc_adapter.core.key_scheduler import KeyScheduler
 
-            self.key_pool: KeyPool | None = KeyPool(api_keys, self.base_url)
+            self.scheduler: KeyScheduler | None = KeyScheduler(api_keys, self.base_url)
         else:
-            self.key_pool = None
+            self.scheduler = None
 
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -142,12 +148,16 @@ class CommandCodeClient:
         signal = session or extractor.extract(extra_headers, None, body)
 
         while True:
-            if self.key_pool is not None:
-                key = await self.key_pool.select_key(exclude=tried_keys)
+            if self.scheduler is not None:
+                # Explicit client session identities stick to their key (round robin
+                # for new ones); requests without one go to the first usable key.
+                key = await self.scheduler.select(signal.flag, explicit=signal.explicit, exclude=tried_keys)
             else:
                 key = self.api_key
 
             if not key:
+                if last_error is not None:
+                    raise last_error
                 raise AuthenticationError("CC_ADAPTER_CC_API_KEY is not configured")
 
             if key in tried_keys:
@@ -158,6 +168,10 @@ class CommandCodeClient:
             tried_keys.add(key)
 
             session_id, project_slug = extractor.derive(signal.flag, key)
+            # Keep the forged cwd consistent with the slug sent as x-project-slug.
+            config = body.get("config")
+            if isinstance(config, dict):
+                bind_workspace(config, project_slug)
 
             headers = make_cc_headers(key)
             if zdr_downgraded:
@@ -178,8 +192,9 @@ class CommandCodeClient:
                         logger.warning("upstream.error", status_code=response.status_code, error_type="cc_api_error")
                         mapped = map_upstream_error(response.status_code, text)
 
-                        if _is_retryable_error(response.status_code, text):
+                        if _is_retryable_error(response.status_code, text) or _is_key_error(response.status_code):
                             last_error = mapped
+                            self._report_key_failure(key, response.status_code, text, signal)
                             continue
 
                         if _is_zdr_error(response.status_code, text) and not zdr_downgraded:
@@ -194,6 +209,8 @@ class CommandCodeClient:
                         parsed = _parse_sse_line(line)
                         if parsed is not None:
                             yield parsed
+                    if self.scheduler is not None:
+                        self.scheduler.report(key, ok=True, session_flag=signal.flag)
                     return
 
             except httpx.TimeoutException:
@@ -202,3 +219,14 @@ class CommandCodeClient:
             except httpx.RequestError as e:
                 logger.warning("upstream.error", error_type=e.__class__.__name__, url=url)
                 raise UpstreamError(f"Command Code API request failed: {e.__class__.__name__}")
+
+    def _report_key_failure(self, key: str, status_code: int, body_text: str, signal: SessionSignal) -> None:
+        """Feed a key-level upstream failure back to the scheduler."""
+        if self.scheduler is None:
+            return
+        reason: str | None = None
+        if status_code == 429:
+            reason = "rate_limited"
+        elif status_code == 400 and any(p in body_text.lower() for p in _INSUFFICIENT_CREDITS_PHRASES):
+            reason = "insufficient_credits"
+        self.scheduler.report(key, ok=False, status=status_code, reason=reason, session_flag=signal.flag)

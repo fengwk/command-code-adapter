@@ -231,8 +231,8 @@ class TestClientEdgeCases:
             )
             # Pretend all keys have plenty of credits so select_key keeps
             # cycling through them.
-            client.key_pool._credits = {"k1": 100, "k2": 100, "k3": 100}
-            client.key_pool._last_fetch = 1e18
+            client.scheduler._credits = {"k1": 100, "k2": 100, "k3": 100}
+            client.scheduler._last_fetch = 1e18
             with pytest.raises(Exception) as exc:
                 async for _ in client.generate({"params": {"model": "m", "messages": []}}):
                     pass
@@ -293,7 +293,7 @@ class TestClientEdgeCases:
             api_key="",
             api_keys=None,
         )
-        # No key_pool, api_key empty -> select path returns "" -> auth error.
+        # No scheduler, api_key empty -> select path returns "" -> auth error.
         with pytest.raises(Exception) as exc:
             async for _ in client.generate({"params": {"model": "m", "messages": []}}):
                 pass
