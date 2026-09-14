@@ -60,6 +60,15 @@ docker compose up -d
 
 也可通过 `.env` 文件配置（参考 `.env.example`）。
 
+### 多 Key 路由
+
+配置多个 Key（`CC_ADAPTER_CC_API_KEY=["k1","k2"]`）时，适配器按"会话粘性 + 首可用优先"分配上游 Key：
+
+- 客户端带会话标识时（Claude Code 的 `x-claude-code-session-id` / `metadata.user_id`、Codex 的 `session-id`、`x-session-id`、`prompt_cache_key` 等），同一会话固定使用同一个 Key；新会话按配置顺序轮询分配 —— 目的是最大化上游 prompt cache 命中率。
+- 识别不到会话标识的请求固定使用第一个可用 Key（fill-first），保证行为可预期。
+- Key 失效或额度用尽会自动切换：401/403 禁用该 Key，402/429 进入冷却退避（60s → 最大 1800s），并解除受影响会话的绑定，重试时自动重新绑定到健康 Key。
+- 运维接口（需管理员认证）：`GET /admin/api/keys` 查看各 Key 状态/额度/绑定会话数，`DELETE /admin/api/sessions` 清空绑定，`POST /admin/api/keys/{后四位}/reset` 解除冷却或禁用。
+
 ### 日志
 
 日志格式通过 `CC_ADAPTER_LOG_FORMAT` 控制（默认 `console`）。
@@ -259,6 +268,15 @@ docker compose up -d
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 
 You can also configure via a `.env` file (see `.env.example`).
+
+### Multi-key routing
+
+With more than one key configured (`CC_ADAPTER_CC_API_KEY=["k1","k2"]`) the adapter assigns upstream keys by session stickiness plus first-usable fallback:
+
+- Requests carrying a session identity (Claude Code `x-claude-code-session-id` / `metadata.user_id`, Codex `session-id`, `x-session-id`, `prompt_cache_key`, …) stick to one key per conversation; new sessions are bound round-robin in configured order — this maximizes upstream prompt-cache hits.
+- Requests without a session identity always use the first usable key (fill-first).
+- Failures fail over automatically: 401/403 disables a key, 402/429 puts it in cooling backoff (60s → 1800s max) and unbinds the affected sessions, which rebind to a healthy key on retry.
+- Ops endpoints (admin auth required): `GET /admin/api/keys` (state/credits/bound sessions per key), `DELETE /admin/api/sessions` (drop all bindings), `POST /admin/api/keys/{last4}/reset` (clear cooling/disabled).
 
 ### Logging
 

@@ -30,6 +30,9 @@ docker compose up -d                  # docker-compose.yml + optional docker-com
 | `GET /v1/models` | `main.py` (dynamic via `get_models_data()`) | none |
 | `GET /admin/api/models` | `admin/router.py` (public listing, no auth) | none |
 | `POST /admin/api/models/refresh` | `admin/router.py` | admin auth |
+| `GET /admin/api/keys` | `admin/router.py` (per-key scheduler state) | admin auth |
+| `DELETE /admin/api/sessions` | `admin/router.py` (drop session→key bindings) | admin auth |
+| `POST /admin/api/keys/{suffix}/reset` | `admin/router.py` (clear cooling/disabled) | admin auth |
 
 Entry: `cc_adapter/__main__.py` → `main.py:run()` → uvicorn. Import: `from cc_adapter.main import app`.
 
@@ -70,35 +73,55 @@ Both translate to CC /alpha/generate body, stream SSE back.
 - **Singletons** owned by `core/runtime.py`: `_config`, `_cc_client`, translator instances (lazy init via `get_*()`). Also `_version_checker` and `_model_fetcher`.
 - **`get_or_create_client()`** at `runtime.py:41` — auto-creates a client with `AppConfig()` defaults if `init()` hasn't been called, logging a warning. Used by all routers when no client is available.
 - **Auth headers**: `core/headers.py` — `extract_token()` (Bearer/x-api-key), `auth_error_response(message, protocol)` (401). Branches on `protocol: "openai" | "anthropic"` for correct error shape; `message` parameter allows custom error text.
-- **Retry**: `core/retry.py` — `retry_on_empty()` for non-streaming (retries once on empty upstream response), `stream_with_retry()` for streaming (same retry logic + optional error event emission).
-- **Admin auth**: HMAC-signed token in `core/auth.py` (not JWT); embeds `exp` + password hash prefix. API access validation at `core/auth.py:check_api_access()`.
+- **Retry**: `core/retry.py` — `retry_on_empty()` for non-streaming (retries once on empty upstream response), `stream_with_retry()` for streaming (same retry logic + optional error event emission). Inside `client.py:generate()` a retryable upstream error (402/429/400-insufficient-credits) or a key error (401/403) feeds `KeyScheduler.report()` and moves to the next key.
+- **Admin auth**: HMAC-signed token in `core/auth.py` (not JWT); embeds `exp` (24h) + password hash prefix. API access validation at `core/auth.py:check_api_access()`. When `CC_ADAPTER_ADMIN_PASSWORD` is empty the admin API is **unauthenticated** (`verify_auth` short-circuits it; `main.py` logs a startup warning) — intranet-only deployments rely on this, do not reintroduce a 503 gate.
 - **ID generation**: `generate_id(prefix, length)` in `core/utils.py`.
-- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `VERSION`.
+- **Constants**: `core/constants.py` — `STREAMING_HEADERS`, `NPM_URL`, `NPM_CACHE_TTL`, `NPM_ERROR_BACKOFF`, `KEY_CREDITS_CACHE_TTL`, `KEY_CREDITS_ERROR_BACKOFF`, `KEY_COOLDOWN_BASE`, `KEY_COOLDOWN_MAX`, `SESSION_AFFINITY_TTL`, `SESSION_AFFINITY_MAX_ENTRIES`, `VERSION`.
 - **Version checker**: Background npm polling, cached 30min, fallback `0.25.2` (env `CC_ADAPTER_DEFAULT_VERSION`). See `core/version_checker.py`. Tests must set `_last_fetch_time = None` (not `0.0`) to guarantee cache invalidation.
-- **Model fetcher**: `core/model_fetcher.py` — fetches models/reasoning-efforts from CC API, feeds into `MODEL_PROVIDER_MAP` and `MODEL_REASONING_EFFORTS_MAP` via `refresh_maps()`.
+- **Model fetcher**: `core/model_fetcher.py` — downloads the cmd CLI npm tarball (`registry.npmjs.org`, 30min TTL), extracts model ids/context windows/reasoning efforts and rebuilds the model list plus `MODEL_PROVIDER_MAP` / `MODEL_REASONING_EFFORTS_MAP` via `refresh_maps()`. Unknown model ids pass through unchanged, so new upstream models need no code change; the static tables in `catalog/models_data.py` / `providers/shared/model_mapping.py` are only the pre-fetch fallback.
+- **Key scheduler**: `core/key_scheduler.py` — `KeyScheduler` replaces the old `KeyPool` (deleted). Owns per-key health (ok/cooling/disabled), credits, round-robin + sticky session bindings and the fill-first fallback.
 
 ### CC Request Headers
 
-`make_cc_headers()` in `headers.py:12` builds the base headers used by all CC API calls. BUT `x-session-id` is **NOT** in this function — it is injected per-client-instance in `client.py:generate()`:
+`make_cc_headers()` in `headers.py` builds the base headers for every CC API call and mimics real cmd CLI v1.54.0 traffic (verified against the CLI bundle):
 
-- `CommandCodeClient.__init__()` generates `self._session_id = generate_id("sess_", 16)` once
-- `generate()` sets `headers["x-session-id"] = self._session_id` before merging `extra_headers`
-- This keeps the session ID stable across all `/alpha/generate` calls within a client lifetime
-- Non-`generate()` calls (billing/credits/usage/whoami) do NOT receive `x-session-id`
+- `Content-Type: application/json`, `User-Agent: cli`
+- `x-command-code-version` (dynamic), `x-cli-environment: production`, `x-taste-learning: false` (the CLI always sends this header; the value is the real toggle state)
+- undici defaults: `accept-language: *`, `sec-fetch-mode: cors`, `accept-encoding: gzip, deflate` (setting accept-encoding stops httpx from sending its own `gzip, deflate, br, zstd`)
+- `Authorization: Bearer <key>` when a key is given, `x-cmd-zdr: 1` when ZDR is on, `x-oss-primary-provider` when configured
+- `x-co-flag` is **NOT** sent — the CLI never sends it, do not re-add it
+
+`x-session-id` / `x-project-slug` are **not** in this function — `client.py:generate()` derives them per (session flag, chosen key) via `SessionExtractor.derive()`:
+
+- `sess_<16 hex>` + a slug from a fixed pool; the same conversation on the same key always yields the same pair (mirrors the CLI's per-process id)
+- billing/credits/usage/whoami calls receive the base headers only
 
 ### CC Request Body
 
-`body.py` constructs the body for `POST /alpha/generate`. Notable facts:
+`body.py` constructs the body for `POST /alpha/generate` in the CLI's shape: `memory: null`, `taste: null`, `skills: null`, `permissionMode: "standard"`, and a `config` with
 
-- `_STATIC_CONFIG` deliberately does **NOT** contain an `"env"` field — the official CC CLI has no such field. Do not re-add it.
-- `"additionalDirectories": []` is present (matches official CC CLI schema).
-- `"environment"` is the **string** `"production"`, not an object. The CC backend rejects objects here.
-- `make_config()` shallow-copies mutable lists (`structure`, `recentCommits`) but the rest spreads from `_STATIC_CONFIG`.
+- `date: "YYYY-MM-DD"` (UTC), `environment` = node platform name (`linux` inside Docker)
+- `gitStatus: "Working tree clean"`, `recentCommits`: three commits derived deterministically from the slug
+- `workingDir` rewritten by `bind_workspace(config, slug)` (called from `client.py:generate()`) to `/home/dev/proj/<slug>` so its basename equals the `x-project-slug` header, like the real CLI
+
+Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends neither. `_STATIC_CONFIG` deliberately does **NOT** contain an `"env"` field.
+
+### Key routing & session affinity
+
+`core/key_scheduler.py` (`KeyScheduler`, created for clients with 2+ keys) decides which upstream key serves a request:
+
+- **Sticky**: an explicit client session identity (see the `SessionExtractor.extract()` chain: `x-claude-code-session-id`, `metadata.user_id`, `session-id`, `x-session-id`, `x-conversation-id`, `prompt_cache_key`, …) is bound to a key; a new session is bound round-robin in configured key order.
+- An established binding outranks key order — a recovered key does not steal a session back.
+- **Fill-first**: requests without an explicit identity (content-hash fallback, `explicit=False`) always go to the first usable key and are never bound.
+- Bindings slide: 1h TTL, 4096 entries, LRU eviction (`constants.py`).
+- Health: 401/403 disables a key and unbinds its sessions; 402/429 cools it down with escalating backoff (60s → 1800s); 5xx changes nothing. `client.py:generate()` calls `report()` after every attempt.
+- Ops endpoints: `GET /admin/api/keys`, `DELETE /admin/api/sessions`, `POST /admin/api/keys/{suffix}/reset`.
 
 ## Translation quirks
 
 **Shared (`providers/shared/`):**
-- `model_mapping.py`: `MODEL_PROVIDER_MAP` — bare names → canonical CC IDs. `clamp_reasoning_effort()` — nearest-higher clamping per model's supported range (from `MODEL_REASONING_EFFORTS_MAP`). Maps are mutable at runtime via `refresh_maps()`.
+- `session_extractor.py`: `extract(headers, original, body)` returns `SessionSignal(flag, explicit)` using the CLIProxyAPI-style priority chain (Claude Code header → `metadata.user_id` → `session-id` → `x-http-session-id` → `x-session-id`/affinity/slot → conversation/thread headers → `prompt_cache_key` → `conversation.id` → body session ids → content-hash fallback). `x-client-request-id` is deliberately excluded (per-request UUID). `derive(flag, key)` returns the upstream `sess_<16 hex>` + project slug.
+- `model_mapping.py`: `MODEL_PROVIDER_MAP` — bare names → canonical CC IDs. `clamp_reasoning_effort()` — nearest-higher clamping per model's supported range (from `MODEL_REASONING_EFFORTS_MAP`); unknown models drop the effort. Maps are mutable at runtime via `refresh_maps()`.
 - `tool_mapping.py`: `normalize_schema()` (filePath↔path), `normalize_args()` (path/old_str/new_str→filePath/oldString/newString for file tools), `translate_tool_choice()` (auto/none/required↔type), `make_tool_call_block()`/`make_tool_result_block()`.
 
 **OpenAI:**
