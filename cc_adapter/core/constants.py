@@ -30,6 +30,14 @@ KEY_CREDIT_COOLDOWN: float = 1800.0
 SESSION_AFFINITY_TTL: float = 3600.0
 SESSION_AFFINITY_MAX_ENTRIES: int = 4096
 
+# One upstream account is one forged machine, and a real dev machine only ever
+# works in a handful of repositories. Every key therefore derives its own small
+# palette of project slugs (a pure function of the key, so restarts, rebuilds and
+# rejoins never move a session to another project), and keeps recycling the same
+# few projects instead of reporting a brand-new one per session.
+PROJECT_SLUGS_PER_ACCOUNT_MIN: int = 4
+PROJECT_SLUGS_PER_ACCOUNT_MAX: int = 8
+
 # How long a rebuilt client may keep serving in-flight streams before its pool is closed anyway.
 CLIENT_CLOSE_GRACE_SECONDS: float = 120.0
 

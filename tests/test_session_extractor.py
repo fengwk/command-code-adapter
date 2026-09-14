@@ -7,6 +7,7 @@ import re
 import pytest
 
 from cc_adapter.command_code.body import make_cc_body, make_config
+from cc_adapter.core.constants import PROJECT_SLUGS_PER_ACCOUNT_MAX, PROJECT_SLUGS_PER_ACCOUNT_MIN
 from cc_adapter.providers.anthropic.models import AnthropicRequest
 from cc_adapter.providers.openai.models import ChatCompletionRequest
 from cc_adapter.providers.openai.responses_models import ResponseCreateRequest
@@ -447,13 +448,15 @@ class TestSessionExtractorDerive:
 
     def test_home_login_is_stable_per_key_across_sessions(self):
         # One upstream key is one forged machine: every session it serves reports
-        # the same home login, while session id and slug stay per session.
+        # the same home login, while session ids stay per session and projects are
+        # drawn from that machine's own small palette.
         identities = [self.ex.derive(f"msg:session{i}", "key1") for i in range(32)]
         assert len({identity.home_login for identity in identities}) == 1
 
-        first, second = identities[0], identities[1]
-        assert first.session_id != second.session_id
-        assert first.project_slug != second.project_slug
+        slugs = {identity.project_slug for identity in identities}
+        assert PROJECT_SLUGS_PER_ACCOUNT_MIN <= len(slugs) <= PROJECT_SLUGS_PER_ACCOUNT_MAX
+        assert identities[0].session_id != identities[1].session_id
+        assert identities[0].project_slug in slugs
 
     def test_same_session_on_another_key_changes_all_three_values(self):
         first = self.ex.derive("msg:same", "key1")
@@ -462,10 +465,39 @@ class TestSessionExtractorDerive:
         assert first.project_slug != second.project_slug
         assert first.home_login != second.home_login
 
-    def test_derive_slug_spreads_across_pool(self):
-        # 64 distinct sessions must land on well more than the old 16-slug spread.
-        slugs = {self.ex.derive(f"msg:flag{i}", "key1").project_slug for i in range(64)}
-        assert len(slugs) >= 16
+    def test_machine_works_in_a_small_palette_of_projects(self):
+        # A real dev machine works in a handful of repositories, so one key must not
+        # report a brand-new project for every session. Repeated projects are the
+        # normal case, and every slug still comes from the shared pool.
+        slugs = [self.ex.derive(f"msg:flag{i}", "key1").project_slug for i in range(200)]
+        distinct = set(slugs)
+        assert PROJECT_SLUGS_PER_ACCOUNT_MIN <= len(distinct) <= PROJECT_SLUGS_PER_ACCOUNT_MAX
+        assert distinct <= set(_PROJECT_SLUG_POOL)
+        assert len(slugs) > len(distinct) * 10
+
+    def test_project_palette_is_a_pure_function_of_the_key(self):
+        # No state and no memory: repeated calls and a fresh extractor derive the same
+        # palette, so restarts, client rebuilds and rejoins can not move a session to
+        # a different project.
+        first = {SessionExtractor().derive(f"msg:flag{i}", "key1").project_slug for i in range(200)}
+        second = {SessionExtractor().derive(f"msg:flag{i}", "key1").project_slug for i in range(200)}
+        assert first == second
+        assert self.ex.derive("msg:flag0", "key1").project_slug in first
+
+    def test_palettes_vary_across_keys(self):
+        # Every account samples its own subset: palettes differ, and no account is
+        # restricted to the same handful of names as the others. An occasional shared
+        # name is acceptable (two people on similarly named repos).
+        palettes = {
+            key: frozenset(self.ex.derive(f"msg:flag{i}", key).project_slug for i in range(200))
+            for key in ("key1", "key2", "key3", "key4", "key5")
+        }
+        assert all(
+            PROJECT_SLUGS_PER_ACCOUNT_MIN <= len(palette) <= PROJECT_SLUGS_PER_ACCOUNT_MAX
+            for palette in palettes.values()
+        )
+        assert len(set(palettes.values())) == len(palettes)
+        assert len(set().union(*palettes.values())) > PROJECT_SLUGS_PER_ACCOUNT_MAX
 
     def test_derive_validates_empty_inputs(self):
         with pytest.raises(ValueError):

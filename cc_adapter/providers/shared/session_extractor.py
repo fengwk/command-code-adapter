@@ -13,7 +13,8 @@ disjoint digest segment so none of them can be derived from another:
 
     fig          = sha256(stable_flag | cmd_key)
     session_id   = "sess_" + fig.hex()[:16]        # matches cmd CLI shape
-    project_slug = SLUGS[fig[8:12] uint32 % 64]    # looks like a real cwd slug
+    palette      = 4-8 slugs drawn from SLUGS      # key-scoped, one machine's repos
+    project_slug = palette[fig[8:12] uint32 % |palette|]
     home_login   = LOGINS[sha256("login:" + cmd_key) uint32 % 64]
 
 The home login is derived from the key alone on purpose: one upstream account is
@@ -23,6 +24,18 @@ project slug. Switching cmd keys invalidates the session id, which is the
 correct behavior: each cmd key is a different upstream account and must not
 share session-scoped state. Two keys that map to the same login still differ in
 session id and project slug.
+
+Each key also owns a *small, fixed* set of projects (`PROJECT_SLUGS_PER_ACCOUNT_*`
+in `core/constants.py`): a real machine works in a handful of repositories, so
+one account reporting a brand-new project for every session is a machine-shaped
+pattern. The palette is a pure function of the key, which keeps a session glued
+to the same project across restarts, client rebuilds and reconnects.
+
+Two keys occasionally share a project name, since every palette is drawn from the
+same pool. That is deliberate and low risk: the session id and the home login stay
+per key, and a shared name also shares the forged commit list (the commits derive
+from the slug), which is exactly what two people on similarly named repositories
+look like.
 
 Session identity extraction (CLIProxyAPI-style priority chain)
 -------------------------------------------------------------
@@ -77,10 +90,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from cc_adapter.core.constants import PROJECT_SLUGS_PER_ACCOUNT_MAX, PROJECT_SLUGS_PER_ACCOUNT_MIN
+
 
 # Pool of plausible project slugs (lowercase, hyphenated, cwd-style).
-# 64 entries keep two keys that share a slug unlikely and make the slug a
-# meaningful part of the forged identity.
+# Each key draws its own small palette from this pool (see _account_slug_palette),
+# so the pool is the variety across accounts, not within one.
 _PROJECT_SLUG_POOL: tuple[str, ...] = (
     "alpha-services",
     "analytics-pipeline",
@@ -307,6 +322,19 @@ class SessionIdentity:
     home_login: str
 
 
+def _account_slug_palette(login_digest: bytes, count: int) -> list[str]:
+    """Return the `count` project slugs a key is allowed to report, in stable order.
+
+    Drawn from the shared pool with a key-derived base and an odd stride: an odd
+    stride is coprime with the pool size, so the picked names never repeat, and two
+    keys get mostly different subsets. Every value is a pure function of the key.
+    """
+    size = len(_PROJECT_SLUG_POOL)
+    base = int.from_bytes(login_digest[5:9], "big") % size
+    stride = 1 + 2 * (int.from_bytes(login_digest[9:13], "big") % (size // 2))
+    return [_PROJECT_SLUG_POOL[(base + index * stride) % size] for index in range(count)]
+
+
 class SessionExtractor:
     """Stateless extractor: request -> SessionSignal, then -> SessionIdentity."""
 
@@ -382,10 +410,11 @@ class SessionExtractor:
     def derive(self, stable_flag: str, cmd_key: str) -> SessionIdentity:
         """Return the forged identity for a (stable_flag, cmd_key) pair.
 
-        Pure function: same inputs always yield the same outputs. Each value is
-        read from a disjoint digest segment, so the home login (key-scoped) can
-        not be traced back to the session id or the project slug (session-scoped)
-        and vice versa.
+        Pure function: same inputs always yield the same outputs, with no state, so
+        a restart, a client rebuild or a rejoin never moves a session to another
+        project. Each value is read from a disjoint digest segment, so the key-scoped
+        values (home login, project palette) can not be traced back to the
+        session-scoped ones (session id, project slug within the palette).
         """
         if not isinstance(stable_flag, str) or not stable_flag:
             raise ValueError("stable_flag must be a non-empty string")
@@ -394,9 +423,13 @@ class SessionExtractor:
 
         digest = hashlib.sha256(f"{stable_flag}|{cmd_key}".encode()).digest()
         login_digest = hashlib.sha256(f"login:{cmd_key}".encode()).digest()
+        count = PROJECT_SLUGS_PER_ACCOUNT_MIN + login_digest[4] % (
+            PROJECT_SLUGS_PER_ACCOUNT_MAX - PROJECT_SLUGS_PER_ACCOUNT_MIN + 1
+        )
+        palette = _account_slug_palette(login_digest, count)
         return SessionIdentity(
             session_id=f"sess_{digest[:8].hex()}",
-            project_slug=_PROJECT_SLUG_POOL[int.from_bytes(digest[8:12], "big") % len(_PROJECT_SLUG_POOL)],
+            project_slug=palette[int.from_bytes(digest[8:12], "big") % count],
             home_login=_HOME_LOGIN_POOL[int.from_bytes(login_digest[:4], "big") % len(_HOME_LOGIN_POOL)],
         )
 

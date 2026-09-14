@@ -110,8 +110,9 @@ Both translate to CC /alpha/generate body, stream SSE back.
 
 `x-session-id` / `x-project-slug` are **not** in this function — `CommandCodeClient` derives them per (session flag, chosen key) via `SessionExtractor.derive()`:
 
-- `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`, each value read from a disjoint digest segment: `sess_<16 hex>` (from the session digest) + a slug from a 64-entry pool (same digest, later bytes) + a home login from a 64-entry pool (derived from the key **only**, so every session of one key reports the same forged machine)
+- `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`, each value read from a disjoint digest segment: `sess_<16 hex>` (from the session digest) + a slug from the key's own 4-8 entry palette (`PROJECT_SLUGS_PER_ACCOUNT_MIN/MAX`, drawn from a 64-entry pool) + a home login from a 64-entry pool (derived from the key **only**, so every session of one key reports the same forged machine)
 - the same conversation on the same key always yields the same triple (mirrors the CLI's per-process id); another key yields a different session id, slug and — for a different login — home directory, which is intentional: each key is a different upstream account
+- everything is a **pure function** of `(flag, key)`: no state, no cache, so a restart or a client rebuild never moves a session to another project. A key reports only its own handful of projects (a real machine works in a few repos); two keys may share a name, which is acceptable — session id and home always stay per key
 - billing/credits/usage/whoami calls receive the base headers only
 
 ### Per-key connection pools
@@ -151,7 +152,7 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 ## Translation quirks
 
 **Shared (`providers/shared/`):**
-- `session_extractor.py`: `extract(headers, original, body)` returns `SessionSignal(flag, explicit)` using the CLIProxyAPI-style priority chain (Claude Code header → `metadata.user_id` → `session-id` → `x-http-session-id` → `x-session-id`/affinity/slot → conversation/thread headers → `prompt_cache_key` → `conversation.id` → body session ids → content-hash fallback). `x-client-request-id` is deliberately excluded (per-request UUID). `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`; the login pool is key-scoped, the session id/slug pool is (flag, key)-scoped.
+- `session_extractor.py`: `extract(headers, original, body)` returns `SessionSignal(flag, explicit)` using the CLIProxyAPI-style priority chain (Claude Code header → `metadata.user_id` → `session-id` → `x-http-session-id` → `x-session-id`/affinity/slot → conversation/thread headers → `prompt_cache_key` → `conversation.id` → body session ids → content-hash fallback). `x-client-request-id` is deliberately excluded (per-request UUID). `derive(flag, key)` returns a frozen `SessionIdentity(session_id, project_slug, home_login)`; the login and the project palette are key-scoped, the session id and the slug chosen inside the palette are (flag, key)-scoped.
 - `model_mapping.py`: `MODEL_PROVIDER_MAP` — bare names → canonical CC IDs. `clamp_reasoning_effort()` — nearest-higher clamping per model's supported range (from `MODEL_REASONING_EFFORTS_MAP`); unknown models drop the effort. Maps are mutable at runtime via `refresh_maps()`.
 - `tool_mapping.py`: `normalize_schema()` (filePath↔path), `normalize_args()` (path/old_str/new_str→filePath/oldString/newString for file tools), `translate_tool_choice()` (auto/none/required↔type), `make_tool_call_block()`/`make_tool_result_block()`.
 
