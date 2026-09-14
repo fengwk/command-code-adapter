@@ -39,6 +39,8 @@ docker run -p 8080:8080 -e CC_ADAPTER_CC_API_KEY=user_your_key_here cc-adapter
 docker compose up -d
 ```
 
+面板管理的 Key 与配置写在 `CC_ADAPTER_ENV_FILE` 指向的文件里，容器里建议挂一个目录卷（见下）。镜像以 `appuser`（uid 999）运行，所以挂载目录要对它可写：`chown 999:999 ./data`，或者用 `--user "$(id -u):$(id -g)"` 以宿主用户身份运行（不需要 root，面板写入的文件在宿主上直接可读，权限 `0600`）。
+
 ### 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -75,7 +77,7 @@ volumes:
 
 两点注意：① 不要用单文件挂载 `/app/.env`——面板的原子写入（临时文件 + `rename`）在单文件挂载上会报 `EBUSY`；② 环境变量优先级高于该文件，想让某个字段"由面板管理"，就不要再用环境变量注入它（否则重启后被环境变量覆盖）。
 
-**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。
+**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。面板相关接口（`GET /admin/api/keys`、`POST /admin/api/usage/query` 等）返回的 Key 一律是掩码（长 Key 前 10 位 + 后 6 位，短 Key 只留末尾 4 位），完整值不会离开服务端。
 
 ### 多 Key 路由
 
@@ -267,6 +269,8 @@ docker run -p 8080:8080 -e CC_ADAPTER_CC_API_KEY=user_your_key_here cc-adapter
 docker compose up -d
 ```
 
+Keys and configuration saved in the panel live in the file behind `CC_ADAPTER_ENV_FILE`, so mount a directory (see below). The image runs as `appuser` (uid 999), so that directory must be writable by it: `chown 999:999 ./data`, or run with `--user "$(id -u):$(id -g)"` to use the host user instead (no root needed, and the files the panel writes - mode `0600` - stay readable on the host).
+
 ### Configuration
 
 | Variable | Default | Description |
@@ -303,7 +307,7 @@ volumes:
 
 Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel's atomic rewrite (temp file + `rename`) fails with `EBUSY` on a single-file mount; (2) environment variables outrank that file, so a field you want the panel to manage must not be injected as an environment variable.
 
-**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool).
+**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool). Keys returned by the admin APIs (`GET /admin/api/keys`, `POST /admin/api/usage/query`, ...) are always masked (first 10 + last 6 characters, short keys only their last 4), so the full value never leaves the server.
 
 ### Multi-key routing
 
