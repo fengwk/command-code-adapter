@@ -5,8 +5,11 @@ services:
       dockerfile: Dockerfile
     container_name: cc-adapter
     restart: always
+    stop_grace_period: 10m30s
     ports:
-      - "8080:8080"
+      - "${CC_ADAPTER_PORT:-8080}:${CC_ADAPTER_PORT:-8080}"
+    environment:
+      - CC_ADAPTER_PORT=${CC_ADAPTER_PORT:-8080}
     env_file:
       - .env
     deploy:

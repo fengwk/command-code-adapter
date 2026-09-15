@@ -9,6 +9,7 @@ from cc_adapter.admin.usage_client import (
     query_token_usage,
     query_all_tokens,
     query_daily_usage,
+    query_all_daily_usage,
 )
 from cc_adapter.providers.shared.session_extractor import process_identity
 
@@ -446,3 +447,64 @@ async def test_query_usage_extracts_limits():
     assert result["usage"]["fiveHour"]["cap"] == 100
     assert result["usage"]["weekly"]["used"] == 150
     assert result["usage"]["weekly"]["cap"] == 500
+
+
+@pytest.mark.asyncio
+class TestQueryAllDailyUsage:
+    async def test_empty_keys_returns_empty(self, base_url):
+        res = await query_all_daily_usage(base_url, [], date(2026, 3, 1), date(2026, 3, 2))
+        assert res == []
+
+    async def test_aggregates_multiple_keys_by_date(self, monkeypatch, base_url):
+        k1 = "key-alpha-1111"
+        k2 = "key-beta-2222"
+
+        async def fake_query_daily_usage(b_url, key, s_date, e_date, timeout=30.0):
+            if key == k1:
+                return [
+                    {"date": "2026-03-01", "total_cost": 1.25, "total_count": 10},
+                    {"date": "2026-03-02", "total_cost": 2.0, "total_count": 20},
+                ]
+            elif key == k2:
+                return [
+                    {"date": "2026-03-01", "total_cost": 0.75, "total_count": 5},
+                    {"date": "2026-03-02", "total_cost": 1.5, "total_count": 10},
+                ]
+            return []
+
+        monkeypatch.setattr("cc_adapter.admin.usage_client.query_daily_usage", fake_query_daily_usage)
+
+        res = await query_all_daily_usage(base_url, [k1, k2], date(2026, 3, 1), date(2026, 3, 2))
+        assert len(res) == 2
+        assert res[0] == {"date": "2026-03-01", "total_cost": 2.0, "total_count": 15}
+        assert res[1] == {"date": "2026-03-02", "total_cost": 3.5, "total_count": 30}
+
+    async def test_deduplicates_keys_without_double_querying(self, monkeypatch, base_url):
+        k1 = "key-alpha-1111"
+        queried = []
+
+        async def fake_query_daily_usage(b_url, key, s_date, e_date, timeout=30.0):
+            queried.append(key)
+            return [{"date": "2026-03-01", "total_cost": 1.0, "total_count": 10}]
+
+        monkeypatch.setattr("cc_adapter.admin.usage_client.query_daily_usage", fake_query_daily_usage)
+
+        res = await query_all_daily_usage(base_url, [k1, k1, k1], date(2026, 3, 1), date(2026, 3, 1))
+        assert queried == [k1]
+        assert len(res) == 1
+        assert res[0]["total_cost"] == 1.0
+
+    async def test_partial_failure_preserves_successful_keys(self, monkeypatch, base_url):
+        k1 = "key-alpha-1111"
+        k2 = "key-beta-2222"
+
+        async def fake_query_daily_usage(b_url, key, s_date, e_date, timeout=30.0):
+            if key == k1:
+                return [{"date": "2026-03-01", "total_cost": 1.5, "total_count": 10}]
+            raise RuntimeError("upstream timeout")
+
+        monkeypatch.setattr("cc_adapter.admin.usage_client.query_daily_usage", fake_query_daily_usage)
+
+        res = await query_all_daily_usage(base_url, [k1, k2], date(2026, 3, 1), date(2026, 3, 1))
+        assert len(res) == 1
+        assert res[0] == {"date": "2026-03-01", "total_cost": 1.5, "total_count": 10}

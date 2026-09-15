@@ -18,7 +18,7 @@ def create_client(cfg: AppConfig, *, timeout: float | None = None) -> CommandCod
     return CommandCodeClient(
         base_url=cfg.cc_base_url,
         api_key=cfg.cc_api_key[0] if cfg.cc_api_key else "",
-        api_keys=cfg.cc_api_key if len(cfg.cc_api_key) > 1 else None,
+        api_keys=cfg.cc_api_key if cfg.cc_api_key else None,
         max_connections=cfg.http_max_connections,
         max_keepalive_connections=cfg.http_max_keepalive_connections,
         http2=cfg.http2,

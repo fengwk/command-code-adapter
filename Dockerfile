@@ -35,6 +35,6 @@ RUN groupadd -r -g 999 appuser && useradd -r -u 999 -g appuser -d /app -s /sbin/
 USER appuser
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
+    CMD python -c "import urllib.request, cc_adapter.core.config as c; port = c.AppConfig().port; urllib.request.urlopen(f'http://localhost:{port}/health')" || exit 1
 
-CMD ["uvicorn", "cc_adapter.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "cc_adapter"]

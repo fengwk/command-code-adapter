@@ -372,6 +372,86 @@ class TestRecreateClient:
             if new is not None:
                 await new.aclose()
 
+    @pytest.mark.asyncio
+    async def test_scheduler_state_survives_2_to_1_rebuild(self):
+        """2 -> 1 rebuild preserves the remaining key's automatic disabled and manual-off state."""
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        k1, k2 = "key-alpha-1111", "key-beta-2222"
+        keys = [k1, k2]
+        cfg = AppConfig(cc_api_key=keys)
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=k1, api_keys=keys)
+        assert old.scheduler is not None
+
+        old.scheduler.report(k1, ok=False, status=401)
+        old.scheduler.disable(k1)
+        assert old.scheduler.key_state(k1)["state"] == "disabled"
+        assert old.scheduler.key_state(k1)["manual"] is True
+
+        previous = (get_config(), get_client())
+        state_init(cfg, old)
+        new = None
+        try:
+            cfg.cc_api_key = [k1]
+            _recreate_client(cfg)
+            new = get_client()
+            assert new.scheduler is not None
+            assert new.scheduler.keys == [k1]
+            assert new.scheduler.key_state(k1)["state"] == "disabled"
+            assert new.scheduler.key_state(k1)["reason"] == "http_401"
+            assert new.scheduler.key_state(k1)["manual"] is True
+            assert new.scheduler.key_state(k1)["enabled"] is False
+        finally:
+            state_init(*previous)
+            await old.aclose()
+            if new is not None:
+                await new.aclose()
+
+    @pytest.mark.asyncio
+    async def test_base_url_change_drops_automatic_health_and_retains_manual_off(self):
+        """When cc_base_url changes, automatic health/credits/affinity are cleared but manual-off is kept."""
+        from cc_adapter.admin.config_manager import _recreate_client
+        from cc_adapter.command_code.client import CommandCodeClient
+        from cc_adapter.core.runtime import get_client, get_config, init as state_init
+
+        k1, k2 = "key-alpha-1111", "key-beta-2222"
+        keys = [k1, k2]
+        cfg = AppConfig(cc_api_key=keys, cc_base_url="https://old.example.com")
+        old = CommandCodeClient(base_url=cfg.cc_base_url, api_key=k1, api_keys=keys)
+        assert old.scheduler is not None
+
+        old.scheduler.report(k1, ok=False, status=401)
+        old.scheduler._credits[k1] = 500
+        old.scheduler._affinity.set("sess:old", k1)
+        old.scheduler.disable(k2)
+
+        previous = (get_config(), get_client())
+        state_init(cfg, old)
+        new = None
+        try:
+            cfg.cc_base_url = "https://new.example.com"
+            _recreate_client(cfg)
+            new = get_client()
+            assert new.scheduler is not None
+
+            # k1: automatic 401 health, credits and affinity are dropped on new upstream
+            assert new.scheduler.key_state(k1)["state"] == "ok"
+            assert new.scheduler.key_state(k1)["reason"] is None
+            assert new.scheduler.key_state(k1)["credits"] is None
+            assert new.scheduler._affinity.get_and_refresh("sess:old") is None
+
+            # k2: manual-off was an explicit operator action, so it is retained
+            assert new.scheduler.key_state(k2)["manual"] is True
+            assert new.scheduler.key_state(k2)["enabled"] is False
+            assert new.scheduler.manual_disabled_keys() == {k2}
+        finally:
+            state_init(*previous)
+            await old.aclose()
+            if new is not None:
+                await new.aclose()
+
 
 class TestDistributionUpdate:
     """A mode switch is applied to the live scheduler in place; nothing is rebuilt.
@@ -413,7 +493,7 @@ class TestDistributionUpdate:
 
     @pytest.mark.asyncio
     async def test_update_without_a_scheduler_only_stores_the_mode(self):
-        """A single-key pool has no scheduler; the mode applies to the next rebuild."""
+        """A direct-mode client has no scheduler, so only the stored mode changes."""
         from cc_adapter.command_code.client import CommandCodeClient
         from cc_adapter.core.runtime import get_client, get_config, init as state_init
 

@@ -95,7 +95,7 @@ const i18n = {
     zdrLabel: "零数据保留 (ZDR)",
     zdrEnabled: "开启",
     zdrDisabled: "关闭",
-    zdrHint: "发送 x-cmd-zdr: 1 请求头以启用零数据保留；关闭后将不再发送该请求头（部分上游服务或模型可能需要关闭）。",
+    zdrHint: "发送 x-cmd-zdr: 1 请求头以启用零数据保留；若上游不支持将严格报错，不自动降级；如需调用无 ZDR 支持的模型请显式关闭。",
     tokenManagerEmpty: "请先添加至少一个 Key",
     tokenManagerResult: "新增 {added} 个，已存在 {existing} 个，失败 {failed} 个",
     tokenManagerHint: "此处只新增 Key（不会覆盖已有列表）；删除与启停在「Keys」页。",
@@ -108,10 +108,11 @@ const i18n = {
     keySessions: "会话",
     keyFailures: "失败",
     keyUnknown: "未知",
-    keyUnmanagedHint: "仅在配置多个 Key 时可管理",
+    keyUnmanagedHint: "未由调度器管理（直接客户端模式）",
     keyReasonCredits: "额度用尽",
     keyReasonRateLimited: "限流",
     keyReasonInvalidKey: "密钥无效",
+    keyReasonForbidden: "访问被拒绝",
     // Dashboard / usage / token manager (were missing, the UI rendered the raw key names)
     manage: "管理",
     refresh: "刷新",
@@ -228,7 +229,7 @@ const i18n = {
     zdrLabel: "Zero Data Retention (ZDR)",
     zdrEnabled: "Enabled",
     zdrDisabled: "Disabled",
-    zdrHint: "Sends x-cmd-zdr: 1 header for zero data retention; disable to omit the header (useful for models or upstreams without ZDR support).",
+    zdrHint: "Sends x-cmd-zdr: 1 header for zero data retention; fails closed without automatic downgrade if upstream lacks ZDR support. Disable explicitly to call models without ZDR.",
     tokenManagerEmpty: "Add at least one key first",
     tokenManagerResult: "added {added}, already configured {existing}, failed {failed}",
     tokenManagerHint: "This dialog only adds keys (it never rewrites the pool); removal and the on/off switch live in the Keys tab.",
@@ -241,10 +242,11 @@ const i18n = {
     keySessions: "Sessions",
     keyFailures: "Failures",
     keyUnknown: "unknown",
-    keyUnmanagedHint: "Manageable only with multiple keys",
+    keyUnmanagedHint: "Not managed by scheduler (direct client mode)",
     keyReasonCredits: "out of credits",
     keyReasonRateLimited: "rate limited",
     keyReasonInvalidKey: "invalid key",
+    keyReasonForbidden: "access denied",
     // Dashboard / usage / token manager (were missing, the UI rendered the raw key names)
     manage: "Manage",
     refresh: "Refresh",
@@ -714,11 +716,11 @@ async function loadTokenUsageData() {
 }
 
 // Mirrors the server-side masking of upstream keys: >20 chars keep the first 10 and the
-// last 6, shorter keys keep only the last 4, everything else is hidden completely.
+// last 6, 8..20 chars keep only the last 4, shorter keys are hidden as '****' to prevent leaking.
 function maskToken(token) {
   const s = String(token || "");
   if (s.length > 20) return s.slice(0, 10) + "…" + s.slice(-6);
-  if (s.length >= 4) return "****" + s.slice(-4);
+  if (s.length >= 8) return "****" + s.slice(-4);
   return "****";
 }
 
@@ -1568,7 +1570,8 @@ function formatCooldown(seconds) {
 function formatKeyReason(reason) {
   if (reason === "insufficient_credits") return t("keyReasonCredits");
   if (reason === "rate_limited") return t("keyReasonRateLimited");
-  if (reason === "http_401" || reason === "http_403") return t("keyReasonInvalidKey");
+  if (reason === "invalid_key" || reason === "http_401") return t("keyReasonInvalidKey");
+  if (reason === "http_403") return t("keyReasonForbidden");
   return String(reason);
 }
 
@@ -1642,8 +1645,7 @@ async function addKey() {
     const data = await resp.json();
     input.value = ""; // the full key never stays in the DOM
     showToast(t("keysAddToast").replace("{key}", data.key || "****"), "success");
-    // Reload from the server: adding may have flipped the pool from a single
-    // (unmanaged) key to a managed pool, which changes what every row shows.
+    // Reload from the server because rebuilding the managed pool can change every row.
     await loadKeys();
   } catch (e) {
     showToast(e.message, "error");
@@ -1652,29 +1654,39 @@ async function addKey() {
   }
 }
 
-function buildKeyRow(item) {
+function keyVisualState(item) {
   const state = item.state || "ok";
   const unmanaged = state === "unmanaged";
-  const manual = item.manual === true;
   const enabled = item.enabled !== false;
-  // A cooling key is parked by the scheduler, so it counts as off even when the
-  // operator never touched it; an unmanaged key has no scheduler state to show.
-  const on = unmanaged ? enabled : enabled && state !== "cooling";
+  const manualOff = item.manual === true || !enabled;
+  // Effective on only when manual enabled and state == ok (unmanaged fallback preserves old behavior).
+  // Automatic disabled or cooling keys both render as switch off; clicking enable resets them.
+  const on = unmanaged ? enabled : (!manualOff && state === "ok");
 
+  // Badge priority: unmanaged -> manual-off (Off) -> cooling (Cooling) -> disabled (Disabled) -> OK.
+  // Manually disabling a key that is cooling or disabled must show Off.
   let badgeKey = "keyStateOk";
   let badgeClass = "ok";
-  let badgeExtra = "";
   if (unmanaged) {
     badgeKey = "keyStateUnmanaged";
     badgeClass = "muted";
+  } else if (manualOff) {
+    badgeKey = "keyStateOff";
+    badgeClass = "err";
   } else if (state === "cooling") {
     badgeKey = "keyStateCooling";
     badgeClass = "warn";
-    badgeExtra = formatCooldown(item.cooldown_seconds);
-  } else if (!enabled) {
-    badgeKey = manual ? "keyStateOff" : "keyStateDisabled";
+  } else if (state === "disabled") {
+    badgeKey = "keyStateDisabled";
     badgeClass = "err";
   }
+  return { unmanaged, on, badgeKey, badgeClass };
+}
+
+function buildKeyRow(item) {
+  const visual = keyVisualState(item);
+  const { unmanaged, on, badgeKey, badgeClass } = visual;
+  const badgeExtra = badgeKey === "keyStateCooling" ? formatCooldown(item.cooldown_seconds) : "";
   const badgeText = badgeExtra ? `${t(badgeKey)} ${badgeExtra}` : t(badgeKey);
   const credits = item.credits === null || item.credits === undefined ? t("keyUnknown") : item.credits;
   const reason = item.reason ? formatKeyReason(item.reason) : "";
@@ -1721,9 +1733,9 @@ function buildKeyRow(item) {
     };
   }
 
-  // Removal stays available for an unmanaged row: with a single configured key
-  // the on/off switch has no scheduler to talk to, but the delete button is the
-  // only way to take that key out of the config.
+  // Removal stays available for an unmanaged row: when a client runs without a
+  // scheduler (direct client mode), the on/off switch is disabled, but the delete button
+  // remains the way to take that key out of the config.
   const del = row.querySelector(".key-delete");
   del.title = t("keysDelete");
   del.setAttribute("aria-label", `${t("keysDelete")} ${item.key || ""}`);

@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from cc_adapter.command_code.headers import make_cc_headers
-from cc_adapter.core.utils import mask_api_key
+from cc_adapter.core.utils import mask_api_key, normalize_api_keys
 from cc_adapter.providers.shared.session_extractor import process_identity
 
 logger = structlog.get_logger(__name__)
@@ -237,3 +237,47 @@ async def query_daily_usage(
         )
 
     return daily_results
+
+
+async def query_all_daily_usage(
+    base_url: str,
+    api_keys: list[str],
+    start_date: date_type,
+    end_date: date_type,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Query daily usage for all unique keys concurrently and aggregate by date.
+
+    Results are aggregated across all keys per date with costs rounded to 4 decimal places,
+    sorted stably by date. If any key query fails, other keys' results are preserved.
+    """
+    keys = normalize_api_keys(api_keys)
+    if not keys:
+        return []
+
+    results = await asyncio.gather(
+        *(query_daily_usage(base_url, key, start_date, end_date, timeout=timeout) for key in keys),
+        return_exceptions=True,
+    )
+
+    by_date: dict[str, dict[str, Any]] = {}
+    for res in results:
+        if isinstance(res, Exception):
+            logger.warning("query_all_daily_usage.key_failed", error=str(res))
+            continue
+        for entry in res:
+            date_key = entry["date"]
+            if date_key not in by_date:
+                by_date[date_key] = {"date": date_key, "total_cost": 0.0, "total_count": 0}
+            by_date[date_key]["total_cost"] += float(entry.get("total_cost", 0.0))
+            by_date[date_key]["total_count"] += int(entry.get("total_count", 0))
+
+    aggregated = [
+        {
+            "date": d_str,
+            "total_cost": round(data["total_cost"], 4),
+            "total_count": data["total_count"],
+        }
+        for d_str, data in sorted(by_date.items(), key=lambda x: x[0])
+    ]
+    return aggregated

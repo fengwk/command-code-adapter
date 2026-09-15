@@ -142,17 +142,24 @@ class CommandCodeClient:
         self._close_tasks: set[asyncio.Task[None]] = set()
         self._retiring = False
 
-        if api_keys and len(api_keys) > 1:
-            from cc_adapter.core.key_scheduler import KeyScheduler
+        if api_keys is not None:
+            from cc_adapter.core.utils import normalize_api_keys
 
-            self.scheduler: KeyScheduler | None = KeyScheduler(
-                api_keys,
-                self.base_url,
-                cooldown_base=key_cooldown_base,
-                cooldown_max=key_cooldown_max,
-                credit_cooldown=key_credit_cooldown,
-                distribution=key_distribution,
-            )
+            normalized_keys = normalize_api_keys(api_keys)
+            if normalized_keys:
+                from cc_adapter.core.key_scheduler import KeyScheduler
+
+                self.scheduler: KeyScheduler | None = KeyScheduler(
+                    normalized_keys,
+                    self.base_url,
+                    cooldown_base=key_cooldown_base,
+                    cooldown_max=key_cooldown_max,
+                    credit_cooldown=key_credit_cooldown,
+                    distribution=key_distribution,
+                )
+                self.api_key = normalized_keys[0]
+            else:
+                self.scheduler = None
         else:
             self.scheduler = None
 
@@ -282,7 +289,6 @@ class CommandCodeClient:
     ) -> AsyncGenerator[dict[str, Any], None]:
         tried_keys: set[str] = set()
         last_error: Exception | None = None
-        zdr_downgraded: bool = False
         extractor = get_session_extractor()
         # extra_headers may contain client-authored values (X-Session-ID etc.)
         # for session extraction but must not leak to the CC upstream. Routers
@@ -320,8 +326,6 @@ class CommandCodeClient:
                 bind_workspace(config, identity.project_slug, identity.home_login)
 
             headers = make_cc_headers(key, identity=identity, base_url=self.base_url)
-            if zdr_downgraded:
-                headers.pop("x-cmd-zdr", None)
 
             url = f"{self.base_url}/alpha/generate"
 
@@ -342,11 +346,13 @@ class CommandCodeClient:
                             self._report_key_failure(key, response.status_code, text, signal)
                             continue
 
-                        if _is_zdr_error(response.status_code, text) and not zdr_downgraded:
-                            zdr_downgraded = True
-                            tried_keys.discard(key)
-                            logger.info("zdr.downgrade", key_id=api_key_id(key))
-                            continue
+                        if _is_zdr_error(response.status_code, text):
+                            logger.warning(
+                                "zdr.required_unavailable",
+                                key_id=api_key_id(key),
+                                status_code=response.status_code,
+                            )
+                            raise mapped
 
                         raise mapped
 

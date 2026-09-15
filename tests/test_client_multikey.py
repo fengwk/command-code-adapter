@@ -149,14 +149,81 @@ class TestMultiKeyClient:
         assert client.scheduler._keys == ["key1", "key2", "key3"]
 
     @pytest.mark.asyncio
-    async def test_scheduler_not_created_with_one_key(self):
-        """When only 1 key in api_keys, scheduler stays None."""
-        client = CommandCodeClient(
+    async def test_scheduler_created_with_one_key_and_none_for_direct_mode(self):
+        """Single key in api_keys creates a scheduler; api_keys=None preserves direct mode."""
+        client_single = CommandCodeClient(
             base_url="https://api.example.com",
             api_key="key1",
             api_keys=["key1"],
         )
-        assert client.scheduler is None
+        assert client_single.scheduler is not None
+        assert client_single.scheduler.keys == ["key1"]
+
+        client_direct = CommandCodeClient(
+            base_url="https://api.example.com",
+            api_key="key1",
+            api_keys=None,
+        )
+        assert client_direct.scheduler is None
+
+        client_empty = CommandCodeClient(
+            base_url="https://api.example.com",
+            api_key="",
+            api_keys=[],
+        )
+        assert client_empty.scheduler is None
+
+    def test_direct_client_normalizes_and_validates_api_keys(self):
+        """Direct construction with api_keys validates and deduplicates keys."""
+        client = CommandCodeClient(
+            base_url="https://api.example.com",
+            api_key="ignored-primary",
+            api_keys=[" test-key1 ", "test-key2", "test-key1"],
+        )
+        assert client.scheduler is not None
+        assert client.scheduler.keys == ["test-key1", "test-key2"]
+        assert client.api_key == "test-key1"
+
+        with pytest.raises(ValueError):
+            CommandCodeClient(
+                base_url="https://api.example.com",
+                api_key="bad-key",
+                api_keys=["bad key"],
+            )
+
+    @pytest.mark.asyncio
+    async def test_single_key_disabled_does_not_call_upstream(self, monkeypatch):
+        """A disabled single-key pool fails before billing or generation calls."""
+        client = CommandCodeClient(
+            base_url="https://api.example.com",
+            api_key="alpha-key-1234",
+            api_keys=["alpha-key-1234"],
+        )
+        assert client.scheduler is not None
+        client.scheduler.disable("alpha-key-1234")
+
+        credit_calls = 0
+        call_count = 0
+
+        async def mock_credits(key):
+            nonlocal credit_calls
+            credit_calls += 1
+            raise AssertionError("Billing endpoint must not be called")
+
+        def mock_stream(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise AssertionError("Generate endpoint must not be called")
+
+        monkeypatch.setattr(client.scheduler, "_fetch_credits", mock_credits)
+        with patch.object(httpx.AsyncClient, "stream", side_effect=mock_stream):
+            with pytest.raises(AdapterError) as excinfo:
+                async for _ in client.generate({"params": {"model": "test", "messages": []}}):
+                    pass
+
+        assert credit_calls == 0
+        assert call_count == 0
+        assert "disabled by admin" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_first_key_used_by_default(self, sse_stream):
@@ -290,12 +357,13 @@ class TestMultiKeyClient:
     @pytest.mark.asyncio
     async def test_all_keys_parked_reports_the_last_upstream_failure(self, error_response_400_insufficient_credits):
         """Once every key is parked the next request fails with the last upstream error."""
+        k1, k2 = "test-key1", "test-key2"
         client = CommandCodeClient(
             base_url="https://api.example.com",
-            api_key="key1",
-            api_keys=["key1", "key2"],
+            api_key=k1,
+            api_keys=[k1, k2],
         )
-        client.scheduler._credits = {"key1": 100, "key2": 100}
+        client.scheduler._credits = {k1: 100, k2: 100}
         client.scheduler._last_fetch = time.monotonic()
 
         call_count = 0

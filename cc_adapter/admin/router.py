@@ -21,7 +21,7 @@ from cc_adapter.core.config import DEFAULT_MODEL
 from cc_adapter.core.constants import DEFAULT_DISTRIBUTION, VERSION
 from cc_adapter.command_code.body import make_cc_body, make_config
 from cc_adapter.admin.config_manager import ConfigManager
-from cc_adapter.admin.usage_client import query_all_tokens, query_daily_usage
+from cc_adapter.admin.usage_client import query_all_daily_usage, query_all_tokens
 from cc_adapter.core.utils import api_key_id, mask_api_key, normalize_api_keys
 from cc_adapter.core import log_buffer
 
@@ -39,7 +39,7 @@ class LoginResponse(BaseModel):
 
 
 class ConfigUpdate(BaseModel):
-    cc_api_key: str | None = None
+    cc_api_key: str | list[str] | None = None
     cc_base_url: str | None = None
     host: str | None = None
     port: int | None = None
@@ -81,8 +81,8 @@ async def login(req: LoginRequest):
 def _effective_distribution(cfg) -> str:
     """The mode that is actually in force: the live scheduler's, else the stored config.
 
-    The scheduler owns the value once it exists (the panel switches it in place), and a
-    single-key pool has no scheduler, so there the config file is the source of truth.
+    The scheduler owns the value once it exists (the panel switches it in place);
+    direct-mode and unconfigured clients fall back to the stored config.
     """
     from cc_adapter.core.runtime import get_client
 
@@ -195,13 +195,19 @@ async def update_config(update: ConfigUpdate, _=Depends(verify_auth)):
     if isinstance(cc_api_key, str) and _MASKED_KEY_SUMMARY_RE.match(cc_api_key):
         logger.warning("admin.config.rejected", reason="masked_summary")
         raise HTTPException(status_code=400, detail="cc_api_key must be a real key or omitted")
+    if "cc_api_key" in update_dict:
+        try:
+            update_dict["cc_api_key"] = normalize_api_keys(update_dict["cc_api_key"])
+        except (ValueError, TypeError) as e:
+            logger.warning("admin.config.rejected", reason="invalid_api_key", error=str(e))
+            raise HTTPException(status_code=400, detail=f"Invalid cc_api_key: {e}")
     ConfigManager.update_env_file(update_dict)
     await ConfigManager.apply_config_update(update_dict)
     return await get_config_endpoint()
 
 
 def _key_scheduler():
-    """Scheduler of the active client, or None when fewer than two keys are configured."""
+    """Scheduler of the active managed key pool, or None in direct/unconfigured mode."""
     from cc_adapter.core.runtime import get_client
 
     return getattr(get_client(), "scheduler", None)
@@ -267,8 +273,8 @@ def _scheduler_and_key(identifier: str):
 def _resolve_key_identifier(identifier: str) -> str:
     """Resolve one configured key from its ID or unique suffix (404 when unknown or ambiguous).
 
-    The scheduler owns identifier resolution whenever it exists; a pool of a single key
-    has no scheduler, so the live config list is used as the fallback there.
+    The scheduler owns identifier resolution whenever it exists; direct-mode clients
+    fall back to the live config list.
     """
     scheduler = _key_scheduler()
     if scheduler is not None:
@@ -419,15 +425,15 @@ async def admin_daily_usage(req: DailyUsageRequest, _=Depends(verify_auth)):
     cfg = get_config()
     if not cfg or not cfg.cc_api_key:
         return {"daily": [], "totals": {"total_cost": 0, "total_count": 0, "models": []}}
-    primary_key = normalize_api_keys(cfg.cc_api_key)
-    if not primary_key:
+    keys = normalize_api_keys(cfg.cc_api_key)
+    if not keys:
         return {"daily": [], "totals": {"total_cost": 0, "total_count": 0, "models": []}}
     start = date_type.fromisoformat(req.start_date)
     end = date_type.fromisoformat(req.end_date)
 
-    # ponytail: CC billing API no longer returns per-model breakdown.
-    # Use local per-model token stats to proportionally split daily cost.
-    daily_cc = await query_daily_usage(cfg.cc_base_url, primary_key[0], start, end)
+    # CC billing API returns account-level usage.
+    # Query all configured keys and use local per-model token stats to proportionally split daily cost.
+    daily_cc = await query_all_daily_usage(cfg.cc_base_url, keys, start, end)
     local = query_daily_tokens(days=365)
 
     daily_result: list[dict[str, Any]] = []

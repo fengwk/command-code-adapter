@@ -32,7 +32,8 @@ usable key has room, and when every usable key is saturated the least loaded one
 takes the stream - the cap spreads load, it never rejects a request.
 
 ``select()`` blocks only on the very first credits fetch; later calls use the
-currently known state and refresh the credits cache in the background.
+currently known state and refresh the credits cache in the background. A pool
+with no health-eligible key fails before probing balances.
 """
 
 from __future__ import annotations
@@ -226,8 +227,19 @@ class KeyScheduler:
         `set_distribution()` switches the mode of a running scheduler; existing
         bindings and the saturation path both outrank it.
         """
-        await self._ensure_credits()
         skip = exclude or set()
+        # Do not contact the billing endpoint when routing is already impossible:
+        # manual-off, cooling, disabled and excluded keys cannot become candidates
+        # merely because their balance was refreshed.
+        health_eligible = [
+            key
+            for key in self._keys
+            if key not in skip and key not in self._manual_off and self._health(key) == STATE_OK
+        ]
+        if not health_eligible:
+            return None
+
+        await self._ensure_credits()
 
         usable = [key for key in self._keys if key not in skip and self._usable(key)]
         if not usable:
@@ -331,7 +343,8 @@ class KeyScheduler:
         detail: str | None = None,
     ) -> None:
         if ok:
-            self._clear_health(key)
+            if self._health(key) == STATE_OK:
+                self._failures.pop(key, None)
             return
 
         self._last_failure = {
@@ -350,6 +363,13 @@ class KeyScheduler:
             logger.info(
                 "key.disabled", key=_safe_log_key(key), status=status, reason=self._reason[key], sessions=unbound
             )
+            return
+
+        if self._health(key) == STATE_DISABLED:
+            # disabled is permanently prioritized: late-arriving non-permanent failures
+            # (403/429/402/insufficient_credits) must not downgrade it to cooling.
+            if session_flag:
+                self._affinity.compare_and_delete(session_flag, key)
             return
 
         if status == 403:

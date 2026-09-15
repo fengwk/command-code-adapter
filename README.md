@@ -61,7 +61,7 @@ docker compose up -d
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | 限流冷却上限（秒） |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | 额度用尽的 Key 冷却时长（秒，固定值） |
 | `CC_ADAPTER_DISTRIBUTION` | `round-robin` | 新会话分发：`round-robin`（轮询）或 `fill-first`（主号优先），可在面板实时切换 |
-| `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存），可在面板实时切换 |
+| `CC_ADAPTER_ZDR` | `true` | 发送 `x-cmd-zdr: 1` 请求头（零数据留存）；上游不支持时严格报错不自动降级，如需调用无 ZDR 支持的模型可在面板或环境变量显式设为 `false` |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | 可选的 OSS 提供商名称，作为 `x-oss-primary-provider` 请求头发送 |
 | `CC_ADAPTER_ENV_FILE` | `.env` | 配置文件路径（管理面板读写此文件，见下） |
 
@@ -80,7 +80,7 @@ volumes:
 
 **每 Key 隔离**：每个上游 Key 使用**独立的 HTTP 连接池**（keep-alive 连接不会先后承载两个 Key 的 Authorization），并且上游可见的身份（`x-session-id`、`x-project-slug`、`workingDir` 的 `home` 段与项目目录）都按 Key（或「会话 + Key」）派生：同一对话换 Key 时会整体更换身份，同一 Key 的所有会话则共用同一个伪造家目录。余额探测也会按 Key 错开时间发出，避免所有账号在同一时刻从同一 IP 探活。
 
-**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。重建会迁移保留 Key 的健康状态、额度缓存和会话绑定，并让旧客户端继续服务已有流直到自然结束。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。面板相关接口（`GET /admin/api/keys`、`POST /admin/api/usage/query` 等）返回的 Key 一律使用统一掩码：超过 20 位显示前 10 位和后 6 位，4～20 位只显示后 4 位，不足 4 位则完全隐藏。Key 管理接口另返回不透明 `id` 用于操作，完整值不会离开服务端。
+**Key 管理**：`CC_ADAPTER_CC_API_KEY` 是可选的引导（bootstrap）配置——部署时不填也能启动，之后可在管理面板中逐个添加（`POST /admin/api/keys`）。添加/删除都写入 `CC_ADAPTER_ENV_FILE` 指向的配置文件**并立即在运行中的进程生效**（重建 CC 客户端，无需重启）：新 Key 立刻可被选中；删除的 Key 立刻离开 Key 池，其会话绑定一并清除。单 Key 也由调度器管理，因此支持健康状态、额度检查和人工启停；同一上游地址内重建时会迁移保留 Key 的健康状态、额度缓存和会话绑定，切换上游地址时则只保留人工关闭状态，避免沿用旧上游的自动状态。旧客户端会继续服务已有流直到自然结束。删除最后一个 Key 是允许的，此时请求会返回客户端的 `CC_ADAPTER_CC_API_KEY is not configured` 错误，直到面板再添加 Key。面板里 Key 的增删与启停集中在「Keys」页：配置页只显示已配置数量并提供跳转；「用量」页的令牌对话框是**只增不覆盖**的入口（避免误清空已有 Key）。面板相关接口（`GET /admin/api/keys`、`POST /admin/api/usage/query` 等）返回的 Key 一律使用统一掩码：超过 20 位显示前 10 位和后 6 位，8～20 位只显示后 4 位，不足 8 位则完全隐藏。Key 管理接口另返回不透明 `id` 用于操作，完整值不会离开服务端。
 
 ### 多 Key 路由
 
@@ -296,7 +296,7 @@ Keys and configuration saved in the panel live in the file behind `CC_ADAPTER_EN
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap in seconds |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat cooldown for an out-of-credits key, in seconds |
 | `CC_ADAPTER_DISTRIBUTION` | `round-robin` | New-session routing: `round-robin` or `fill-first`, switchable live in the admin panel |
-| `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` (zero data retention), switchable live in the admin panel |
+| `CC_ADAPTER_ZDR` | `true` | Send `x-cmd-zdr: 1` (zero data retention); fails closed without automatic downgrade if upstream lacks ZDR support; explicitly set `false` to use models without ZDR |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Config file path (the admin panel reads and rewrites this file) |
 
@@ -315,7 +315,7 @@ Two caveats: (1) do not bind-mount a single file over `/app/.env` — the panel'
 
 **Per-key isolation**: every upstream key gets its **own HTTP connection pool** (a keep-alive connection never carries two keys' `Authorization` header), and the upstream-visible identity (`x-session-id`, `x-project-slug`, the `home` segment of `workingDir` and the project directory) is derived per key (or per session + key): moving one conversation to another key changes the whole identity, while all sessions of one key share the same forged home directory. Balance probes are staggered per key as well, so the accounts never poll the upstream from one IP in the same instant.
 
-**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. Rebuilds migrate health, cached credits and bindings for retained keys, while the retired client keeps serving existing streams until they finish naturally. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool). Admin APIs (`GET /admin/api/keys`, `POST /admin/api/usage/query`, ...) use one masking rule: keys longer than 20 characters retain the first 10 and last 6, keys 4–20 characters retain only the last 4, and shorter keys are fully hidden. Key-management responses also carry an opaque `id` for operations; the full value never leaves the server.
+**Key management**: `CC_ADAPTER_CC_API_KEY` is an optional bootstrap value — the service starts without it, and keys can then be added one by one from the admin panel (`POST /admin/api/keys`). Adding and removing both write to the config file behind `CC_ADAPTER_ENV_FILE` **and apply to the running process immediately** (the CC client is rebuilt, no restart): a new key is selectable at once, a removed key leaves the pool together with its session bindings. A one-key pool is scheduler-managed too, so health, credits and the manual switch remain available. Rebuilds on the same upstream migrate health, cached credits and bindings for retained keys; changing the upstream URL keeps only explicit manual-off state so stale automatic state cannot cross upstreams. The retired client keeps serving existing streams until they finish naturally. Removing the last key is allowed; requests then fail with the client's own `CC_ADAPTER_CC_API_KEY is not configured` error until a key is added again. The Keys tab is the single editor: the Configuration tab only reports the configured count and links there, and the Usage tab's token dialog is add-only (it can never wipe the pool). Admin APIs (`GET /admin/api/keys`, `POST /admin/api/usage/query`, ...) use one masking rule: keys longer than 20 characters retain the first 10 and last 6, keys 8–20 characters retain only the last 4, and shorter keys are fully hidden. Key-management responses also carry an opaque `id` for operations; the full value never leaves the server.
 
 ### Multi-key routing
 

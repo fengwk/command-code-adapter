@@ -339,7 +339,7 @@ def _init_pool_client(keys: list[str]):
     client = CommandCodeClient(
         base_url=cfg.cc_base_url,
         api_key=keys[0] if keys else "",
-        api_keys=keys if len(keys) > 1 else None,
+        api_keys=keys if keys else None,
     )
     if client.scheduler is not None:
         client.scheduler._credits = {key: 100 for key in keys}
@@ -392,8 +392,8 @@ async def test_list_keys_without_scheduler_reports_unmanaged():
 async def test_list_keys_reports_scheduler_state_and_masks_keys():
     from cc_adapter.core.auth import generate_token
 
-    client_impl = _init_multi_key_client(["key1111", "key2222"])
-    client_impl.scheduler.report("key1111", ok=False, status=401)
+    client_impl = _init_multi_key_client(["test-key1111", "test-key2222"])
+    client_impl.scheduler.report("test-key1111", ok=False, status=401)
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -401,7 +401,7 @@ async def test_list_keys_reports_scheduler_state_and_masks_keys():
 
     assert resp.status_code == 200
     keys = resp.json()["keys"]
-    assert [entry["id"] for entry in keys] == [api_key_id("key1111"), api_key_id("key2222")]
+    assert [entry["id"] for entry in keys] == [api_key_id("test-key1111"), api_key_id("test-key2222")]
     assert [entry["key"] for entry in keys] == ["****1111", "****2222"]
     assert [entry["state"] for entry in keys] == ["disabled", "ok"]
     assert [entry["credits"] for entry in keys] == [100, 100]
@@ -411,7 +411,7 @@ async def test_list_keys_reports_scheduler_state_and_masks_keys():
 async def test_clear_sessions_endpoint_drops_bindings():
     from cc_adapter.core.auth import generate_token
 
-    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl = _init_multi_key_client(["test-key1111", "test-key2222"])
     await client_impl.scheduler.select("claude:s1", explicit=True)
     await client_impl.scheduler.select("claude:s2", explicit=True)
     assert client_impl.scheduler._affinity.stats()["entries"] == 2
@@ -431,10 +431,10 @@ async def test_enable_key_endpoint_clears_manual_off_and_health(monkeypatch):
     _stub_refresh(monkeypatch)
     from cc_adapter.core.auth import generate_token
 
-    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl = _init_multi_key_client(["test-key1111", "test-key2222"])
     scheduler = client_impl.scheduler
-    scheduler.report("key1111", ok=False, status=429, reason="rate_limited")
-    scheduler.disable("key1111")
+    scheduler.report("test-key1111", ok=False, status=429, reason="rate_limited")
+    scheduler.disable("test-key1111")
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -442,14 +442,14 @@ async def test_enable_key_endpoint_clears_manual_off_and_health(monkeypatch):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["id"] == api_key_id("key1111")
+    assert body["id"] == api_key_id("test-key1111")
     assert body["key"] == "****1111"
     assert body["state"] == "ok"
     assert body["enabled"] is True
     assert body["manual"] is False
     assert body["cooldown_seconds"] is None
     assert body["credits"] is None  # cached balance dropped, so the key is selectable right away
-    assert await scheduler.select(None, explicit=False) == "key1111"
+    assert await scheduler.select(None, explicit=False) == "test-key1111"
 
 
 @pytest.mark.asyncio
@@ -457,12 +457,12 @@ async def test_disable_key_endpoint_unbinds_sessions_and_is_idempotent():
     """POST /keys/{suffix}/disable takes one key out of rotation without touching the others."""
     from cc_adapter.core.auth import generate_token
 
-    client_impl = _init_multi_key_client(["key1111", "key2222"])
+    client_impl = _init_multi_key_client(["test-key1111", "test-key2222"])
     scheduler = client_impl.scheduler
-    await scheduler.select("claude:s1", explicit=True)  # key1111
-    await scheduler.select("claude:s2", explicit=True)  # key2222
-    await scheduler.select("claude:s3", explicit=True)  # key1111 again
-    assert scheduler.key_state("key1111")["sessions"] == 2
+    await scheduler.select("claude:s1", explicit=True)  # test-key1111
+    await scheduler.select("claude:s2", explicit=True)  # test-key2222
+    await scheduler.select("claude:s3", explicit=True)  # test-key1111 again
+    assert scheduler.key_state("test-key1111")["sessions"] == 2
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -471,21 +471,21 @@ async def test_disable_key_endpoint_unbinds_sessions_and_is_idempotent():
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["id"] == api_key_id("key1111")
+    assert body["id"] == api_key_id("test-key1111")
     assert body["key"] == "****1111"
     assert body["unbound_sessions"] == 2
     assert body["enabled"] is False
     assert body["manual"] is True
-    assert scheduler.key_state("key1111")["sessions"] == 0
-    assert scheduler.key_state("key2222")["sessions"] == 1  # other key untouched
-    assert await scheduler.select(None, explicit=False) == "key2222"
+    assert scheduler.key_state("test-key1111")["sessions"] == 0
+    assert scheduler.key_state("test-key2222")["sessions"] == 1  # other key untouched
+    assert await scheduler.select(None, explicit=False) == "test-key2222"
     assert again.json()["unbound_sessions"] == 0  # idempotent
 
 
 @pytest.mark.parametrize(
     "keys,suffix",
     [
-        (["key1111", "key2222"], "9999"),  # unknown suffix
+        (["test-key1111", "test-key2222"], "9999"),  # unknown suffix
         (["aaa-7777", "bbb-7777"], "7777"),  # ambiguous suffix
     ],
 )
@@ -509,8 +509,8 @@ async def test_key_switch_endpoints_reject_unresolvable_suffixes(keys, suffix):
 async def test_list_keys_reports_the_manual_switch_fields():
     from cc_adapter.core.auth import generate_token
 
-    client_impl = _init_multi_key_client(["key1111", "key2222"])
-    client_impl.scheduler.disable("key2222")
+    client_impl = _init_multi_key_client(["test-key1111", "test-key2222"])
+    client_impl.scheduler.disable("test-key2222")
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -540,25 +540,25 @@ async def test_add_key_appends_persists_and_applies_to_the_running_client(panel_
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
-    _, client_before = _init_pool_client(["key1111"])  # one key: no scheduler yet
-    assert client_before.scheduler is None
+    _, client_before = _init_pool_client(["pool-key1111"])  # one key in pool: has single-key scheduler
+    assert client_before.scheduler is not None
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/admin/api/keys", json={"key": "key5678"}, headers={"Authorization": f"Bearer {my_token}"}
+            "/admin/api/keys", json={"key": "pool-key5678"}, headers={"Authorization": f"Bearer {my_token}"}
         )
 
     assert resp.status_code == 200
-    assert resp.json() == {"id": api_key_id("key5678"), "key": "****5678", "count": 2}
-    assert get_config().cc_api_key == ["key1111", "key5678"]
+    assert resp.json() == {"id": api_key_id("pool-key5678"), "key": "****5678", "count": 2}
+    assert get_config().cc_api_key == ["pool-key1111", "pool-key5678"]
     rebuilt = get_client()
     assert rebuilt is not client_before  # rebuilt, so the new key is selectable right away
-    assert rebuilt.scheduler._keys == ["key1111", "key5678"]
-    assert 'CC_ADAPTER_CC_API_KEY=["key1111", "key5678"]' in panel_env.read_text()
+    assert rebuilt.scheduler._keys == ["pool-key1111", "pool-key5678"]
+    assert 'CC_ADAPTER_CC_API_KEY=["pool-key1111", "pool-key5678"]' in panel_env.read_text()
     added = [r for r in caplog.records if "admin.key.added" in str(r.message)]
     assert len(added) == 1
-    assert api_key_id("key5678") in str(added[0].message) and "count" in str(added[0].message)
+    assert api_key_id("pool-key5678") in str(added[0].message) and "count" in str(added[0].message)
 
 
 @pytest.mark.asyncio
@@ -567,7 +567,7 @@ async def test_add_key_accepts_the_512_character_boundary(panel_env):
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_config
 
-    _init_pool_client(["key1111"])
+    _init_pool_client(["pool-key1111"])
     longest = "k" * 512
     my_token = generate_token()
 
@@ -577,7 +577,7 @@ async def test_add_key_accepts_the_512_character_boundary(panel_env):
         )
 
     assert resp.status_code == 200
-    assert get_config().cc_api_key == ["key1111", longest]
+    assert get_config().cc_api_key == ["pool-key1111", longest]
 
 
 @pytest.mark.asyncio
@@ -586,17 +586,17 @@ async def test_add_key_rejects_a_key_already_in_the_pool(panel_env):
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
-    _, client_before = _init_pool_client(["key1111", "key2222"])
+    _, client_before = _init_pool_client(["pool-key1111", "pool-key2222"])
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/admin/api/keys", json={"key": " key2222 "}, headers={"Authorization": f"Bearer {my_token}"}
+            "/admin/api/keys", json={"key": " pool-key2222 "}, headers={"Authorization": f"Bearer {my_token}"}
         )
 
     assert resp.status_code == 409
     assert resp.json()["detail"] == "Key already configured"
-    assert get_config().cc_api_key == ["key1111", "key2222"]
+    assert get_config().cc_api_key == ["pool-key1111", "pool-key2222"]
     assert get_client() is client_before  # nothing rebuilt
     assert not panel_env.exists()  # nothing persisted
 
@@ -617,7 +617,7 @@ async def test_add_key_rejects_blank_whitespace_and_oversized_values(panel_env, 
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
-    _, client_before = _init_pool_client(["key1111"])
+    _, client_before = _init_pool_client(["pool-key1111"])
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -627,7 +627,7 @@ async def test_add_key_rejects_blank_whitespace_and_oversized_values(panel_env, 
 
     assert resp.status_code == 400
     assert resp.json()["detail"] == detail
-    assert get_config().cc_api_key == ["key1111"]
+    assert get_config().cc_api_key == ["pool-key1111"]
     assert get_client() is client_before
     assert not panel_env.exists()
 
@@ -657,37 +657,42 @@ async def test_remove_key_drops_it_from_pool_client_and_config_file(panel_env, c
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
-    _, client_before = _init_pool_client(["key1111", "key2222"])
-    await client_before.scheduler.select("claude:s1", explicit=True)  # binds key1111
-    await client_before.scheduler.select("claude:s2", explicit=True)  # binds key2222
-    assert client_before.scheduler.key_state("key2222")["sessions"] == 1
+    _, client_before = _init_pool_client(["pool-key1111", "pool-key2222"])
+    await client_before.scheduler.select("claude:s1", explicit=True)  # binds pool-key1111
+    await client_before.scheduler.select("claude:s2", explicit=True)  # binds pool-key2222
+    assert client_before.scheduler.key_state("pool-key2222")["sessions"] == 1
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.delete("/admin/api/keys/2222", headers={"Authorization": f"Bearer {my_token}"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"id": api_key_id("key2222"), "key": "****2222", "count": 1}
-    assert get_config().cc_api_key == ["key1111"]
+    assert resp.json() == {"id": api_key_id("pool-key2222"), "key": "****2222", "count": 1}
+    assert get_config().cc_api_key == ["pool-key1111"]
     env_content = panel_env.read_text()
-    assert 'CC_ADAPTER_CC_API_KEY=["key1111"]' in env_content
-    assert "key2222" not in env_content
+    assert 'CC_ADAPTER_CC_API_KEY=["pool-key1111"]' in env_content
+    assert "pool-key2222" not in env_content
     rebuilt = get_client()
     assert rebuilt is not client_before  # rebuilt without the removed key and its bindings
-    assert rebuilt.scheduler is None
-    assert rebuilt.api_key == "key1111"
+    assert rebuilt.scheduler is not None  # single-key pool retains KeyScheduler
+    assert rebuilt.scheduler._keys == ["pool-key1111"]
+    assert rebuilt.api_key == "pool-key1111"
     removed = [r for r in caplog.records if "admin.key.removed" in str(r.message)]
     assert len(removed) == 1
-    assert api_key_id("key2222") in str(removed[0].message) and "count" in str(removed[0].message)
+    assert api_key_id("pool-key2222") in str(removed[0].message) and "count" in str(removed[0].message)
 
 
 @pytest.mark.asyncio
 async def test_remove_key_resolves_a_single_key_pool_without_a_scheduler(panel_env):
-    """A one-key pool has no scheduler, so the config list is the resolution fallback."""
+    """An unmanaged one-key client has no scheduler, so the config list is the resolution fallback."""
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client, get_config
 
-    _, client_before = _init_pool_client(["only1234"])
+    cfg = AppConfig()
+    cfg.admin_password = "admin123"
+    cfg.cc_api_key = ["only1234"]
+    client_before = CommandCodeClient(base_url="https://api.example.com", api_key="only1234")
+    admin_state_init(cfg, client_before)
     assert client_before.scheduler is None
     my_token = generate_token()
 
@@ -728,9 +733,9 @@ async def test_removing_the_last_key_leaves_a_supported_empty_pool(panel_env):
 @pytest.mark.parametrize(
     "keys,suffix",
     [
-        (["key1111", "key2222"], "9999"),  # unknown suffix, scheduler active
+        (["pool-key1111", "pool-key2222"], "9999"),  # unknown suffix, scheduler active
         (["aaa-7777", "bbb-7777"], "7777"),  # ambiguous suffix, scheduler active
-        (["only1234"], "9999"),  # single-key pool: no scheduler, config-list fallback
+        (["only1234"], "9999"),  # single-key pool: no match
     ],
 )
 @pytest.mark.asyncio
@@ -759,26 +764,26 @@ async def test_manual_off_survives_the_client_rebuild(panel_env):
     from cc_adapter.core.auth import generate_token
     from cc_adapter.core.runtime import get_client
 
-    _, client_before = _init_pool_client(["key1111", "key2222"])
-    client_before.scheduler.disable("key1111")  # off, so it must not come back at the head
+    _, client_before = _init_pool_client(["pool-key1111", "pool-key2222"])
+    client_before.scheduler.disable("pool-key1111")  # off, so it must not come back at the head
     my_token = generate_token()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/admin/api/keys", json={"key": "key3333"}, headers={"Authorization": f"Bearer {my_token}"}
+            "/admin/api/keys", json={"key": "pool-key3333"}, headers={"Authorization": f"Bearer {my_token}"}
         )
 
     assert resp.status_code == 200
     rebuilt = get_client()
     assert rebuilt is not client_before
     scheduler = rebuilt.scheduler
-    assert scheduler.manual_disabled_keys() == {"key1111"}
-    assert scheduler.key_state("key1111")["manual"] is True
-    assert scheduler.key_state("key1111")["enabled"] is False
+    assert scheduler.manual_disabled_keys() == {"pool-key1111"}
+    assert scheduler.key_state("pool-key1111")["manual"] is True
+    assert scheduler.key_state("pool-key1111")["enabled"] is False
     # Seeded instead of fetched: select() must not go to the network in tests.
-    scheduler._credits = {key: 100 for key in ["key1111", "key2222", "key3333"]}
+    scheduler._credits = {key: 100 for key in ["pool-key1111", "pool-key2222", "pool-key3333"]}
     scheduler._last_fetch = time.monotonic()
-    assert await scheduler.select(None, explicit=False) == "key2222"
+    assert await scheduler.select(None, explicit=False) == "pool-key2222"
 
 
 @pytest.mark.asyncio
@@ -987,3 +992,190 @@ def test_admin_js_keys_tab_uses_safe_id_with_suffix_fallback():
     assert "toggleKey(id, !on, row)" in src
     assert 'deleteKey(id, item.key || "", row)' in src
     assert "keyIdentifier(k) === id" in src
+
+
+def test_admin_js_build_key_row_state_and_badge_matrix():
+    """Execute the actual pure helper to verify switch state and badge priority."""
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "cc_adapter" / "admin" / "static" / "admin.js").read_text()
+    helper = re.search(r"^function keyVisualState\(item\) \{.*?^\}", src, flags=re.MULTILINE | re.DOTALL)
+    assert helper is not None
+    helper_src = helper.group(0)
+    assert 'const on = unmanaged ? enabled : (!manualOff && state === "ok");' in helper_src
+    assert "item.manual === true || !enabled" in helper_src
+    assert "} else if (manualOff) {" in helper_src
+    assert '} else if (state === "cooling") {' in helper_src
+    assert '} else if (state === "disabled") {' in helper_src
+
+    if shutil.which("node"):
+        js_code = (
+            helper_src
+            + """
+        const stateMatrix = [
+          // [item, expectedOn, expectedBadgeKey]
+          [{ state: "unmanaged", enabled: true, manual: false }, true, "keyStateUnmanaged"],
+          [{ state: "unmanaged", enabled: false, manual: false }, false, "keyStateUnmanaged"],
+          [{ state: "ok", manual: true, enabled: false }, false, "keyStateOff"],
+          [{ state: "cooling", manual: true, enabled: false }, false, "keyStateOff"],
+          [{ state: "disabled", manual: true, enabled: false }, false, "keyStateOff"],
+          [{ state: "cooling", manual: false, enabled: true }, false, "keyStateCooling"],
+          [{ state: "disabled", manual: false, enabled: true }, false, "keyStateDisabled"],
+          [{ state: "ok", manual: false, enabled: true }, true, "keyStateOk"],
+          [{ state: "ok", manual: false, enabled: false }, false, "keyStateOff"],
+        ];
+
+        for (const [item, expOn, expBadge] of stateMatrix) {
+          const res = keyVisualState(item);
+          if (res.on !== expOn || res.badgeKey !== expBadge) {
+            console.error(JSON.stringify({ item, res, expOn, expBadge }));
+            process.exit(1);
+          }
+        }
+        console.log("OK");
+        """
+        )
+        proc = subprocess.run(["node", "-e", js_code], capture_output=True, text=True)
+        assert proc.returncode == 0, f"Node matrix check failed: {proc.stderr}"
+        assert proc.stdout.strip() == "OK"
+
+    assert 'if (reason === "invalid_key" || reason === "http_401") return t("keyReasonInvalidKey");' in src
+    assert 'if (reason === "http_403") return t("keyReasonForbidden");' in src
+    assert src.count("keyReasonForbidden:") == 2
+
+
+@pytest.mark.asyncio
+async def test_admin_daily_usage_endpoint_aggregates_all_keys(monkeypatch):
+    """POST /admin/api/usage/daily aggregates multiple keys and uses local token stats."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import init as admin_state_init
+    from cc_adapter.command_code.client import CommandCodeClient
+
+    cfg = AppConfig()
+    cfg.admin_password = "admin"
+    cfg.cc_api_key = ["key-alpha-1111", "key-beta-2222"]
+    client_inst = CommandCodeClient(base_url=cfg.cc_base_url, api_key="key-alpha-1111", api_keys=cfg.cc_api_key)
+    admin_state_init(cfg, client_inst)
+
+    async def fake_query_all(b_url, keys, start, end):
+        assert keys == ["key-alpha-1111", "key-beta-2222"]
+        return [
+            {"date": "2026-03-01", "total_cost": 4.0, "total_count": 20},
+            {"date": "2026-03-02", "total_cost": 6.0, "total_count": 30},
+        ]
+
+    monkeypatch.setattr("cc_adapter.admin.router.query_all_daily_usage", fake_query_all)
+    # mock local tokens
+    monkeypatch.setattr(
+        "cc_adapter.admin.router.query_daily_tokens",
+        lambda days: {
+            "2026-03-01": {
+                "tokens": 100,
+                "models": {
+                    "deepseek/v3": {"tokens": 60, "requests": 12},
+                    "claude/sonnet": {"tokens": 40, "requests": 8},
+                },
+            },
+            "2026-03-02": {
+                "tokens": 200,
+                "models": {
+                    "deepseek/v3": {"tokens": 200, "requests": 30},
+                },
+            },
+        },
+    )
+
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/admin/api/usage/daily",
+            json={"start_date": "2026-03-01", "end_date": "2026-03-02"},
+            headers={"Authorization": f"Bearer {my_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["daily"]) == 2
+    day1 = data["daily"][0]
+    assert day1["date"] == "2026-03-01"
+    assert day1["total_cost"] == 4.0
+    assert day1["total_count"] == 20
+    # Day 1 models split: 60% of 4.0 = 2.4, 40% of 4.0 = 1.6
+    assert len(day1["models"]) == 2
+    assert day1["models"][0]["model_id"] == "deepseek/v3"
+    assert day1["models"][0]["cost"] == 2.4
+    assert day1["models"][1]["model_id"] == "claude/sonnet"
+    assert day1["models"][1]["cost"] == 1.6
+
+    day2 = data["daily"][1]
+    assert day2["date"] == "2026-03-02"
+    assert day2["total_cost"] == 6.0
+    assert day2["models"][0]["cost"] == 6.0
+
+    assert data["totals"]["total_cost"] == 10.0
+    assert data["totals"]["total_count"] == 50
+
+
+@pytest.mark.asyncio
+async def test_put_config_invalid_cc_api_key_returns_400_without_side_effects(tmp_path, monkeypatch):
+    """PUT /admin/api/config rejects invalid cc_api_key (400) without writing to disk or runtime."""
+    from cc_adapter.core.auth import generate_token
+    from cc_adapter.core.runtime import init as admin_state_init
+    from cc_adapter.command_code.client import CommandCodeClient
+
+    test_env = tmp_path / ".env"
+    initial_content = 'CC_ADAPTER_CC_API_KEY=["valid-key-1111"]\nCC_ADAPTER_PORT=8080\n'
+    test_env.write_text(initial_content)
+
+    cfg = AppConfig()
+    cfg.admin_password = "admin"
+    cfg.cc_api_key = ["valid-key-1111"]
+    client_inst = CommandCodeClient(base_url=cfg.cc_base_url, api_key="valid-key-1111", api_keys=cfg.cc_api_key)
+    admin_state_init(cfg, client_inst)
+
+    monkeypatch.setattr("cc_adapter.core.config.env_file_path", lambda: str(test_env))
+    monkeypatch.setattr("cc_adapter.admin.config_manager.env_file_path", lambda: str(test_env))
+
+    my_token = generate_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Invalid key with whitespace in list
+        resp = await client.put(
+            "/admin/api/config",
+            json={"cc_api_key": ["valid-key-1111", "bad key with space"]},
+            headers={"Authorization": f"Bearer {my_token}"},
+        )
+        assert resp.status_code == 400
+        assert "Invalid cc_api_key" in resp.json()["detail"]
+
+        # 2. Invalid empty string entry in list
+        resp2 = await client.put(
+            "/admin/api/config",
+            json={"cc_api_key": [""]},
+            headers={"Authorization": f"Bearer {my_token}"},
+        )
+        assert resp2.status_code == 400
+
+    # Ensure disk file content was NOT changed
+    assert test_env.read_text() == initial_content
+    # Ensure runtime config was NOT modified
+    assert cfg.cc_api_key == ["valid-key-1111"]
+
+
+def test_docker_and_compose_configuration_static_guard():
+    """Static guard for Dockerfile launcher & dynamic healthcheck, and docker-compose.yml grace period."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text()
+    compose = (root / "docker-compose.yml").read_text()
+
+    assert 'CMD ["python", "-m", "cc_adapter"]' in dockerfile
+    assert "port = c.AppConfig().port" in dockerfile
+    assert "http://localhost:{port}/health" in dockerfile
+
+    assert "stop_grace_period: 10m30s" in compose
+    assert '"${CC_ADAPTER_PORT:-8080}:${CC_ADAPTER_PORT:-8080}"' in compose
+    assert "CC_ADAPTER_PORT=${CC_ADAPTER_PORT:-8080}" in compose

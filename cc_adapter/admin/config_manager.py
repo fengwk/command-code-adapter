@@ -67,8 +67,8 @@ def _apply_config_fields(cfg: AppConfig, updates: dict[str, Any]) -> bool:
 def _apply_live_distribution(value: Any) -> None:
     """Point the running scheduler at the new mode (no client rebuild, no binding loss).
 
-    A single-key pool has no scheduler, so there the mode only takes effect once a
-    client is created with the updated config (adding a key rebuilds it anyway).
+    A direct-mode or unconfigured client has no scheduler; there the stored mode
+    takes effect when a managed key pool is created.
     """
     from cc_adapter.core.runtime import get_client
 
@@ -88,10 +88,16 @@ def _recreate_client(cfg: AppConfig) -> CommandCodeClient | None:
     # manual off-switch, session affinity, health states, cooldowns, credits, etc.
     # A panel save must neither re-enable a disabled/cooling key nor drag running conversations
     # to another account. Removed keys leave no state or binding.
+    # When base_url changes, automatic health, credits, and affinity belong to the old upstream
+    # and must be dropped; only the operator's explicit manual-off intent is preserved.
     new_scheduler = getattr(new, "scheduler", None)
     old_scheduler = getattr(old, "scheduler", None)
     if new_scheduler is not None and old_scheduler is not None:
-        new_scheduler.import_state(old_scheduler.export_state())
+        same_base = getattr(old, "base_url", "").rstrip("/") == getattr(new, "base_url", "").rstrip("/")
+        if same_base:
+            new_scheduler.import_state(old_scheduler.export_state())
+        else:
+            new_scheduler.import_state({"manual_off": set(old_scheduler.manual_disabled_keys())})
     state_init(cfg, new)
     return old
 

@@ -38,30 +38,67 @@ def mask_api_key(key: str) -> str:
     """Display form of an upstream key: the panel never receives the full value.
 
     ``>20`` characters keep the first 10 and the last 6 (enough for an operator to tell
-    accounts apart), shorter keys keep only the last 4. The admin UI mirrors this rule
-    (``maskToken`` in ``admin/static/admin.js``) for values it never sends to the server.
+    accounts apart), 8..20 characters keep only the last 4, and keys shorter than 8
+    are completely hidden as '****' to prevent revealing the full key text. The admin UI
+    mirrors this rule (``maskToken`` in ``admin/static/admin.js``).
     """
     if len(key) > 20:
         return f"{key[:10]}…{key[-6:]}"
-    if len(key) >= 4:
+    if len(key) >= 8:
         return f"****{key[-4:]}"
     return "****"
 
 
-def normalize_api_keys(value: str | list[str] | None) -> list[str]:
+def normalize_api_keys(value: Any) -> list[str]:
+    """Normalize and validate API keys into a deduplicated list of strings.
+
+    Scalar string, JSON array string, or list -> trimmed list with order preserved.
+    None, empty scalar, or empty list represents an empty key pool ([]).
+    Rejects:
+    - non-string elements (raises ValueError)
+    - empty or pure-whitespace entries in arrays (raises ValueError)
+    - keys with internal whitespace (raises ValueError)
+    - keys exceeding 512 characters (raises ValueError)
+    """
+    if value is None:
+        return []
+
     if isinstance(value, list):
-        return [k for k in value if k]
-    if isinstance(value, str):
-        if not value:
+        raw_entries = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if not s:
             return []
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return [k for k in parsed if k]
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return [value]
-    return []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except Exception as e:
+                raise ValueError(f"Invalid JSON array for API keys: {e}") from e
+            if not isinstance(parsed, list):
+                raise ValueError("API keys JSON must be an array")
+            raw_entries = parsed
+        else:
+            raw_entries = [s]
+    else:
+        raise ValueError(f"API keys must be a string, list, or None, got {type(value).__name__}")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_entries:
+        if not isinstance(item, str):
+            raise ValueError(f"API key must be a string, got {type(item).__name__}")
+        k = item.strip()
+        if not k:
+            raise ValueError("API key must not be empty")
+        if any(c.isspace() for c in k):
+            raise ValueError("API key must not contain whitespace")
+        if len(k) > 512:
+            raise ValueError("API key must not exceed 512 characters")
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+
+    return result
 
 
 def parse_usage(raw_usage: dict | None) -> dict | None:

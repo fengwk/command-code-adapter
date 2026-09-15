@@ -68,12 +68,12 @@ Fields in `core/config.py:AppConfig` (loaded eagerly from `.env` at import).
 | `CC_ADAPTER_KEY_COOLDOWN_MAX` | `1800` | Rate-limit cooldown cap, seconds |
 | `CC_ADAPTER_KEY_CREDIT_COOLDOWN` | `1800` | Flat park window for an out-of-credits key, seconds |
 | `CC_ADAPTER_DISTRIBUTION` | `round-robin` | How a **new** session is dealt over the key pool: `round-robin` walks the configured ring, `fill-first` always starts at the first usable key. Sticky bindings and the saturation path outrank it; switchable at runtime from the panel (`PUT /admin/api/config {"distribution": …}`, applied in place — no client rebuild, no binding loss). |
-| `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention); switchable live from the panel without rebuilding the client |
+| `CC_ADAPTER_ZDR` | `true` | Sends `x-cmd-zdr: 1` header (zero data retention); switchable live from the panel without rebuilding the client. When enabled, unsupported upstreams fail closed instead of retrying without the header |
 | `CC_ADAPTER_OSS_PRIMARY_PROVIDER` | — | Optional OSS provider name, sent as `x-oss-primary-provider` header |
 | `CC_ADAPTER_ENV_FILE` | `.env` | Dotenv file read at startup **and rewritten by the admin panel** (`core/config.py:env_file_path()`). Point it at a mounted path (e.g. `/app/data/.env`) to persist panel changes — a single-file bind mount over `/app/.env` breaks the atomic rewrite (rename → EBUSY). Real environment variables still outrank this file, so anything the panel must own has to be absent from the container environment. Its directory is also the data directory (`core/config.py:data_dir()`): `token_usage.json`, `models_cache.json` and `cli_version.json` live there. |
 
-- **The panel never receives a full key**: `GET /admin/api/keys` and `GET /admin/api/config` return masked forms, and `POST /admin/api/usage/query` masks each upstream key with `core/utils.py:mask_api_key()` (first 10 + last 6 for keys longer than 20 characters, `****` + last 4 for lengths 4–20, and `****` below 4). Key-management responses include a deterministic opaque `api_key_id()` for operations; the routes prefer that ID but still accept a unique suffix for backward compatibility. The admin UI escapes every upstream-derived string at its `innerHTML` sink.
-- **Keys are managed from the panel**: add/remove an upstream key at runtime (persisted into `CC_ADAPTER_ENV_FILE`, client rebuilt in-process, no restart) — nothing has to be injected as `CC_ADAPTER_CC_API_KEY`, and a zero-key startup is valid (requests fail with the client's own `AuthenticationError`). The Keys tab is the only key editor: the Configuration tab just reports `cc_api_key_count` and links there, and the Usage tab's token dialog adds keys through `POST /admin/api/keys` (it never rewrites the pool). A rebuild imports the old scheduler's retained-key health/credits/affinity state and retires the old client with `schedule_close_when_idle()`: scheduler probe tasks stop immediately, while every in-flight stream keeps its pool until it ends naturally, with no forced timeout.
+- **The panel never receives a full key**: `GET /admin/api/keys` and `GET /admin/api/config` return masked forms, and `POST /admin/api/usage/query` masks each upstream key with `core/utils.py:mask_api_key()` (first 10 + last 6 for keys longer than 20 characters, `****` + last 4 for lengths 8–20, and `****` below 8). Key-management responses include a deterministic opaque `api_key_id()` for operations; the routes prefer that ID but still accept a unique suffix for backward compatibility. The admin UI escapes every upstream-derived string at its `innerHTML` sink.
+- **Keys are managed from the panel**: add/remove an upstream key at runtime (persisted into `CC_ADAPTER_ENV_FILE`, client rebuilt in-process, no restart) — nothing has to be injected as `CC_ADAPTER_CC_API_KEY`, and a zero-key startup is valid (requests fail with the client's own `AuthenticationError`). The Keys tab is the only key editor: the Configuration tab just reports `cc_api_key_count` and links there, and the Usage tab's token dialog adds keys through `POST /admin/api/keys` (it never rewrites the pool). A same-upstream rebuild imports the old scheduler's retained-key health/credits/affinity state; changing `cc_base_url` keeps only retained keys' explicit manual-off state. Rebuilds retire the old client with `schedule_close_when_idle()`: scheduler probe tasks stop immediately, while every in-flight stream keeps its pool until it ends naturally, with no forced timeout.
 
 ## Architecture
 
@@ -143,7 +143,7 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
 
 ### Key routing & session affinity
 
-`core/key_scheduler.py` (`KeyScheduler`, created for clients with 2+ keys) decides which upstream key serves a request:
+`core/key_scheduler.py` (`KeyScheduler`, created for every non-empty runtime-managed key pool, including one key) decides which upstream key serves a request:
 
 - **Sticky**: a client session identity (see the `SessionExtractor.extract()` chain: `x-claude-code-session-id`, `metadata.user_id`, `session-id`, `x-session-id`, `x-conversation-id`, `prompt_cache_key`, …) is bound to a key; so is a conversation the adapter only knows by its content anchor.
 - An established binding outranks key order — a recovered key does not steal a session back.
@@ -158,7 +158,7 @@ Do **not** re-add `additionalDirectories` or an `env` field — the CLI sends ne
   `CC_ADAPTER_DISTRIBUTION` in `CC_ADAPTER_ENV_FILE`, panel select on the Configuration tab) applies to the running scheduler
   in place. `distribution` is deliberately **not** in `admin/config_manager.py:_CONFIG_CLIENT_FIELDS`, so a mode switch does not
   rebuild the client (which would re-deal every running conversation) — only the next new session lands differently. `GET /admin/api/config`
-  reports the live scheduler's value (the stored config value when a single-key pool has no scheduler), and any unrecognised
+  reports the live scheduler's value (the stored config value in direct/unconfigured mode), and any unrecognised
   spelling falls back to `round-robin` (`core/constants.py:normalize_distribution()`).
 - **Content anchor**: the fallback identity hashes the *full* system prompt and the *full* first user message (never truncated), with
   timestamps, dates and UUIDs in the system prompt masked - a truncated head merged unrelated conversations, and an unmasked clock split one

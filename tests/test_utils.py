@@ -5,9 +5,11 @@ from cc_adapter.core.utils import api_key_id, generate_id, mask_api_key, normali
 class TestNormalizeApiKeys:
     def test_empty_string_returns_empty(self):
         assert normalize_api_keys("") == []
+        assert normalize_api_keys("   ") == []
 
     def test_single_key_string_returns_list(self):
         assert normalize_api_keys("key1") == ["key1"]
+        assert normalize_api_keys("  key1  ") == ["key1"]
 
     def test_json_array_string(self):
         assert normalize_api_keys('["k1","k2"]') == ["k1", "k2"]
@@ -15,14 +17,47 @@ class TestNormalizeApiKeys:
     def test_list_input(self):
         assert normalize_api_keys(["k1", "k2"]) == ["k1", "k2"]
 
-    def test_list_filters_empty(self):
-        assert normalize_api_keys(["k1", "", "k2"]) == ["k1", "k2"]
+    def test_preserves_order_and_deduplicates(self):
+        assert normalize_api_keys(["k1", "k2", "k1", "k3", "k2"]) == ["k1", "k2", "k3"]
+        assert normalize_api_keys('["k1", "k2", "k1"]') == ["k1", "k2"]
+
+    def test_array_rejects_empty_or_whitespace_entry(self):
+        with pytest.raises(ValueError, match="API key must not be empty"):
+            normalize_api_keys(["k1", "", "k2"])
+        with pytest.raises(ValueError, match="API key must not be empty"):
+            normalize_api_keys(["k1", "   ", "k2"])
+        with pytest.raises(ValueError, match="API key must not be empty"):
+            normalize_api_keys('["k1", ""]')
+
+    def test_rejects_non_string_elements(self):
+        with pytest.raises(ValueError, match="API key must be a string"):
+            normalize_api_keys(["k1", 123])
+        with pytest.raises(ValueError, match="API key must be a string"):
+            normalize_api_keys(["k1", None])
+        with pytest.raises(ValueError, match="API key must be a string"):
+            normalize_api_keys('["k1", 123]')
+
+    def test_rejects_internal_whitespace(self):
+        with pytest.raises(ValueError, match="API key must not contain whitespace"):
+            normalize_api_keys("k 1")
+        with pytest.raises(ValueError, match="API key must not contain whitespace"):
+            normalize_api_keys(["k 1"])
+        with pytest.raises(ValueError, match="API key must not contain whitespace"):
+            normalize_api_keys('["k\\t1"]')
+
+    def test_rejects_keys_exceeding_512_chars(self):
+        too_long = "k" * 513
+        with pytest.raises(ValueError, match="exceed 512 characters"):
+            normalize_api_keys(too_long)
+        with pytest.raises(ValueError, match="exceed 512 characters"):
+            normalize_api_keys([too_long])
 
     def test_none_returns_empty(self):
         assert normalize_api_keys(None) == []
 
-    def test_invalid_json_falls_back_to_single(self):
-        assert normalize_api_keys("{bad") == ["{bad"]
+    def test_invalid_json_array_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid JSON array"):
+            normalize_api_keys("[bad-json")
 
 
 class TestGenerateId:
@@ -74,12 +109,15 @@ class TestApiKeyId:
 
 class TestMaskApiKey:
     def test_short_keys_masked_fully(self):
+        assert mask_api_key("") == "****"
         assert mask_api_key("a") == "****"
         assert mask_api_key("ab") == "****"
         assert mask_api_key("abc") == "****"
+        assert mask_api_key("abcd") == "****"  # < 8 chars is fully masked
+        assert mask_api_key("1234567") == "****"  # 7 chars
 
     def test_medium_keys_keep_last4(self):
-        assert mask_api_key("abcd") == "****abcd"
+        assert mask_api_key("12345678") == "****5678"  # exactly 8 chars
         assert mask_api_key("key-alpha-1111") == "****1111"
         assert mask_api_key("12345678901234567890") == "****7890"  # 20 chars
 

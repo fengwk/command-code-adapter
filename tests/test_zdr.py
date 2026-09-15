@@ -64,8 +64,9 @@ class TestZdrErrorDetection:
 
 
 @pytest.mark.asyncio
-class TestZdrDowngrade:
-    async def test_retries_without_zdr_header(self, monkeypatch):
+class TestZdrFailClosed:
+    async def test_fails_closed_without_downgrade_when_zdr_unsupported(self, monkeypatch):
+        """When zdr=True and upstream rejects with no-ZDR 400, fail closed without retry or header stripping."""
         config = AppConfig(zdr=True, cc_api_key="sk-test-key")
         monkeypatch.setattr("cc_adapter.core.runtime._config", config)
         monkeypatch.setattr("cc_adapter.core.runtime._cc_client", None)
@@ -73,32 +74,33 @@ class TestZdrDowngrade:
         zdr_error_body = '{"error":{"message":"This model has no zero-data-retention upstream. Disable CMD_ZDR or pick a different model.","type":"invalid_request_error","code":400}}'
 
         async with respx.mock as mock:
-            route = mock.post("https://api.example.com/alpha/generate")
-            route.side_effect = [
-                httpx.Response(400, content=zdr_error_body),
-                httpx.Response(
-                    200,
-                    content='data: {"type":"result","subtype":"success"}\n\ndata: [DONE]\n',
-                ),
-            ]
+            route = mock.post("https://api.example.com/alpha/generate").respond(400, content=zdr_error_body)
+
+            client = CommandCodeClient(base_url="https://api.example.com", api_key="sk-test-key")
+            with pytest.raises(AdapterError) as excinfo:
+                async for _ in client.generate({"params": {"model": "test-model", "messages": []}}):
+                    pass
+
+            assert route.call_count == 1  # strictly no retry
+            sent_headers = route.calls[0].request.headers
+            assert sent_headers.get("x-cmd-zdr") == "1"
+            assert "zero-data-retention" in str(excinfo.value)
+
+    async def test_zdr_false_omits_header_and_allows_generation(self, monkeypatch):
+        """When user explicitly sets zdr=False, x-cmd-zdr is omitted and requests succeed."""
+        config = AppConfig(zdr=False, cc_api_key="sk-test-key")
+        monkeypatch.setattr("cc_adapter.core.runtime._config", config)
+        monkeypatch.setattr("cc_adapter.core.runtime._cc_client", None)
+
+        async with respx.mock as mock:
+            route = mock.post("https://api.example.com/alpha/generate").respond(
+                200,
+                content='data: {"type":"result","subtype":"success"}\n\ndata: [DONE]\n',
+            )
 
             client = CommandCodeClient(base_url="https://api.example.com", api_key="sk-test-key")
             results = [event async for event in client.generate({"params": {"model": "test-model", "messages": []}})]
             assert len(results) == 1
             assert results[0]["type"] == "result"
-            assert results[0]["subtype"] == "success"
-
-    async def test_zdr_error_not_retried_twice(self, monkeypatch):
-        config = AppConfig(zdr=True, cc_api_key="sk-test-key")
-        monkeypatch.setattr("cc_adapter.core.runtime._config", config)
-        monkeypatch.setattr("cc_adapter.core.runtime._cc_client", None)
-
-        zdr_error_body = '{"error":{"message":"This model has no zero-data-retention upstream. Disable CMD_ZDR or pick a different model.","type":"invalid_request_error","code":400}}'
-
-        async with respx.mock as mock:
-            mock.post("https://api.example.com/alpha/generate").respond(400, content=zdr_error_body)
-
-            client = CommandCodeClient(base_url="https://api.example.com", api_key="sk-test-key")
-            with pytest.raises(AdapterError):
-                async for _ in client.generate({"params": {"model": "test-model", "messages": []}}):
-                    pass
+            assert route.call_count == 1
+            assert "x-cmd-zdr" not in route.calls[0].request.headers

@@ -683,29 +683,62 @@ class TestReport:
             "manual": False,
         }
 
-    def test_report_ok_resets_health(self):
+    def test_report_ok_does_not_clear_active_cooling(self):
+        """A concurrent success must not clear an unexpired cooling window."""
         sched = make_scheduler([K1], {K1: 100})
         sched.report(K1, ok=False, status=429, reason="rate_limited")
+        assert sched.key_state(K1)["state"] == "cooling"
+        assert sched.key_state(K1)["failures"] == 1
+        # Late-arriving success while cooling is a no-op
         sched.report(K1, ok=True)
-        assert sched.key_state(K1) == {
-            "state": "ok",
-            "until": None,
-            "cooldown_seconds": None,
-            "reason": None,
-            "credits": 100,
-            "failures": 0,
-            "sessions": 0,
-            "enabled": True,
-            "manual": False,
-        }
+        assert sched.key_state(K1)["state"] == "cooling"
+        assert sched.key_state(K1)["failures"] == 1
 
-    def test_success_does_not_clear_a_zero_credit_mark(self):
+        # Once the window expires, health becomes ok and a success clears failures
+        expire_cooldown(sched, K1)
+        assert sched.key_state(K1)["state"] == "ok"
+        assert sched.key_state(K1)["failures"] == 1
+        sched.report(K1, ok=True)
+        assert sched.key_state(K1)["failures"] == 0
+
+    def test_success_does_not_clear_a_zero_credit_mark_or_cooling(self):
         """A key parked for credits only recovers via the credits refresh or /enable."""
         sched = make_scheduler([K1], {K1: 100})
         sched.report(K1, ok=False, status=400, reason="insufficient_credits")
         sched.report(K1, ok=True)
         assert sched.key_state(K1)["credits"] == 0
-        assert sched.key_state(K1)["state"] == "ok"
+        assert sched.key_state(K1)["state"] == "cooling"
+
+    def test_disabled_key_not_downgraded_by_subsequent_cooling_failures(self):
+        """Disabled is permanently prioritized; subsequent 429/403/402 must not downgrade to cooling."""
+        sched = make_scheduler([K1], {K1: 100})
+        sched.report(K1, ok=False, status=401)
+        assert sched.key_state(K1)["state"] == "disabled"
+        assert sched.key_state(K1)["until"] is None
+        assert sched.key_state(K1)["reason"] == "http_401"
+
+        # Subsequent 429 must not change state to cooling
+        sched.report(K1, ok=False, status=429, reason="rate_limited", detail="rate limited text")
+        assert sched.key_state(K1)["state"] == "disabled"
+        assert sched.key_state(K1)["until"] is None
+        assert sched.key_state(K1)["reason"] == "http_401"
+        assert sched.last_failure()["status"] == 429
+        assert sched.last_failure()["detail"] == "rate limited text"
+
+        # Subsequent 403 must not change state to cooling
+        sched.report(K1, ok=False, status=403, detail="forbidden text")
+        assert sched.key_state(K1)["state"] == "disabled"
+        assert sched.key_state(K1)["until"] is None
+
+        # Subsequent 402 / insufficient credits must not change state to cooling
+        sched.report(K1, ok=False, status=400, reason="insufficient_credits", detail="out of credits")
+        assert sched.key_state(K1)["state"] == "disabled"
+        assert sched.key_state(K1)["until"] is None
+        assert sched.last_failure()["status"] == 400
+
+        # Success must not clear disabled state
+        sched.report(K1, ok=True)
+        assert sched.key_state(K1)["state"] == "disabled"
 
     def test_cooling_window_expiry_keeps_failures_so_backoff_keeps_escalating(self):
         sched = make_scheduler([K1], {K1: 100})
